@@ -289,13 +289,15 @@ mod tests {
         let b = screen(&mut player, 100, 34);
         let nav = NAV_H as usize;
         assert_eq!(&a[..nav], &b[..nav], "the nav row differs between views");
-        // Not vacuously equal: it really is the mark and the path.
-        assert_eq!(
-            a[0].trim_end(),
-            " ♫ spot   MUSE  ›  BLACK HOLES",
+        // Not vacuously equal: it really is the mark, the path, and the
+        // playback status opposite them — which is the point of asserting it
+        // here, since the status is drawn on both screens from the same code.
+        assert!(
+            a[0].starts_with(" ♫ spot   MUSE  ›  BLACK HOLES"),
             "{:?}",
             a[0]
         );
+        assert!(a[0].trim_end().ends_with("● LOADING"), "{:?}", a[0]);
         assert!(a[1].trim().is_empty(), "{:?}", a[1]);
 
         // The prompt is on the browse screen only, and the player spends the
@@ -339,8 +341,11 @@ mod tests {
         });
         st.main = crate::app::state::MainView::Home;
         let lines = screen(&mut st, 100, 34);
-        // Home draws no crumb: the mark is already the way there.
-        assert_eq!(lines[0].trim_end(), " ♫ spot", "{:?}", lines[0]);
+        // Home draws no crumb: the mark is already the way there. The
+        // playback status is opposite it, as on every other page.
+        assert!(lines[0].starts_with(" ♫ spot "), "{:?}", lines[0]);
+        assert!(lines[0].trim_end().ends_with("● LOADING"), "{:?}", lines[0]);
+        assert!(!lines[0].contains('›'), "{:?}", lines[0]);
         assert!(lines[4].contains("Liked Songs"), "{:?}", lines[4]);
         // No count: its length is not known until it is opened.
         assert!(
@@ -392,7 +397,7 @@ mod tests {
         assert!(row.contains("2 saved stations"), "{row:?}");
     }
 
-    fn station(uuid: &str, name: &str) -> crate::app::state::Station {
+    pub(super) fn station(uuid: &str, name: &str) -> crate::app::state::Station {
         crate::app::state::Station {
             uuid: uuid.into(),
             name: name.into(),

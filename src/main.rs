@@ -138,6 +138,11 @@ async fn run_tui(
     // everywhere else the slow tick keeps the app idle-cheap.
     const TICK_SLOW: Duration = Duration::from_millis(250);
     const TICK_FAST: Duration = Duration::from_millis(50);
+    // How recently PCM must have arrived for the tick to stay fast. Wider
+    // than [`TICK_SLOW`] on purpose: at the slow tick the loop only looks
+    // every 250 ms, and a window that narrow could fall between two samples
+    // and drop back to the slow tick under a record that is still playing.
+    const AUDIO_LIVE: Duration = Duration::from_millis(600);
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK_SLOW);
@@ -163,7 +168,11 @@ async fn run_tui(
             last_title = title;
         }
         terminal.draw(|frame| ui::draw(frame, &mut st))?;
-        let want_fast = st.show_player;
+        // The nav row's dot rides the audio's loudness on every screen, so
+        // audio arriving is reason enough for the fast tick — at 250 ms it
+        // would visibly step rather than breathe. Nothing playing still costs
+        // four wakeups a second.
+        let want_fast = st.show_player || st.audio_tap.is_fresh(AUDIO_LIVE);
         drop(st);
         // Rebuild outside the select! arm, where `tick` isn't borrowed.
         if want_fast != fast {

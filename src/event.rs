@@ -74,6 +74,21 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         go_home(st);
         return;
     }
+    // The playback status opposite it, on the same row and on every screen.
+    // It is the deck's queue name said where you are already looking when you
+    // want to know what is playing, so it toggles the player the same way —
+    // and clears the input like the mark does, or a click here while typing
+    // would fall into the cancel branch below and never reach this one.
+    if st.hit.status.contains(pos) {
+        st.input_mode = InputMode::Normal;
+        st.input_buffer.clear();
+        if st.show_player {
+            st.show_player = false;
+        } else {
+            open_player(st, tx);
+        }
+        return;
+    }
     // The search row is always on screen now, so clicking it is how you start
     // a search with the mouse. It has to be checked before the cancel below,
     // or clicking the box you are typing in would close it.
@@ -2528,5 +2543,48 @@ mod tests {
             assert!(state.read().show_player, "{key:?} left the player");
             assert_eq!(state.read().input_mode, InputMode::Normal);
         }
+    }
+
+    /// The nav row's playback status is the deck's queue name said where you
+    /// are already looking when you want to know what is playing, so it opens
+    /// and closes the player the same way — including from the player itself,
+    /// where it is the row's own way back out.
+    #[test]
+    fn the_status_toggles_the_player_from_either_screen() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.hit.status = Rect {
+            x: 68,
+            y: 0,
+            width: 11,
+            height: 1,
+        };
+        let on_status = Position { x: 70, y: 0 };
+
+        handle_click(&mut st, on_status, &tx);
+        assert!(st.show_player, "the status should open the player");
+        handle_click(&mut st, on_status, &tx);
+        assert!(!st.show_player, "and close it again");
+
+        // Opening goes through `open_player`, so a queue belonging to some
+        // other context is reloaded — exactly as pressing `v` would.
+        st.playback = Some(playing("spotify:playlist:p1"));
+        handle_click(&mut st, on_status, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::LoadQueue)));
+
+        // Clicked while typing it does not lose the mode quietly to the
+        // "a click elsewhere cancels the input" branch: it clears the box
+        // itself, the way the mark beside it does.
+        st.show_player = false;
+        st.input_mode = InputMode::Search;
+        st.input_buffer = "muse".into();
+        handle_click(&mut st, on_status, &tx);
+        assert!(st.show_player, "the click still reached the status");
+        assert_eq!(st.input_mode, InputMode::Normal);
+        assert!(st.input_buffer.is_empty());
+
+        // A click that misses it leaves the view where it was.
+        handle_click(&mut st, Position { x: 40, y: 0 }, &tx);
+        assert!(st.show_player);
     }
 }

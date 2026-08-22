@@ -13,7 +13,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
@@ -252,8 +251,7 @@ fn draw_toast(frame: &mut Frame, row: Rect, toast: Option<&str>) {
     // the text against the edge rather than the padding.
     let msg = fit(msg, (row.width - 1) as usize).trim_end().to_string();
     frame.render_widget(
-        Paragraph::new(Line::styled(msg, Style::default().fg(theme::WARN)))
-            .alignment(Alignment::Right),
+        Paragraph::new(Line::styled(msg, theme::warn())).alignment(Alignment::Right),
         Rect {
             width: row.width - 1,
             ..row
@@ -379,7 +377,7 @@ mod tests {
         // progress track rather than beside the queue's name, with the play
         // state centred between them.
         assert!(lines[TRANSPORT_ROW].contains("◂◂ previous"));
-        assert!(lines[TRANSPORT_ROW].contains("● playing"));
+        assert!(lines[TRANSPORT_ROW].contains("● play"));
         assert!(lines[TRANSPORT_ROW].trim_end().ends_with("▸▸ next"));
         // The queue's name and length, with shuffle opposite.
         assert!(lines[CONTEXT_ROW].contains("My Mix · 24 tracks"));
@@ -531,7 +529,7 @@ mod tests {
         let mut paused = playing_state();
         paused.playback.as_mut().unwrap().is_playing = false;
         let lines = render(&mut paused, 100, BAR_H);
-        assert!(lines[TRANSPORT_ROW].contains("■ paused"));
+        assert!(lines[TRANSPORT_ROW].contains("■ pause"));
         assert_eq!(playing.hit.play_btn, paused.hit.play_btn);
         assert_eq!(playing.hit.prev_btn, paused.hit.prev_btn);
         assert_eq!(playing.hit.next_btn, paused.hit.next_btn);

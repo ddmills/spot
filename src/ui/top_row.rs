@@ -26,7 +26,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -50,6 +49,22 @@ pub(super) const MARK_GAP: u16 = 3;
 /// shortens when the row is tight, because a path shed from the middle still
 /// reads as a path while a half-drawn count reads as a fault.
 const COUNT_GAP: u16 = 3;
+/// Cells between the status and whatever is to its left — the count, or the
+/// path when there is none. Wider than [`COUNT_GAP`] because the two say
+/// unrelated things: one is about the page, the other about the sound.
+const STATUS_GAP: u16 = 4;
+
+/// How long the tap may go quiet before a source that says it is playing is
+/// read as still loading. Longer than the visualizer's own freshness window,
+/// which is tuned to drop the bars' colour the instant audio stops: a word
+/// that flickers between `STREAMING` and `LOADING` on a momentary underrun is
+/// worse than one that waits.
+const LOAD_WITHIN: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// How dim the playing dot goes between beats, as a fraction of the accent.
+/// Low enough that the swing is unmistakable, high enough that the dot never
+/// reads as having gone out.
+const PULSE_FLOOR: f32 = 0.22;
 
 /// Draw the header into `area` and record its controls.
 ///
@@ -94,11 +109,35 @@ fn nav_row(frame: &mut Frame, row: Rect, state: &mut AppState, page: PageHeader)
     } else {
         mark.width + MARK_GAP
     };
-    let reserve = page
+    // Measured before the path is laid out, not drawn before it: whatever is
+    // pinned to the right edge has to come off the path's width first, or the
+    // crumbs run underneath it.
+    let mut status = status_spans(state);
+    // Its cells plus the gap that separates it, or nothing at all — the two
+    // travel together, so a shed status takes its gap with it.
+    let mut status_slot = match status.iter().map(|s| s.width() as u16).sum::<u16>() {
+        0 => 0,
+        w => w + STATUS_GAP,
+    };
+    let count_w = page
         .count
         .as_ref()
         .map(|s| s.width() as u16 + COUNT_GAP)
         .unwrap_or(0);
+    // The count is about the page and the path is the page, so they share the
+    // row on the terms already set out above: the path shortens, the count
+    // does not. The status is a third thing that neither of them is about, and
+    // on a row too tight for all three it is what goes — a status that costs
+    // you the name of the page you are on is a poor trade, and the deck at the
+    // bottom is still saying the same thing. It sheds whole rather than
+    // narrowing, because there is no shorter way to say `STREAMING`.
+    if status_slot > 0
+        && row.width.saturating_sub(taken + count_w + status_slot) < main_pane::HEAD_W as u16
+    {
+        status = Vec::new();
+        status_slot = 0;
+    }
+    let reserve = count_w + status_slot;
     let field = Rect {
         x: row.x + taken,
         width: row.width.saturating_sub(taken + reserve),
@@ -122,9 +161,84 @@ fn nav_row(frame: &mut Frame, row: Rect, state: &mut AppState, page: PageHeader)
         );
         state.hit.close_player = head;
     }
+    // The status takes the edge and the count sits inboard of it. Two calls
+    // rather than one with two groups, because `right_row` applies hover to
+    // every group it is given a pointer for: the status is a control and
+    // should light under the cursor, the count is a readout and should not.
+    state.hit.status = if status.is_empty() {
+        Rect::default()
+    } else {
+        right_row(frame, row, mouse, vec![status])[0]
+    };
     if let Some(span) = page.count {
-        right_row(frame, row, None, vec![vec![span]]);
+        let count_row = Rect {
+            width: row.width.saturating_sub(status_slot),
+            ..row
+        };
+        right_row(frame, count_row, None, vec![vec![span]]);
     }
+}
+
+/// The playback status pinned opposite the mark: what is making sound, and
+/// whether it is. Empty when nothing is — an idle word would be a control
+/// that leads to a player with nothing in it.
+///
+/// Radio is checked first, as it is everywhere else: the two sources are
+/// mutually exclusive by construction, and while a station is on the Spotify
+/// snapshot is kept only so stopping the stream puts the last track back.
+fn status_spans(state: &mut AppState) -> Vec<Span<'static>> {
+    let (word, is_playing) = match (&state.radio, &state.playback) {
+        (Some(r), _) => ("RADIO", r.is_playing),
+        (None, Some(pb)) => ("STREAMING", pb.is_playing),
+        (None, None) => return Vec::new(),
+    };
+
+    // Whether the audio is ours to judge. Playing on a phone, librespot is
+    // idle and the tap will never fill — reading that as "loading" would
+    // leave the word stuck yellow for the length of the record.
+    let ours =
+        state.radio.is_some() || state.playback.as_ref().is_some_and(|pb| pb.is_local_device);
+    let fresh = state.audio_tap.is_fresh(LOAD_WITHIN);
+    // Claims to be playing, but nothing has come out of it yet: a station
+    // still connecting and prefetching, or a track still being fetched. The
+    // radio player clears the tap before it connects, so this window is
+    // exactly the buffering one.
+    if is_playing && ours && !fresh {
+        // The dot does not pulse here. Nothing is arriving to pulse to, and a
+        // moving dot would say the opposite of the word beside it.
+        return vec![
+            Span::styled("● ", theme::warn()),
+            Span::styled("LOADING", theme::warn()),
+        ];
+    }
+
+    if !is_playing {
+        // Paused is a resting state: one flat grey for the dot and the word
+        // alike, so the whole control recedes rather than half of it.
+        return vec![
+            Span::styled("● ", theme::dim()),
+            Span::styled(word, theme::dim()),
+        ];
+    }
+
+    // Playing. The dot rides the loudness envelope, so it keeps time with
+    // whatever is on — and falls back to the transport's own timed breath
+    // when there is no local audio to ride (playback on another device),
+    // which is the case that pulse was written for.
+    let dot = if ours {
+        let level = state
+            .pulse
+            .update(&state.audio_tap, fresh, std::time::Instant::now());
+        // A wider travel than the transport's own breathing dot, which only
+        // has to say "something is happening": this one is tracking the beat,
+        // and it has to be visible from across the room to be worth doing.
+        // The floor is not black — a dot that goes out between kicks reads as
+        // dropping out rather than as keeping time.
+        theme::accent_at(PULSE_FLOOR + (1.0 - PULSE_FLOOR) * level)
+    } else {
+        super::table::pulse_style(std::time::Instant::now())
+    };
+    vec![Span::styled("● ", dot), Span::styled(word, theme::accent())]
 }
 
 /// The search prompt, spread across a row of its own.
@@ -152,11 +266,7 @@ fn search_row(frame: &mut Frame, row: Rect, state: &mut AppState) {
 
     // The prompt and the text share a colour, so the row reads as one control
     // rather than as a glyph next to a word.
-    let style = if typing {
-        Style::default().fg(theme::WARN)
-    } else {
-        theme::dim()
-    };
+    let style = if typing { theme::warn() } else { theme::dim() };
     // Idle, the row says what the list below it is answering — read off the
     // view rather than off `input_buffer`, which is cleared on submit. Only a
     // search view has a query; browsing a playlist puts the prompt back.
@@ -429,5 +539,198 @@ mod tests {
                 )
             })
             .unwrap();
+    }
+
+    /// A Spotify snapshot on our own device, with PCM already in the tap.
+    fn streaming() -> AppState {
+        let mut st = AppState::new();
+        st.playback = Some(crate::app::state::PlaybackSnapshot {
+            is_playing: true,
+            progress_ms: 0,
+            duration_ms: 1000,
+            track_uri: None,
+            context_uri: None,
+            artist_id: None,
+            album_id: None,
+            track_name: "Envejecer".into(),
+            artists: "Erameld".into(),
+            album: "Días Despejados".into(),
+            release_year: "2020".into(),
+            cover_url: None,
+            shuffle: false,
+            repeat: crate::app::state::RepeatMode::Off,
+            volume_percent: 70,
+            device_name: "spot".into(),
+            is_local_device: true,
+            fetched_at: std::time::Instant::now(),
+        });
+        audible(&st);
+        st
+    }
+
+    fn radio_state() -> AppState {
+        let mut st = AppState::new();
+        st.radio = Some(crate::app::state::RadioPlayback {
+            station: super::super::tests::station("s1", "KEXP"),
+            is_playing: true,
+            started_at: std::time::Instant::now(),
+            title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            volume_percent: 50,
+        });
+        audible(&st);
+        st
+    }
+
+    /// Put samples in the tap, so the source reads as playing rather than as
+    /// still loading. A silent buffer is enough: what the word turns on is
+    /// whether audio is *arriving*, not how loud it is.
+    fn audible(st: &AppState) {
+        st.audio_tap.push(&[0.0; 2048], 1.0);
+    }
+
+    /// The fg of the cell at `x` on the nav row.
+    fn fg(state: &mut AppState, width: u16, x: u16) -> ratatui::style::Color {
+        let mut terminal = Terminal::new(TestBackend::new(width, H)).unwrap();
+        terminal
+            .draw(|f| draw(f, f.area(), state, PageHeader::default()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .cell(Position { x, y: 0 })
+            .unwrap()
+            .style()
+            .fg
+            .unwrap()
+    }
+
+    /// What is making sound, opposite the mark, on the row that says where
+    /// you are. The two sources are named rather than both called "playing":
+    /// a station and a track behave differently enough that which one is on
+    /// is worth a word.
+    #[test]
+    fn the_status_names_the_source_it_is_playing_from() {
+        let mut st = streaming();
+        let lines = render(&mut st, 80);
+        assert!(
+            lines[0].trim_end().ends_with("● STREAMING"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(!st.hit.status.is_empty(), "the status must be clickable");
+        assert_eq!(st.hit.status.y, 0);
+        assert_eq!(st.hit.status.right(), 80);
+
+        let mut st = radio_state();
+        let lines = render(&mut st, 80);
+        assert!(lines[0].trim_end().ends_with("● RADIO"), "{:?}", lines[0]);
+    }
+
+    /// Nothing playing draws nothing: an idle word would be a control leading
+    /// to a player with nothing in it.
+    #[test]
+    fn nothing_playing_draws_no_status() {
+        let mut st = AppState::new();
+        st.main = MainView::Playlists;
+        let lines = render(&mut st, 80);
+        assert_eq!(lines[0].trim_end(), "♫ spot   PLAYLISTS", "{:?}", lines[0]);
+        assert!(st.hit.status.is_empty(), "and nothing to click");
+    }
+
+    /// Paused is a resting state, so the whole control recedes — the dot and
+    /// the word together, rather than a lit dot beside a grey word.
+    #[test]
+    fn paused_greys_the_dot_and_the_word_alike() {
+        let mut st = streaming();
+        st.playback.as_mut().unwrap().is_playing = false;
+        let lines = render(&mut st, 80);
+        assert!(
+            lines[0].trim_end().ends_with("● STREAMING"),
+            "{:?}",
+            lines[0]
+        );
+        let dot = st.hit.status.x;
+        assert_eq!(fg(&mut st, 80, dot), theme::DIM, "the dot is not at rest");
+        assert_eq!(fg(&mut st, 80, dot + 2), theme::DIM, "nor is the word");
+    }
+
+    /// Claims to be playing, but no audio has arrived: a station still
+    /// connecting and prefetching, or a track still being fetched. This is
+    /// the several-second window a radio station spends buffering, which the
+    /// row used to spend saying it was already playing.
+    #[test]
+    fn a_source_with_no_audio_yet_reads_as_loading() {
+        let mut st = radio_state();
+        st.audio_tap.clear();
+        let lines = render(&mut st, 80);
+        assert!(lines[0].trim_end().ends_with("● LOADING"), "{:?}", lines[0]);
+        let dot = st.hit.status.x;
+        assert_eq!(fg(&mut st, 80, dot), theme::WARN);
+
+        // But only when the audio is ours to judge. Playing on a phone,
+        // librespot is idle and the tap will never fill.
+        let mut st = streaming();
+        st.audio_tap.clear();
+        st.playback.as_mut().unwrap().is_local_device = false;
+        let lines = render(&mut st, 80);
+        assert!(
+            lines[0].trim_end().ends_with("● STREAMING"),
+            "{:?}",
+            lines[0]
+        );
+    }
+
+    /// The count is about the page and the status is about the sound. Both
+    /// fit, in that order out from the edge, and neither lands on the path.
+    #[test]
+    fn a_count_and_a_status_share_the_right_edge() {
+        let mut st = streaming();
+        st.main = MainView::Playlists;
+        let mut terminal = Terminal::new(TestBackend::new(80, H)).unwrap();
+        let page = PageHeader {
+            loading: false,
+            count: Some(Span::styled("8 playlists", theme::dim())),
+        };
+        terminal.draw(|f| draw(f, f.area(), &mut st, page)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row: String = (0..80)
+            .filter_map(|x| buffer.cell(Position { x, y: 0 }).map(|c| c.symbol()))
+            .collect();
+        assert!(
+            row.trim_end().ends_with("8 playlists    ● STREAMING"),
+            "{row:?}"
+        );
+        assert!(row.starts_with("♫ spot   PLAYLISTS  "), "{row:?}");
+        // The path stops before the count, which stops before the status.
+        let count_at = row.find("8 playlists").unwrap() as u16;
+        assert!(count_at > 18, "the count overlaps the path: {row:?}");
+        assert!(st.hit.status.x > count_at, "{row:?}");
+    }
+
+    /// On a row too tight for all three, the status is what goes. It is the
+    /// one thing the row is not about, the deck is still saying it, and a
+    /// status bought with the name of the page you are on is a poor trade.
+    #[test]
+    fn a_tight_row_sheds_the_status_before_the_path() {
+        let mut st = streaming();
+        st.push_view();
+        st.main = MainView::Tracks(crate::app::state::TrackList::new(
+            "Black Holes",
+            "",
+            None,
+            None,
+        ));
+        let lines = render(&mut st, 40);
+        assert!(lines[0].contains("BLACK HOLES"), "{:?}", lines[0]);
+        assert!(!lines[0].contains("STREAMING"), "{:?}", lines[0]);
+        assert!(st.hit.status.is_empty());
+        // Given the room, it comes back.
+        let lines = render(&mut st, 80);
+        assert!(lines[0].contains("BLACK HOLES"), "{:?}", lines[0]);
+        assert!(
+            lines[0].trim_end().ends_with("● STREAMING"),
+            "{:?}",
+            lines[0]
+        );
     }
 }

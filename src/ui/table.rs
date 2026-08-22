@@ -412,7 +412,7 @@ const PULSE: Duration = Duration::from_millis(1800);
 /// The player view already redraws at ~20 fps for the visualizer, so this
 /// costs no extra wakeups. Paused shows a flat red instead: nothing is
 /// happening, so nothing should move.
-fn pulse_style(now: Instant) -> Style {
+pub(super) fn pulse_style(now: Instant) -> Style {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     let elapsed = now.saturating_duration_since(*ORIGIN.get_or_init(|| now));
     pulse_at(elapsed.as_secs_f32() / PULSE.as_secs_f32())
@@ -422,7 +422,7 @@ fn pulse_style(now: Instant) -> Style {
 /// the shape can be checked without one.
 fn pulse_at(phase: f32) -> Style {
     let t = (1.0 - (phase * std::f32::consts::TAU).cos()) / 2.0;
-    theme::green_at(0.45 + 0.55 * t)
+    theme::accent_at(0.45 + 0.55 * t)
 }
 
 /// The play-state pill. The word is padded to a fixed width, and the whole
@@ -430,21 +430,22 @@ fn pulse_at(phase: f32) -> Style {
 /// toggles and the hover pill sits off the text either side.
 ///
 /// The two states differ in glyph as well as colour: a round `●` that pulses
-/// while audio is running, a square `■` when it is not — the shape transports
-/// have used for stop since tape decks. Colour alone would be the whole signal
-/// otherwise, which is a poor one to lean on.
+/// in the theme accent while audio is running, a square `■` when it is not —
+/// the shape transports have used for stop since tape decks. Colour alone
+/// would be the whole signal otherwise, which is a poor one to lean on, and
+/// the accent moves with the playing sleeve.
 pub fn state_spans(is_playing: bool) -> Vec<Span<'static>> {
     let (glyph, style, word) = if is_playing {
-        ("●", pulse_style(Instant::now()), "playing")
+        ("●", pulse_style(Instant::now()), "play")
     } else {
-        ("■", theme::stopped_dim(), "paused")
+        ("■", theme::stopped_dim(), "pause")
     };
     vec![
         Span::styled(format!(" {glyph}"), style),
         Span::styled(
-            format!(" {:<7} ", word),
+            format!(" {:<5} ", word),
             if is_playing {
-                theme::green()
+                theme::accent()
             } else {
                 theme::dim()
             },
@@ -544,6 +545,6 @@ mod tests {
         // Symmetric about the peak: rising and falling pass the same values.
         assert_eq!(at(0.25), at(0.75));
         // And it is a breath, not a blink — the dimmest state is still lit.
-        assert_ne!(at(0.0), theme::green_at(0.0).fg.unwrap());
+        assert_ne!(at(0.0), theme::accent_at(0.0).fg.unwrap());
     }
 }

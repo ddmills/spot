@@ -319,14 +319,26 @@ pub fn bright() -> Style {
     Style::default().fg(BRIGHT)
 }
 
+/// [`WARN`] as a style: something is in flight. The toast and the search
+/// prompt built this inline; the nav row's `● LOADING` is the third site, and
+/// three is where the colour stops being a one-off.
+pub fn warn() -> Style {
+    Style::default().fg(WARN)
+}
+
 pub fn green() -> Style {
     Style::default().fg(GREEN)
 }
 
-/// The state green at a fraction of full brightness, for the pulsing dot.
-pub fn green_at(k: f32) -> Style {
-    let (r, g, b) = GREEN_RGB;
-    Style::default().fg(scale(r, g, b, k))
+/// The accent in force right now at a fraction of full brightness, for the
+/// play pill's pulsing dot. Derived from [`accent_color`] rather than a fixed
+/// hue so the transport breathes in whatever colour the playing sleeve has
+/// put on the rest of the screen.
+pub fn accent_at(k: f32) -> Style {
+    match accent_color() {
+        Color::Rgb(r, g, b) => Style::default().fg(scale(r, g, b, k)),
+        other => Style::default().fg(other),
+    }
 }
 
 /// How far [`stopped_dim`] pulls the paused red back.

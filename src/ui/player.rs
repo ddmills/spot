@@ -906,11 +906,14 @@ mod tests {
         st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
 
         let lines = render_raw(&mut st, 80, 26);
-        assert_eq!(
-            lines[0].trim_end(),
-            " ♫ spot   MUSE  ›  BLACK HOLES",
-            "the mark does not lead the path"
+        assert!(
+            lines[0].starts_with(" ♫ spot   MUSE  ›  BLACK HOLES"),
+            "the mark does not lead the path: {:?}",
+            lines[0]
         );
+        // And the playback status is opposite it, the same as on the browse
+        // screen — the player draws this row from the same function.
+        assert!(lines[0].trim_end().ends_with("● LOADING"), "{:?}", lines[0]);
         assert!(lines[1].trim().is_empty(), "{:?}", lines[1]);
         assert!(!lines[2].contains("/  search"), "{:?}", lines[2]);
         assert!(lines[2].contains("Beta"), "the masthead took the row");
@@ -1025,7 +1028,7 @@ mod tests {
             "{:?}",
             lines[17]
         );
-        assert!(lines[17].contains("● playing"), "{:?}", lines[17]);
+        assert!(lines[17].contains("● play"), "{:?}", lines[17]);
         assert!(lines[17].trim_end().ends_with("▸▸ next"), "{:?}", lines[17]);
         assert!(lines[18].trim().is_empty() && lines[20].trim().is_empty());
         // Then one row heads the list: name on the left, shuffle opposite.
@@ -1472,7 +1475,7 @@ mod tests {
         let mut playing = playing_state();
         let lines = render(&mut playing, 80, 26);
         assert!(
-            lines[STATE_ROW].contains("● playing"),
+            lines[STATE_ROW].contains("● play"),
             "{:?}",
             lines[STATE_ROW]
         );
@@ -1481,7 +1484,7 @@ mod tests {
         paused.playback.as_mut().unwrap().is_playing = false;
         let lines = render(&mut paused, 80, 26);
         assert!(
-            lines[STATE_ROW].contains("■ paused"),
+            lines[STATE_ROW].contains("■ pause"),
             "{:?}",
             lines[STATE_ROW]
         );

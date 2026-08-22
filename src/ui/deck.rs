@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(hit.prev_btn.x, 0);
         assert_eq!(hit.next_btn.right(), 60);
         assert_eq!(hit.prev_btn.y, hit.next_btn.y);
-        assert!(lines[0].contains("● playing"), "{:?}", lines[0]);
+        assert!(lines[0].contains("● play"), "{:?}", lines[0]);
         // Centred on the row: the same gap either side, to within the odd
         // cell an even-width pill cannot split.
         let (left, right) = (hit.play_btn.x, 60 - hit.play_btn.right());

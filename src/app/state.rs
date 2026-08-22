@@ -843,6 +843,12 @@ pub struct HitAreas {
     pub main_list: Rect,
     /// The always-on search row at the top of the browse screen.
     pub search_box: Rect,
+    /// The playback status opposite the mark on the nav row — `● STREAMING`,
+    /// `● RADIO`, `● LOADING`. Toggles the player view, like
+    /// [`Self::queue_name`]: the two are the same control said in the two
+    /// places you are looking when you want it. Empty when nothing is playing,
+    /// which is when there is no player worth opening.
+    pub status: Rect,
     pub search_tabs: Vec<(Rect, SearchTab)>,
     /// The radio page's tab strip, in the same spirit as [`Self::search_tabs`].
     pub radio_tabs: Vec<(Rect, RadioTab)>,
@@ -1020,6 +1026,10 @@ pub struct AppState {
     /// Spectrum analysis and bar/glow/peak envelopes, persisted across frames
     /// for the visualizer's attack/decay animation.
     pub viz: crate::viz::VizState,
+    /// Loudness envelope for the nav row's playing dot. Its own state rather
+    /// than a band of [`Self::viz`]: the visualizer is only updated while the
+    /// player view is drawn, and the dot is on both screens.
+    pub pulse: crate::viz::Pulse,
 
     /// Decoded art for the playing item, at a fixed pixel grid; the player
     /// resamples it to whatever the pane can spare. `None` until the first
@@ -1089,6 +1099,7 @@ impl AppState {
             last_queue_click: None,
             audio_tap: Arc::new(AudioTap::new()),
             viz: crate::viz::VizState::new(),
+            pulse: crate::viz::Pulse::new(),
             cover: None,
             cover_generation: 0,
             view_cover: None,
