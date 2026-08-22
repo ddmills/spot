@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod audio_sink;
 mod audio_tap;
 mod auth;
 mod client;
@@ -21,13 +22,14 @@ use anyhow::{Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, EventStream};
 use crossterm::terminal::SetTitle;
 use futures::StreamExt;
+use librespot_playback::player::{PlayerEvent, PlayerEventChannel};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use unicode_width::UnicodeWidthChar;
 
 use crate::api::Api;
 use crate::app::command::AppCommand;
-use crate::app::state::AppState;
+use crate::app::state::{self, AppState, LocalPlayback};
 use crate::client::Client;
 
 /// Below this the browse pane starts shedding columns and art; the UI still
@@ -86,7 +88,7 @@ async fn run() -> Result<()> {
         "starting playback engine (Connect device \"{}\")...",
         config::DEVICE_NAME
     );
-    let (session, spirc, spirc_task, audio_tap) = session::build().await?;
+    let (session, spirc, spirc_task, audio_tap, mixer, player_events) = session::build().await?;
     let _spirc_join = tokio::spawn(spirc_task);
 
     let api = Api::new(
@@ -104,9 +106,17 @@ async fn run() -> Result<()> {
         st.radio_favorites = config::load_radio();
     }
     let (tx, rx) = mpsc::unbounded_channel();
+    // Playback truth for our own device, ahead of the Web API poll by a
+    // second or more: librespot says when it really started and stopped.
+    let local = Arc::new(LocalPlayback::default());
+    tokio::spawn(player_event_loop(
+        player_events,
+        Arc::clone(&state),
+        Arc::clone(&local),
+    ));
     // The radio player writes into the same tap librespot's sink does, so the
     // visualizer follows whichever engine is playing.
-    tokio::spawn(Client::new(api, spirc, Arc::clone(&state), rx, audio_tap).run());
+    tokio::spawn(Client::new(api, spirc, mixer, local, Arc::clone(&state), rx, audio_tap).run());
 
     let _ = tx.send(AppCommand::LoadPlaylists);
     let _ = tx.send(AppCommand::RefreshPlayback);
@@ -238,6 +248,64 @@ fn window_title(
         used += cw;
     }
     out
+}
+
+/// Follow librespot's own player, which knows what the audio is doing the
+/// moment it changes.
+///
+/// Everything else about playback comes from `/me/player`, polled every three
+/// seconds and lagging Spotify's backend besides. That is fine for what is
+/// playing and useless for whether it is playing: a pause has to show on the
+/// keypress, not a second later, and a snapshot that arrives mid-flight would
+/// otherwise flip the pill back.
+///
+/// Only our own device is followed. When something else is playing, librespot
+/// is idle and has nothing to say about it.
+async fn player_event_loop(
+    mut events: PlayerEventChannel,
+    state: Arc<RwLock<AppState>>,
+    local: Arc<LocalPlayback>,
+) {
+    /// Re-anchor progress on a snapshot, but only if it describes our device.
+    fn anchor(pb: &mut state::PlaybackSnapshot, position_ms: u32) {
+        pb.progress_ms = u64::from(position_ms).min(pb.duration_ms);
+        pb.fetched_at = Instant::now();
+    }
+
+    while let Some(event) = events.recv().await {
+        let playing = match &event {
+            PlayerEvent::Playing { .. } => Some(true),
+            PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } => Some(false),
+            _ => None,
+        };
+        if let Some(playing) = playing {
+            local.set_playing(playing);
+        }
+
+        let mut st = state.write();
+        let Some(pb) = st.playback.as_mut().filter(|pb| pb.is_local_device) else {
+            continue;
+        };
+        match event {
+            PlayerEvent::Playing { position_ms, .. } => {
+                pb.is_playing = true;
+                anchor(pb, position_ms);
+            }
+            PlayerEvent::Paused { position_ms, .. } => {
+                pb.is_playing = false;
+                anchor(pb, position_ms);
+            }
+            PlayerEvent::Stopped { .. } => pb.is_playing = false,
+            PlayerEvent::Seeked { position_ms, .. }
+            | PlayerEvent::PositionCorrection { position_ms, .. } => anchor(pb, position_ms),
+            // Covers our own volume keys and a change sent from another
+            // Connect client, which Spirc applies to the mixer the same way.
+            PlayerEvent::VolumeChanged { volume } => {
+                pb.volume_percent = client::raw_to_pct(volume);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Keep the Web API token fresh for the lifetime of the app. The librespot

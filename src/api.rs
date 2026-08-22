@@ -77,7 +77,9 @@ impl Api {
             .current_playback(None, None::<&[_]>)
             .await
             .context("failed to fetch playback state")?;
-        Ok(ctx.as_ref().and_then(snapshot_from_context))
+        Ok(ctx
+            .as_ref()
+            .and_then(|c| snapshot_from_context(c, &self.device_id)))
     }
 
     /// The signed-in user's Spotify id.
@@ -488,7 +490,10 @@ fn album_from_raw(a: &RawAlbum) -> Option<AlbumItem> {
     })
 }
 
-fn snapshot_from_context(ctx: &CurrentPlaybackContext) -> Option<PlaybackSnapshot> {
+fn snapshot_from_context(
+    ctx: &CurrentPlaybackContext,
+    device_id: &str,
+) -> Option<PlaybackSnapshot> {
     // Wide, but every field comes from the same `match` on the item kind, and
     // splitting it would mean matching twice.
     let (
@@ -555,6 +560,7 @@ fn snapshot_from_context(ctx: &CurrentPlaybackContext) -> Option<PlaybackSnapsho
         },
         volume_percent: ctx.device.volume_percent.unwrap_or(0).min(100) as u8,
         device_name: ctx.device.name.clone(),
+        is_local_device: ctx.device.id.as_deref() == Some(device_id),
         fetched_at: Instant::now(),
     })
 }

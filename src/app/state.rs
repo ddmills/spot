@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ratatui::layout::{Position, Rect};
@@ -49,6 +50,13 @@ pub struct PlaybackSnapshot {
     /// a device picker would want it.
     #[allow(dead_code)]
     pub device_name: String,
+    /// Whether the reported device is spot's own Connect device.
+    ///
+    /// When it is, playback state has a local source that beats the Web API:
+    /// librespot's player events for play/pause and the soft mixer for volume,
+    /// both immediate where `/me/player` lags by a second or more. When it is
+    /// not — playback is on a phone, say — the API is all there is.
+    pub is_local_device: bool,
     pub fetched_at: Instant,
 }
 
@@ -60,6 +68,35 @@ impl PlaybackSnapshot {
         }
         let elapsed = self.fetched_at.elapsed().as_millis() as u64;
         (self.progress_ms + elapsed).min(self.duration_ms)
+    }
+}
+
+/// What librespot's own player says about play/pause, shared between the task
+/// draining its event channel and the client's Web API poll.
+///
+/// The poll replaces the whole snapshot, so without this the local truth is
+/// overwritten by a `/me/player` response that Spotify's backend has not
+/// caught up on yet — which is what made the play/pause pill flip back a
+/// moment after being pressed.
+#[derive(Debug, Default)]
+pub struct LocalPlayback {
+    /// False until the first player event. Before that there is no local
+    /// truth to prefer and the API's answer has to stand.
+    seen: AtomicBool,
+    playing: AtomicBool,
+}
+
+impl LocalPlayback {
+    pub fn set_playing(&self, playing: bool) {
+        self.playing.store(playing, Ordering::Relaxed);
+        self.seen.store(true, Ordering::Relaxed);
+    }
+
+    /// The local play/pause state, or `None` before any player event.
+    pub fn playing(&self) -> Option<bool> {
+        self.seen
+            .load(Ordering::Relaxed)
+            .then(|| self.playing.load(Ordering::Relaxed))
     }
 }
 

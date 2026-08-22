@@ -7,11 +7,11 @@ use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
-use librespot_playback::audio_backend;
-use librespot_playback::config::{AudioFormat, PlayerConfig};
-use librespot_playback::mixer::{self, MixerConfig};
-use librespot_playback::player::Player;
+use librespot_playback::config::PlayerConfig;
+use librespot_playback::mixer::{self, Mixer, MixerConfig};
+use librespot_playback::player::{Player, PlayerEventChannel};
 
+use crate::audio_sink::SpotSink;
 use crate::audio_tap::{AudioTap, TapSink};
 use crate::{auth, config};
 
@@ -37,8 +37,13 @@ fn explain_connect_failure(e: librespot_core::Error) -> anyhow::Error {
 
 /// Build the librespot session, audio player and Spirc Connect device.
 /// Returns the session, the Spirc control handle, the Spirc event-loop
-/// future (which the caller must spawn), and the PCM tap feeding the
-/// visualizer.
+/// future (which the caller must spawn), the PCM tap feeding the visualizer,
+/// the soft mixer, and the player's event channel.
+///
+/// The mixer and the event channel are what let the UI show playback state
+/// without waiting on the Web API: the mixer holds the volume actually being
+/// applied, and the events say when playback really started or stopped. Both
+/// are local and immediate, where `/me/player` is neither.
 ///
 /// Credentials come from librespot's cache when available (stored on the
 /// first successful connect); otherwise this runs a one-time interactive
@@ -48,6 +53,8 @@ pub async fn build() -> Result<(
     Spirc,
     impl Future<Output = ()> + use<>,
     Arc<AudioTap>,
+    Arc<dyn Mixer>,
+    PlayerEventChannel,
 )> {
     let cache_root = config::cache_dir()?;
     let cache = Cache::new(
@@ -76,7 +83,6 @@ pub async fn build() -> Result<(
     let mixer_fn = mixer::find(None).context("no mixer available")?;
     let mixer = mixer_fn(MixerConfig::default()).context("failed to open mixer")?;
 
-    let backend = audio_backend::find(None).context("no audio backend available")?;
     let tap = Arc::new(AudioTap::new());
     let sink_tap = Arc::clone(&tap);
     // Second soft-volume handle for the tap, so it can undo the attenuation
@@ -87,13 +93,18 @@ pub async fn build() -> Result<(
         session.clone(),
         mixer.get_soft_volume(),
         move || {
-            Box::new(TapSink::new(
-                backend(None, AudioFormat::default()),
-                sink_tap,
-                tap_volume,
-            ))
+            // The sink is built on librespot's own player thread and the
+            // device is only opened here, so a failure has nowhere to be
+            // returned to; librespot's own backends give up in the same place
+            // for the same reason.
+            let backend = SpotSink::open().expect("failed to open an audio output device");
+            Box::new(TapSink::new(Box::new(backend), sink_tap, tap_volume))
         },
     );
+
+    // Taken before `Spirc::new` consumes the player: these are what tell the
+    // UI that playback really started or stopped, with no Web API round trip.
+    let player_events = player.get_player_event_channel();
 
     let connect_config = ConnectConfig {
         name: config::DEVICE_NAME.to_string(),
@@ -111,5 +122,5 @@ pub async fn build() -> Result<(
     .await
     .map_err(explain_connect_failure)?;
 
-    Ok((session, spirc, spirc_task, tap))
+    Ok((session, spirc, spirc_task, tap, mixer, player_events))
 }

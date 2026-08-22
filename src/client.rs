@@ -4,12 +4,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use librespot_connect::Spirc;
+use librespot_playback::mixer::Mixer;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::api::{Api, PAGE_LIMIT};
 use crate::app::command::AppCommand;
-use crate::app::state::{self, AppState, ArtistView, MainView, TrackList, TrackListKind};
+use crate::app::state::{
+    self, AppState, ArtistView, LocalPlayback, MainView, TrackList, TrackListKind,
+};
 use crate::cover::{Cover, CoverCache};
 use crate::radio::api::RadioApi;
 use crate::radio::player::RadioPlayer;
@@ -61,9 +64,20 @@ const COVER_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Client {
     api: Api,
     spirc: Spirc,
+    /// librespot's soft mixer: the volume actually being applied, readable
+    /// and writable without a round trip. Spirc writes it for remote volume
+    /// changes too, so it is the truth for our device either way.
+    mixer: Arc<dyn Mixer>,
+    /// What librespot's player events say about play/pause, so the Web API
+    /// poll can leave the local answer alone.
+    local: Arc<LocalPlayback>,
     state: Arc<RwLock<AppState>>,
     rx: UnboundedReceiver<AppCommand>,
     activated: bool,
+    /// When to re-poll after a transport command, as a deadline rather than a
+    /// sleep: the command loop has to keep draining while it waits, or the
+    /// next keypress sits in the channel behind it.
+    repoll_at: Option<Instant>,
     /// Rate-limit backoff: no playback polling until this instant.
     backoff_until: Option<Instant>,
     backoff: Duration,
@@ -91,6 +105,8 @@ impl Client {
     pub fn new(
         api: Api,
         spirc: Spirc,
+        mixer: Arc<dyn Mixer>,
+        local: Arc<LocalPlayback>,
         state: Arc<RwLock<AppState>>,
         rx: UnboundedReceiver<AppCommand>,
         audio_tap: Arc<crate::audio_tap::AudioTap>,
@@ -106,9 +122,12 @@ impl Client {
         Self {
             api,
             spirc,
+            mixer,
+            local,
             state,
             rx,
             activated: false,
+            repoll_at: None,
             backoff_until: None,
             backoff: BACKOFF_INITIAL,
             cache: Arc::new(Mutex::new(HashMap::new())),
@@ -124,21 +143,29 @@ impl Client {
         let mut poll = tokio::time::interval(POLL_INTERVAL);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            // A deadline the loop watches, rather than a sleep inside the
+            // command arm: waiting there stalled every following command for
+            // the delay plus a round trip, which is what made a second key
+            // press feel like it had been swallowed. A burst of commands just
+            // pushes the deadline out, so the burst still costs one poll.
+            let repoll = self.repoll_at;
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
                     Some(cmd) => {
-                        let repoll = command_touches_playback(&cmd);
+                        if command_touches_playback(&cmd) {
+                            self.repoll_at = Some(Instant::now() + COMMAND_REPOLL_DELAY);
+                        }
                         if let Err(e) = self.handle(cmd).await {
                             log::error!("command failed: {e:#}");
                             self.state.write().toast(format!("error: {e}"));
                         }
-                        if repoll {
-                            tokio::time::sleep(COMMAND_REPOLL_DELAY).await;
-                            self.refresh_playback().await;
-                        }
                     }
                     None => break,
                 },
+                _ = async { tokio::time::sleep_until(repoll.unwrap().into()).await }, if repoll.is_some() => {
+                    self.repoll_at = None;
+                    self.refresh_playback().await;
+                }
                 _ = poll.tick() => self.refresh_playback().await,
             }
         }
@@ -228,24 +255,20 @@ impl Client {
                 }
             }
             VolumeRel(delta) => {
-                let current = self
-                    .state
-                    .read()
-                    .playback
-                    .as_ref()
-                    .map(|pb| pb.volume_percent)
-                    .unwrap_or(50);
+                // Stepped off the mixer, not off the snapshot: the snapshot's
+                // percent is whatever `/me/player` last said, which after a
+                // recent change is a second or so out of date — stepping from
+                // it undoes part of the previous step.
+                let current = self.local_volume_pct();
                 let new_pct = (current as i16 + delta as i16).clamp(0, 100) as u8;
-                self.spirc
-                    .set_volume((new_pct as u32 * u16::MAX as u32 / 100) as u16)?;
+                self.spirc.set_volume(pct_to_raw(new_pct))?;
                 if let Some(pb) = self.state.write().playback.as_mut() {
                     pb.volume_percent = new_pct;
                 }
             }
             SetVolume(pct) => {
                 let pct = pct.min(100);
-                self.spirc
-                    .set_volume((pct as u32 * u16::MAX as u32 / 100) as u16)?;
+                self.spirc.set_volume(pct_to_raw(pct))?;
                 if let Some(pb) = self.state.write().playback.as_mut() {
                     pb.volume_percent = pct;
                 }
@@ -563,6 +586,17 @@ impl Client {
         if let Some(r) = self.state.write().radio.as_mut() {
             r.volume_percent = percent;
         }
+    }
+
+    /// What the soft mixer is actually applying, as a percent.
+    ///
+    /// This is the truth for our own Connect device, and it is instant: Spirc
+    /// writes the mixer synchronously, both for our commands and for a volume
+    /// change arriving from another client. `/me/player`'s percent is the same
+    /// number a second or more later, having been round-tripped through
+    /// Spotify's backend.
+    fn local_volume_pct(&self) -> u8 {
+        raw_to_pct(self.mixer.volume())
     }
 
     /// The volume both engines share, as a percent.
@@ -1060,9 +1094,14 @@ impl Client {
             return;
         }
         match self.api.playback().await {
-            Ok(snapshot) => {
+            Ok(mut snapshot) => {
                 self.backoff_until = None;
                 self.backoff = BACKOFF_INITIAL;
+                prefer_local_truth(
+                    snapshot.as_mut(),
+                    self.local.playing(),
+                    self.local_volume_pct(),
+                );
                 {
                     let mut st = self.state.write();
                     // Keep the last snapshot if the API briefly reports
@@ -1342,6 +1381,46 @@ fn into_facet_rows(facets: Vec<crate::radio::api::Facet>) -> Vec<state::RadioRow
         .collect()
 }
 
+/// Overwrite a polled snapshot's play/pause and volume with what is known
+/// locally, when the snapshot describes our own device.
+///
+/// `/me/player` is the authority on what is playing and a poor one on whether
+/// it is playing: Spirc debounces its notify to the backend, the backend takes
+/// its own time, and the poll that follows a keypress usually arrives carrying
+/// the state from before it. Taking that answer is what made the pill flip
+/// back a moment after being pressed and the slider snap to a stale value.
+///
+/// `local_playing` is `None` until librespot's player has said anything at
+/// all; there is no local truth to prefer before that.
+fn prefer_local_truth(
+    snapshot: Option<&mut state::PlaybackSnapshot>,
+    local_playing: Option<bool>,
+    local_volume_pct: u8,
+) {
+    let Some(pb) = snapshot.filter(|pb| pb.is_local_device) else {
+        return;
+    };
+    if let Some(playing) = local_playing {
+        pb.is_playing = playing;
+    }
+    pb.volume_percent = local_volume_pct;
+}
+
+/// A slider percent as librespot's 16-bit volume.
+pub fn pct_to_raw(percent: u8) -> u16 {
+    (percent.min(100) as u32 * u16::MAX as u32 / 100) as u16
+}
+
+/// librespot's 16-bit volume back as a slider percent.
+///
+/// Rounded, not truncated: the mixer stores the value mapped through its
+/// logarithmic curve and unmaps it on the way out, which costs a bit of
+/// precision, and truncating that turns a round trip of 55 into 54. Rounding
+/// makes [`pct_to_raw`] and this exact inverses across the whole range.
+pub fn raw_to_pct(raw: u16) -> u8 {
+    ((raw as u32 * 100 + u16::MAX as u32 / 2) / u16::MAX as u32) as u8
+}
+
 fn command_touches_playback(cmd: &AppCommand) -> bool {
     matches!(
         cmd,
@@ -1354,4 +1433,99 @@ fn command_touches_playback(cmd: &AppCommand) -> bool {
             | AppCommand::PlayContext { .. }
             | AppCommand::PlayTracks { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::{PlaybackSnapshot, RepeatMode};
+    use librespot_playback::mixer::{self, MixerConfig};
+
+    fn snapshot(is_local_device: bool) -> PlaybackSnapshot {
+        PlaybackSnapshot {
+            is_playing: false,
+            progress_ms: 0,
+            duration_ms: 200_000,
+            track_uri: Some("spotify:track:x".into()),
+            context_uri: None,
+            artist_id: None,
+            album_id: None,
+            track_name: "Song".into(),
+            artists: "Artist".into(),
+            album: "Album".into(),
+            release_year: "2020".into(),
+            cover_url: None,
+            shuffle: false,
+            repeat: RepeatMode::Context,
+            volume_percent: 20,
+            device_name: "somewhere".into(),
+            is_local_device,
+            fetched_at: Instant::now(),
+        }
+    }
+
+    /// The poll that lands ~400 ms after a pause still says "playing"; taking
+    /// it would flip the pill back under the user's finger.
+    #[test]
+    fn a_stale_poll_does_not_undo_a_local_pause() {
+        let mut pb = snapshot(true);
+        pb.is_playing = true;
+        pb.volume_percent = 20;
+        prefer_local_truth(Some(&mut pb), Some(false), 75);
+        assert!(!pb.is_playing);
+        assert_eq!(pb.volume_percent, 75);
+    }
+
+    /// Another device's playback has no local truth to prefer — librespot is
+    /// idle and its mixer describes an output nobody is listening to.
+    #[test]
+    fn a_remote_device_keeps_what_the_api_reported() {
+        let mut pb = snapshot(false);
+        pb.is_playing = true;
+        prefer_local_truth(Some(&mut pb), Some(false), 75);
+        assert!(pb.is_playing);
+        assert_eq!(pb.volume_percent, 20);
+    }
+
+    /// Before librespot's player has said anything there is nothing to prefer,
+    /// so the API's answer has to stand — otherwise the first poll of a
+    /// session would report paused whatever was really happening.
+    #[test]
+    fn the_api_stands_until_the_player_speaks() {
+        let mut pb = snapshot(true);
+        pb.is_playing = true;
+        prefer_local_truth(Some(&mut pb), None, 75);
+        assert!(pb.is_playing);
+        // Volume is not conditional: the mixer is always the truth for our
+        // own device, including a change made from another Connect client.
+        assert_eq!(pb.volume_percent, 75);
+    }
+
+    /// Every percent the UI can produce has to survive a trip through the
+    /// mixer unchanged, or the slider drifts a step at a time: `VolumeRel`
+    /// reads the mixer back to find its base, so a percent that comes back
+    /// one low turns every nudge into a nudge and a half.
+    #[test]
+    fn volume_percent_round_trips_through_the_mixer() {
+        let mixer = mixer::find(None).expect("softvol mixer")(MixerConfig::default())
+            .expect("open the mixer");
+        for pct in 0..=100u8 {
+            mixer.set_volume(pct_to_raw(pct));
+            assert_eq!(
+                raw_to_pct(mixer.volume()),
+                pct,
+                "volume {pct}% did not survive"
+            );
+        }
+    }
+
+    #[test]
+    fn volume_percent_spans_the_whole_range() {
+        assert_eq!(pct_to_raw(0), 0);
+        assert_eq!(pct_to_raw(100), u16::MAX);
+        assert_eq!(raw_to_pct(0), 0);
+        assert_eq!(raw_to_pct(u16::MAX), 100);
+        // Out-of-range input is clamped rather than wrapped.
+        assert_eq!(pct_to_raw(200), u16::MAX);
+    }
 }

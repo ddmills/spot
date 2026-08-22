@@ -1481,6 +1481,7 @@ mod tests {
             repeat: crate::app::state::RepeatMode::Context,
             volume_percent: 50,
             device_name: "dev".into(),
+            is_local_device: true,
             fetched_at: Instant::now(),
         }
     }

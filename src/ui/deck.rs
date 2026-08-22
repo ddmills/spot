@@ -627,6 +627,7 @@ mod tests {
             repeat: RepeatMode::Context,
             volume_percent: 56,
             device_name: "MyPC".into(),
+            is_local_device: true,
             fetched_at: Instant::now(),
         }
     }

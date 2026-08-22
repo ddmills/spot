@@ -2447,6 +2447,7 @@ mod tests {
             repeat: RepeatMode::Off,
             volume_percent: 50,
             device_name: "dev".into(),
+            is_local_device: true,
             fetched_at: std::time::Instant::now(),
         }
     }
