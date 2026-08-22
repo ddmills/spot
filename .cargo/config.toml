@@ -1,0 +1,7 @@
+# Link the MSVC runtime statically. Without this the binary imports
+# VCRUNTIME140.dll, which is the only DLL it needs that Windows does not ship
+# itself — so a machine without the VC++ redistributable refuses to start it.
+# Everything else spot touches (WASAPI audio, schannel TLS) is in-box, which
+# makes the released exe a single self-contained file.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

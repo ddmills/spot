@@ -44,7 +44,10 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
             ("R", "refresh view & playlists"),
         ],
     ),
-    ("Other", &[("?", "toggle this help"), ("q", "quit")]),
+    (
+        "Other",
+        &[("?", "toggle this help"), ("q", "quit"), ("Ctrl-c", "quit")],
+    ),
 ];
 
 const MOUSE_HINTS: &[&str] = &[

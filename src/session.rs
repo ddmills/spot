@@ -15,6 +15,26 @@ use librespot_playback::player::Player;
 use crate::audio_tap::{AudioTap, TapSink};
 use crate::{auth, config};
 
+/// Turn a failed Connect handshake into something a first-time user can act on.
+///
+/// The two failures worth naming are a non-Premium account and stale cached
+/// credentials; librespot reports both as a login failure whose reason only
+/// appears in the message text, so that is what we match on. Anything else
+/// keeps the generic wrapper and the original error underneath.
+fn explain_connect_failure(e: librespot_core::Error) -> anyhow::Error {
+    let detail = e.to_string();
+    let hint = if detail.contains("Premium account required") {
+        "\nspot streams audio itself through librespot, which Spotify only \
+         permits for Premium accounts."
+    } else if detail.contains("Bad credentials") || detail.contains("validate credentials") {
+        "\nThe saved login is no longer valid. Delete the `creds` file in \
+         %LOCALAPPDATA%\\spot and start spot again to log in fresh."
+    } else {
+        ""
+    };
+    anyhow::anyhow!("failed to start Spotify Connect device: {detail}{hint}")
+}
+
 /// Build the librespot session, audio player and Spirc Connect device.
 /// Returns the session, the Spirc control handle, the Spirc event-loop
 /// future (which the caller must spawn), and the PCM tap feeding the
@@ -89,7 +109,7 @@ pub async fn build() -> Result<(
         Arc::clone(&mixer),
     )
     .await
-    .context("failed to start Spotify Connect device")?;
+    .map_err(explain_connect_failure)?;
 
     Ok((session, spirc, spirc_task, tap))
 }

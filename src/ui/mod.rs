@@ -30,10 +30,10 @@ const BAR_H: u16 = 1 + deck::DECK_H + 1;
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     // Expire stale toasts.
-    if let Some((_, at)) = &state.toast {
-        if at.elapsed() > TOAST_TTL {
-            state.toast = None;
-        }
+    if let Some((_, at)) = &state.toast
+        && at.elapsed() > TOAST_TTL
+    {
+        state.toast = None;
     }
 
     // Rebuild mouse hit regions from scratch each frame.

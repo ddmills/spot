@@ -772,10 +772,10 @@ impl Client {
     }
 
     async fn refresh_playback(&mut self) {
-        if let Some(until) = self.backoff_until {
-            if Instant::now() < until {
-                return;
-            }
+        if let Some(until) = self.backoff_until
+            && Instant::now() < until
+        {
+            return;
         }
         match self.api.playback().await {
             Ok(snapshot) => {

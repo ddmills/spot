@@ -27,9 +27,32 @@ use crate::app::command::AppCommand;
 use crate::app::state::AppState;
 use crate::client::Client;
 
+/// Below this the browse pane starts shedding columns and art; the UI still
+/// draws, it just has less to say.
+const MIN_COLS: u16 = 80;
+const MIN_ROWS: u16 = 24;
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // Everything that can fail here fails before the TUI starts, or
+            // after it has restored the terminal, so plain printing is safe.
+            // The wait matters when spot was double-clicked from Explorer:
+            // the console it opened closes with the process, and the error
+            // would be gone before it could be read.
+            eprintln!("\nspot: {e:#}");
+            eprintln!("\nPress Enter to close.");
+            let _ = std::io::stdin().read_line(&mut String::new());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     init_logging()?;
+    warn_about_terminal();
 
     // Auth and session setup happen before the TUI takes the terminal, so
     // the OAuth flow can print instructions and block on the browser.
@@ -112,6 +135,47 @@ async fn run_tui(
         }
     }
     Ok(())
+}
+
+/// Warn, before the alternate screen hides the console, about the two terminal
+/// properties the UI assumes.
+///
+/// Both are warnings rather than errors: the app still runs, it just looks
+/// wrong, and refusing to start on a heuristic would be worse than a garbled
+/// first frame. ASCII only — this may reach a legacy console codepage.
+fn warn_about_terminal() {
+    let mut warned = false;
+
+    // The whole palette is truecolor (see ui::theme) and album art is drawn as
+    // per-cell RGB half-blocks, so a 16-color terminal has nothing to fall
+    // back to. Windows Terminal advertises itself through WT_SESSION; other
+    // capable terminals generally set COLORTERM.
+    let truecolor = std::env::var_os("WT_SESSION").is_some()
+        || std::env::var("COLORTERM")
+            .map(|v| v.contains("truecolor") || v.contains("24bit"))
+            .unwrap_or(false);
+    if !truecolor {
+        println!(
+            "warning: this terminal does not advertise 24-bit color. spot's colors\n\
+             and album art need it - Windows Terminal is the safe choice."
+        );
+        warned = true;
+    }
+
+    if let Ok((w, h)) = crossterm::terminal::size()
+        && (w < MIN_COLS || h < MIN_ROWS)
+    {
+        println!(
+            "warning: the window is {w}x{h}; spot expects at least {MIN_COLS}x{MIN_ROWS}.\n\
+             Columns and album art will be dropped to fit."
+        );
+        warned = true;
+    }
+
+    if warned {
+        // Long enough to read before the alternate screen takes over.
+        std::thread::sleep(Duration::from_millis(2500));
+    }
 }
 
 /// Window/tab title mirroring the now-playing line. Track metadata is

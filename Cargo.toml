@@ -1,7 +1,17 @@
 [package]
 name = "spot"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+# ratatui 0.30 sets the real floor; the librespot crates need 1.85, as does
+# edition 2024 itself.
+rust-version = "1.88"
+description = "A standalone Spotify player for the terminal"
+license = "MIT"
+repository = "https://github.com/ddmills/spot"
+readme = "README.md"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 librespot-core = "0.8.0"
@@ -28,6 +38,10 @@ zune-core = "0.5"
 
 [profile.release]
 lto = true
+# One codegen unit and no symbols: the release build is a download, so the
+# size and the extra inlining are both worth the slower link.
+codegen-units = 1
+strip = "symbols"
 
 [profile.dev]
 opt-level = 2

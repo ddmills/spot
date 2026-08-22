@@ -21,6 +21,14 @@ pub fn handle_event(event: Event, state: &Arc<RwLock<AppState>>, tx: &UnboundedS
     match event {
         // Windows emits both Press and Release events; act on Press only.
         Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // Raw mode means the terminal never turns Ctrl-C into a signal, so
+            // it would otherwise do nothing at all — and it is the first thing
+            // someone reaches for. Handled above the mode dispatch so it also
+            // quits from the search prompt, where a bare `q` is just a letter.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                state.write().should_quit = true;
+                return;
+            }
             let mode = state.read().input_mode;
             match mode {
                 InputMode::Search => handle_search_input(key, state, tx),

@@ -1,7 +1,8 @@
 use std::collections::HashSet;
+use std::net::TcpListener;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use librespot_oauth::{OAuthClientBuilder, OAuthToken};
 
 use crate::config;
@@ -17,6 +18,9 @@ pub const WEB_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
 pub const SESSION_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 
 const REDIRECT_URI: &str = "http://127.0.0.1:8989/login";
+/// The port inside [`REDIRECT_URI`]. Spotify only redirects to URIs registered
+/// with the app, so this cannot fall back to another port when it is taken.
+const REDIRECT_PORT: u16 = 8989;
 
 /// Scope list mirrored from ncspot's NCSPOT_OAUTH_SCOPES (their PR #1772,
 /// Feb 2026) — the exact set proven to pass authorization for this client ID
@@ -40,6 +44,30 @@ const SCOPES: &[&str] = &[
     "user-read-recently-played",
 ];
 
+/// Check the OAuth redirect port is free before starting a browser flow.
+///
+/// The login server binds [`REDIRECT_PORT`] and blocks until Spotify redirects
+/// to it. If something else already holds the port, the bind fails inside
+/// librespot-oauth *after* the browser has opened, which reads as the login
+/// simply not working. Checking up front turns it into a sentence.
+fn check_redirect_port() -> Result<()> {
+    // Dropped immediately — this is a probe, not the real listener. The gap
+    // between here and librespot's own bind is a race we accept: losing it
+    // only costs the better error message.
+    match TcpListener::bind(("127.0.0.1", REDIRECT_PORT)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) => Err(anyhow!(
+            "port {REDIRECT_PORT} on 127.0.0.1 is not available ({e}).\n\
+             The Spotify login page redirects there, and the port is fixed \
+             because it is registered with the Spotify app.\n\
+             Close whatever is using it, then start spot again."
+        )),
+    }
+}
+
 fn client(client_id: &str) -> Result<librespot_oauth::OAuthClient> {
     OAuthClientBuilder::new(client_id, REDIRECT_URI, SCOPES.to_vec())
         .open_in_browser()
@@ -50,6 +78,7 @@ fn client(client_id: &str) -> Result<librespot_oauth::OAuthClient> {
 /// Interactive browser login for the Web API token (ncspot client ID).
 /// Blocks on the local redirect listener; run before the TUI starts.
 pub fn login_web_interactive() -> Result<OAuthToken> {
+    check_redirect_port()?;
     let token = client(WEB_CLIENT_ID)?
         .get_access_token()
         .context("OAuth login failed")?;
@@ -64,6 +93,7 @@ pub fn login_web_interactive() -> Result<OAuthToken> {
 /// Only needed when no reusable credentials are cached yet; librespot stores
 /// credentials after the first successful connect.
 pub fn login_session_interactive() -> Result<OAuthToken> {
+    check_redirect_port()?;
     client(SESSION_CLIENT_ID)?
         .get_access_token()
         .context("OAuth login for playback session failed")

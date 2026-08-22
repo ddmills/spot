@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked: see the note in ci.yml about the vergen pin.
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $env:GITHUB_REF -replace '^refs/tags/', ''
+          } else {
+            'v' + (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          }
+          $name = "spot-$tag-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/spot.exe, README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "$name.zip" -Force
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          $exeHash = (Get-FileHash target/release/spot.exe -Algorithm SHA256).Hash.ToLower()
+          "tag=$tag"        | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "zip=$name.zip"   | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "sha=$hash"       | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "exesha=$exeHash" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      # Confirm the static CRT actually took. Without it the exe imports
+      # VCRUNTIME140.dll and refuses to start on a machine that has never had
+      # the VC++ redistributable installed — exactly the machine we ship to.
+      - name: Verify the binary is self-contained
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("target/release/spot.exe")
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -match 'VCRUNTIME\d+\.dll') {
+            Write-Error "spot.exe still imports the VC++ runtime; +crt-static did not apply."
+            exit 1
+          }
+          Write-Output "No VC++ runtime dependency."
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: spot ${{ steps.package.outputs.tag }}
+          files: |
+            ${{ steps.package.outputs.zip }}
+            target/release/spot.exe
+          body: |
+            A standalone Spotify player for the terminal. Requires Spotify Premium,
+            Windows 10/11, and a truecolor terminal — [Windows Terminal](https://aka.ms/terminal)
+            is the safe choice.
+
+            Download `spot.exe` and run it from a terminal. Nothing to install. The exe is
+            unsigned, so SmartScreen will ask: *More info* → *Run anyway*.
+
+            SHA256:
+
+            ```
+            ${{ steps.package.outputs.exesha }}  spot.exe
+            ${{ steps.package.outputs.sha }}  ${{ steps.package.outputs.zip }}
+            ```

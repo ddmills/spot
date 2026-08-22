@@ -4,6 +4,37 @@ A standalone Spotify player for the terminal, built with [ratatui](https://ratat
 [librespot](https://github.com/librespot-org/librespot). It streams and plays audio itself —
 no Spotify desktop app required. Requires **Spotify Premium**.
 
+## Download
+
+Grab `spot.exe` from the [latest release](https://github.com/ddmills/spot/releases/latest).
+It is one self-contained file — nothing to install, no runtime to add, and it writes only to
+your own `%APPDATA%` and `%LOCALAPPDATA%`. Delete the exe and those two folders and it is gone.
+
+You need:
+
+- **Windows 10 or 11**
+- **Spotify Premium** — librespot can only stream for Premium accounts
+- **[Windows Terminal](https://aka.ms/terminal)**, or another terminal with 24-bit color. This
+  is a real requirement rather than a preference: the whole palette is truecolor and album art
+  is drawn as per-cell RGB half-blocks, so a 16-color console renders it as garbage. spot warns
+  you at startup if it can't tell that your terminal supports it.
+
+Run it from a terminal — `.\spot.exe` — rather than double-clicking, so the window stays put.
+
+The exe is not code-signed, so the first launch shows **"Windows protected your PC"**. Choose
+*More info* → *Run anyway*. (If that bothers you, build it yourself — see below.)
+
+### First run
+
+Two browser windows open, one after the other: the first authorizes the Web API, the second
+authorizes the playback engine. Both are Spotify's own login page, both are one-time, and after
+them spot refreshes its own tokens forever.
+
+Windows may also ask to allow a network connection — spot briefly listens on `127.0.0.1:8989`
+to catch Spotify's login redirect. Local only; nothing else can reach it. If some other program
+already holds that port, spot says so and stops, because the port is registered with Spotify
+and can't be changed.
+
 ## How it works
 
 - **librespot** provides the playback engine: the app logs in with your Spotify account and
@@ -28,17 +59,29 @@ no Spotify desktop app required. Requires **Spotify Premium**.
 - Because the Web API client ID's quota is shared with all ncspot/spotify-player users,
   polling backs off automatically when Spotify returns 429.
 
-## Running
+## Where it keeps things
+
+- `%APPDATA%\spot\auth.json` — the Web API refresh token
+- `%LOCALAPPDATA%\spot\creds` — the playback session credentials
+- `%LOCALAPPDATA%\spot\audio` — streamed audio cache, capped at 2 GiB
+- `%LOCALAPPDATA%\spot\spot.log` — the log, rewritten each run
+
+There is no config file; nothing needs setting up.
+
+## Building from source
 
 ```
-cargo run --release
+cargo build --locked --release
 ```
 
-On first run a browser window opens for Spotify login. After that, tokens refresh
-automatically. Logs go to `%LOCALAPPDATA%\spot\spot.log`; streamed audio is cached in
-`%LOCALAPPDATA%\spot\audio` (capped at 2 GiB).
+`--locked` matters: `Cargo.lock` pins `vergen` to 9.0.6, and librespot 0.8.0's build script
+breaks with 9.1.0. If you regenerate the lockfile and the build fails inside `librespot-core`,
+run `cargo update -p vergen@9.1.0 --precise 9.0.6`.
 
-Use Windows Terminal for best results.
+The build needs Rust 1.88 or newer. `.cargo/config.toml` links the MSVC runtime statically so
+the binary doesn't need the VC++ redistributable; `build.rs` embeds the icon and version
+resource, which wants `rc.exe` from the Windows SDK — without it you get a warning and an
+unbranded but working exe.
 
 ## Getting around
 
@@ -90,7 +133,7 @@ it closes the player and lands you there.
 | `/` | search Spotify |
 | `R` | refresh the current view and your playlists |
 | `?` | help overlay |
-| `q` | quit |
+| `q`, `Ctrl-c` | quit |
 
 Sorting reorders the visible list only; the playing-context order (and the
 `→` next-up marker) follow Spotify's own order, so the marker hides while a
@@ -98,9 +141,7 @@ sort is active. Playlists longer than 500 tracks load fully, streaming in
 page by page; reopening a playlist is instant until it changes on Spotify's
 side (or you press `R`).
 
-## Notes
+## License
 
-- The build pins `vergen` to 9.0.6 in `Cargo.lock` (librespot 0.8.0's build script breaks
-  with vergen 9.1.0). If you regenerate the lockfile and the build fails in
-  `librespot-core`'s build script, re-run:
-  `cargo update -p vergen@9.1.0 --precise 9.0.6`
+MIT — see [LICENSE](LICENSE). spot builds on librespot, ratatui and rspotify, all MIT licensed;
+it is not affiliated with or endorsed by Spotify.
