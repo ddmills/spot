@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::command::AppCommand;
 use crate::app::state::{
     self as state, AppState, ArtistRow, BackTarget, CrumbTarget, HomeItem, InputMode, MainView,
-    SearchTab, SortKey, Track, TrackList, ViewKey,
+    RadioRow, RadioScope, RadioTab, SearchTab, SortKey, Station, Track, TrackList, ViewKey,
 };
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -99,6 +99,20 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
             st.search_tab = tab;
             st.main_to_top();
         }
+        return;
+    }
+
+    // The radio strip. Unlike search's, each tab is a page of its own — see
+    // `cycle_view_tab` — so clicking one navigates rather than re-cutting a
+    // result set already in hand.
+    if let Some(tab) = st
+        .hit
+        .radio_tabs
+        .iter()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, tab)| *tab)
+    {
+        open_radio_tab(st, tab, tx);
         return;
     }
 
@@ -354,10 +368,24 @@ fn handle_search_input(
             st.input_mode = InputMode::Normal;
             st.input_buffer.clear();
             if !query.is_empty() {
-                // Before the tab reset, so the snapshot keeps the tab the
-                // page you are leaving was on.
-                navigate(&mut st, AppCommand::Search(query), tx);
-                st.search_tab = SearchTab::Tracks;
+                // The prompt searches whatever you are looking at. On a radio
+                // page that is the station directory — the two catalogues have
+                // nothing to do with each other, and one box that quietly
+                // queried both would return a list nobody asked for.
+                if matches!(st.main, MainView::Radio(_)) {
+                    navigate(
+                        &mut st,
+                        AppCommand::LoadRadio {
+                            scope: RadioScope::Search(query),
+                        },
+                        tx,
+                    );
+                } else {
+                    // Before the tab reset, so the snapshot keeps the tab the
+                    // page you are leaving was on.
+                    navigate(&mut st, AppCommand::Search(query), tx);
+                    st.search_tab = SearchTab::Tracks;
+                }
             }
         }
         KeyCode::Backspace => {
@@ -395,8 +423,23 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
             }
         }
 
-        // Transport
+        // Transport. Play/pause and volume mean the same thing to either
+        // engine and are routed by the client; the four below have no meaning
+        // for a live broadcast, so they say so rather than reaching Spirc and
+        // quietly starting Spotify underneath the stream.
         KeyCode::Char(' ') => drop(tx.send(AppCommand::PlayPause)),
+        KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('s')
+            if state.read().radio.is_some() =>
+        {
+            state
+                .write()
+                .toast("radio is live — there is no track to skip");
+        }
+        KeyCode::Char('h') | KeyCode::Char('l') if state.read().radio.is_some() => {
+            state
+                .write()
+                .toast("radio is live — there is nothing to seek");
+        }
         KeyCode::Char('n') => drop(tx.send(AppCommand::Next)),
         KeyCode::Char('p') => drop(tx.send(AppCommand::Prev)),
         KeyCode::Char('h') => drop(tx.send(AppCommand::SeekRel(-5000))),
@@ -427,8 +470,8 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
         KeyCode::Char('v') => open_player(&mut state.write(), tx),
 
         // Tab strips (search view and artist view)
-        KeyCode::Left | KeyCode::Char('[') => cycle_view_tab(&mut state.write(), -1),
-        KeyCode::Right | KeyCode::Char(']') => cycle_view_tab(&mut state.write(), 1),
+        KeyCode::Left | KeyCode::Char('[') => cycle_view_tab(&mut state.write(), -1, tx),
+        KeyCode::Right | KeyCode::Char(']') => cycle_view_tab(&mut state.write(), 1, tx),
 
         // Sorting (track views only)
         KeyCode::Char('o') => cycle_sort(&mut state.write()),
@@ -630,6 +673,7 @@ fn target_key(cmd: &AppCommand) -> Option<ViewKey> {
         AppCommand::OpenAlbum { id, .. } => Some(ViewKey::Tracks(state::album_key(id))),
         AppCommand::OpenArtist { id, .. } => Some(ViewKey::Artist(id.clone())),
         AppCommand::Search(_) => Some(ViewKey::Search),
+        AppCommand::LoadRadio { scope } => Some(ViewKey::Radio(state::radio_key(scope))),
         _ => None,
     }
 }
@@ -840,18 +884,39 @@ fn flip_sort(st: &mut AppState) {
     snap_to_selection(st);
 }
 
-/// ←/→: switch tabs in the search view, the only tabbed view left.
-fn cycle_view_tab(st: &mut AppState, delta: i64) {
-    if !matches!(st.main, MainView::Search(_)) {
-        return;
+/// ←/→: switch tabs on the two tabbed views.
+///
+/// Search's tabs are four cuts of one result set already in hand, so switching
+/// is free. Radio's are four different queries, so switching *navigates* — the
+/// new tab is its own page, and Esc walks back to the one you left.
+fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand>) {
+    match &st.main {
+        MainView::Search(_) => {
+            let pos = SearchTab::ALL
+                .iter()
+                .position(|t| *t == st.search_tab)
+                .unwrap_or(0) as i64;
+            let n = SearchTab::ALL.len() as i64;
+            st.search_tab = SearchTab::ALL[((pos + delta).rem_euclid(n)) as usize];
+            st.main_to_top();
+        }
+        MainView::Radio(v) => {
+            let current = v.scope.tab();
+            let pos = RadioTab::ALL
+                .iter()
+                .position(|t| *t == current)
+                .unwrap_or(0) as i64;
+            let n = RadioTab::ALL.len() as i64;
+            let tab = RadioTab::ALL[((pos + delta).rem_euclid(n)) as usize];
+            open_radio_tab(st, tab, tx);
+        }
+        _ => {}
     }
-    let pos = SearchTab::ALL
-        .iter()
-        .position(|t| *t == st.search_tab)
-        .unwrap_or(0) as i64;
-    let n = SearchTab::ALL.len() as i64;
-    st.search_tab = SearchTab::ALL[((pos + delta).rem_euclid(n)) as usize];
-    st.main_to_top();
+}
+
+/// Open a radio tab, from the strip or from ←/→.
+fn open_radio_tab(st: &mut AppState, tab: RadioTab, tx: &UnboundedSender<AppCommand>) {
+    navigate(st, AppCommand::LoadRadio { scope: tab.scope() }, tx);
 }
 
 /// Enter / click: drill into the selected row, or play it.
@@ -883,6 +948,16 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                         st.main_to_top();
                     }
                 }
+                // Straight to the chart rather than to your saved stations:
+                // the list is empty until you have kept something, and a
+                // destination that opens onto nothing is a dead end.
+                HomeItem::Radio => navigate(
+                    st,
+                    AppCommand::LoadRadio {
+                        scope: RadioScope::Popular,
+                    },
+                    tx,
+                ),
             }
             return;
         }
@@ -891,6 +966,23 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 return;
             };
             navigate(st, AppCommand::LoadPlaylistTracks { playlist_id: id }, tx);
+            return;
+        }
+        // Radio is half navigation and half playback: a country or genre is a
+        // door, a station is a thing to play. Neither goes through the Spotify
+        // path below, so both are resolved here.
+        MainView::Radio(v) => {
+            match v.rows.get(st.main_index) {
+                Some(RadioRow::Facet { key, .. }) => {
+                    let scope = match v.scope.tab() {
+                        RadioTab::Genres => RadioScope::Genre(key.clone()),
+                        _ => RadioScope::Country(key.clone()),
+                    };
+                    navigate(st, AppCommand::LoadRadio { scope }, tx);
+                }
+                Some(RadioRow::Station(s)) => play_station(st, s.clone(), tx),
+                None => {}
+            }
             return;
         }
         _ => {}
@@ -902,7 +994,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let mut adhoc: Option<(String, Vec<Track>)> = None;
     let cmd = match &st.main {
         // Handled above; the match must still be total.
-        MainView::Home | MainView::Playlists => None,
+        MainView::Home | MainView::Playlists | MainView::Radio(_) => None,
         MainView::Tracks(list) => {
             let Some(&ti) = list.display.get(index) else {
                 return;
@@ -995,6 +1087,35 @@ fn display_tracks(list: &TrackList) -> Vec<Track> {
 
 /// Start playback of whatever the main pane is showing, from the top
 /// (header ▶ Play, and the main-pane half of `x`).
+/// Start a station, saying so before the connection has had time to happen.
+///
+/// The toast is not decoration: connecting takes a second or two and prefetches
+/// five more, and until audio arrives nothing else on the screen would have
+/// changed. An HLS station is refused here rather than in the client, because
+/// this is the only place that can say so while the row is still under the
+/// cursor.
+fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCommand>) {
+    // Enter on the station already playing stops it, which is the only way to
+    // stop radio without starting something else. It needs no key of its own:
+    // pressing play on the thing that is playing is the same gesture as
+    // pressing pause, and this is the row that says which station that is.
+    if st
+        .radio
+        .as_ref()
+        .is_some_and(|r| r.station.uuid == station.uuid)
+    {
+        st.toast(format!("stopped {}", station.name));
+        let _ = tx.send(AppCommand::StopRadio);
+        return;
+    }
+    if station.hls {
+        st.toast("that station streams over HLS, which spot can't play yet");
+        return;
+    }
+    st.toast(format!("tuning in to {}…", station.name));
+    let _ = tx.send(AppCommand::PlayStation(Box::new(station)));
+}
+
 fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let mut adhoc: Option<(String, Vec<Track>)> = None;
     let cmd = match &st.main {
@@ -1048,6 +1169,15 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             Some(HomeItem::DiscoverWeekly) => st.discover_weekly().map(|p| p.uri.clone()),
             _ => None,
         },
+        // A station is played, never opened, so `x` and Enter are the same
+        // gesture here. On a facet row there is nothing to play.
+        MainView::Radio(v) => {
+            if let Some(RadioRow::Station(s)) = v.rows.get(st.main_index) {
+                let station = s.clone();
+                play_station(st, station, tx);
+            }
+            return;
+        }
         _ => {
             play_current_view(st, tx);
             return;
@@ -1216,6 +1346,15 @@ fn queue_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     if st.show_player {
         return toggle_like_playing(st, tx);
+    }
+    // On a station row `L` keeps the station. Same key, same gesture — the
+    // difference is only that a station is kept in a file of spot's own,
+    // because the directory has no account to keep it in.
+    if let MainView::Radio(v) = &st.main {
+        if let Some(RadioRow::Station(s)) = v.rows.get(st.main_index) {
+            let _ = tx.send(AppCommand::ToggleSavedStation(Box::new(s.clone())));
+        }
+        return;
     }
     let uri = match &st.main {
         MainView::Tracks(list) => list
@@ -1825,8 +1964,8 @@ mod tests {
         assert!(matches!(st.main, MainView::Home));
         assert_eq!(st.back_target(), None, "Home has nowhere to go back to");
 
-        // Without Discover Weekly there are two rows; Playlists is the last.
-        st.main_index = st.main_len() - 1;
+        // Without Discover Weekly the rows are Liked Songs, Playlists, Radio.
+        st.main_index = 1;
         activate_selection(&mut st, &tx);
         assert!(matches!(st.main, MainView::Playlists));
         assert_eq!(labels(&st), ["home", "playlists"]);
@@ -1853,14 +1992,14 @@ mod tests {
         let mut st = AppState::new();
         assert_eq!(
             st.home_items(),
-            vec![HomeItem::LikedSongs, HomeItem::Playlists]
+            vec![HomeItem::LikedSongs, HomeItem::Playlists, HomeItem::Radio]
         );
 
         // Someone else's playlist of the same name is not Spotify's.
         st.playlists = vec![playlist("p1", "Discover Weekly", "dm")];
         assert_eq!(
             st.home_items(),
-            vec![HomeItem::LikedSongs, HomeItem::Playlists]
+            vec![HomeItem::LikedSongs, HomeItem::Playlists, HomeItem::Radio]
         );
 
         st.playlists
@@ -1870,7 +2009,8 @@ mod tests {
             vec![
                 HomeItem::LikedSongs,
                 HomeItem::DiscoverWeekly,
-                HomeItem::Playlists
+                HomeItem::Playlists,
+                HomeItem::Radio
             ]
         );
 
@@ -2060,5 +2200,261 @@ mod tests {
         // A click that misses the name leaves the view where it was.
         handle_click(&mut st, Position { x: 40, y: 9 }, &tx);
         assert!(!st.show_player);
+    }
+
+    fn test_station(uuid: &str, name: &str) -> Station {
+        Station {
+            uuid: uuid.into(),
+            name: name.into(),
+            url: format!("http://stream/{uuid}"),
+            homepage: String::new(),
+            tags: "eclectic".into(),
+            country: "The United States Of America".into(),
+            countrycode: "US".into(),
+            language: "english".into(),
+            codec: "MP3".into(),
+            bitrate: 128,
+            votes: 12,
+            hls: false,
+        }
+    }
+
+    fn radio_page(scope: RadioScope, rows: Vec<RadioRow>) -> MainView {
+        let mut view = crate::app::state::RadioView::new(scope, 0);
+        view.rows = rows;
+        view.loading = false;
+        MainView::Radio(view)
+    }
+
+    fn live_radio(station: Station) -> crate::app::state::RadioPlayback {
+        crate::app::state::RadioPlayback {
+            station,
+            is_playing: true,
+            started_at: Instant::now(),
+            title: Arc::new(parking_lot::Mutex::new(None)),
+            volume_percent: 50,
+        }
+    }
+
+    /// Home's Radio row opens the chart, not your saved list: Saved is empty
+    /// until you have kept something, and a destination that opens onto
+    /// nothing is a dead end.
+    #[test]
+    fn the_home_radio_row_opens_the_chart() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main_index = st.home_items().len() - 1;
+        assert_eq!(st.home_items()[st.main_index], HomeItem::Radio);
+
+        activate_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio {
+                scope: RadioScope::Popular
+            })
+        ));
+        // The page is pushed on the keypress and the directory answers later,
+        // so until it does the head is still the page you left.
+        st.main = radio_page(RadioScope::Popular, vec![]);
+        assert_eq!(labels(&st), ["home", "radio"]);
+    }
+
+    /// A facet row is a door and a station row is a thing to play, so Enter
+    /// means two things on the one page.
+    #[test]
+    fn enter_drills_into_a_facet_and_plays_a_station() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+
+        st.main = radio_page(
+            RadioScope::Countries,
+            vec![RadioRow::Facet {
+                key: "GB".into(),
+                label: "The United Kingdom".into(),
+                count: 2146,
+            }],
+        );
+        activate_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio { scope: RadioScope::Country(code) }) if code == "GB"
+        ));
+
+        st.main = radio_page(
+            RadioScope::Popular,
+            vec![RadioRow::Station(test_station("a", "Radio Paradise"))],
+        );
+        activate_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::PlayStation(s)) if s.uuid == "a"
+        ));
+    }
+
+    /// The genre tab queries by tag and the country tab by code. The two rows
+    /// are the same shape, so drilling in has to pick the right query from the
+    /// page it is on rather than from the row.
+    #[test]
+    fn a_genre_facet_queries_by_tag() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = radio_page(
+            RadioScope::Genres,
+            vec![RadioRow::Facet {
+                key: "jazz".into(),
+                label: "jazz".into(),
+                count: 900,
+            }],
+        );
+        activate_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio { scope: RadioScope::Genre(tag) }) if tag == "jazz"
+        ));
+    }
+
+    /// Enter on the station already playing stops it — the only way to stop
+    /// radio without starting something else, and it needs no key of its own.
+    #[test]
+    fn enter_on_the_playing_station_stops_it() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        let station = test_station("a", "Radio Paradise");
+        st.radio = Some(live_radio(station.clone()));
+        st.main = radio_page(RadioScope::Popular, vec![RadioRow::Station(station)]);
+
+        activate_selection(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::StopRadio)));
+    }
+
+    /// HLS rows are listed rather than hidden, because dropping them would
+    /// silently remove the BBC — so pressing Enter on one has to say why
+    /// nothing happened instead of failing quietly.
+    #[test]
+    fn an_hls_station_is_refused_with_a_reason() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        let mut station = test_station("c", "BBC Radio 6 Music");
+        station.hls = true;
+        st.main = radio_page(RadioScope::Popular, vec![RadioRow::Station(station)]);
+
+        activate_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "nothing should be sent");
+        let (msg, _) = st.toast.as_ref().expect("the refusal must be said");
+        assert!(msg.contains("HLS"), "{msg:?}");
+    }
+
+    /// `L` keeps a station. The same key likes a track, because it is the same
+    /// gesture — only the store behind it differs.
+    #[test]
+    fn l_saves_the_selected_station() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = radio_page(
+            RadioScope::Popular,
+            vec![RadioRow::Station(test_station("a", "Radio Paradise"))],
+        );
+        toggle_like_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::ToggleSavedStation(s)) if s.uuid == "a"
+        ));
+
+        // On a facet row there is nothing to keep, and `L` must not fall
+        // through to liking whatever Spotify happens to be paused on.
+        st.main = radio_page(
+            RadioScope::Countries,
+            vec![RadioRow::Facet {
+                key: "GB".into(),
+                label: "GB".into(),
+                count: 1,
+            }],
+        );
+        st.playback = Some(playing("spotify:playlist:p1"));
+        toggle_like_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "a facet row likes nothing");
+    }
+
+    /// Radio's tabs are four different queries, so ←/→ navigates rather than
+    /// re-cutting a result set already in hand.
+    #[test]
+    fn arrows_navigate_between_radio_tabs() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = radio_page(RadioScope::Popular, vec![]);
+
+        cycle_view_tab(&mut st, 1, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio {
+                scope: RadioScope::Countries
+            })
+        ));
+
+        // Drilling into a country leaves the Countries tab lit, so the next
+        // step along is Genres rather than Countries over again.
+        st.main = radio_page(RadioScope::Country("GB".into()), vec![]);
+        cycle_view_tab(&mut st, 1, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio {
+                scope: RadioScope::Genres
+            })
+        ));
+    }
+
+    /// While a station is live the Spotify-only transport keys must not reach
+    /// Spirc: doing so would start Spotify playing underneath the stream.
+    #[test]
+    fn skip_and_seek_are_refused_while_radio_is_live() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        state.write().radio = Some(live_radio(test_station("a", "Radio Paradise")));
+
+        for key in ['n', 'p', 's', 'h', 'l'] {
+            handle_normal(KeyEvent::from(KeyCode::Char(key)), &state, &tx);
+            assert!(
+                rx.try_recv().is_err(),
+                "`{key}` must not reach Spotify while radio is live"
+            );
+            assert!(state.read().toast.is_some(), "`{key}` should say why");
+            state.write().toast = None;
+        }
+
+        // Play/pause and volume mean the same thing to either engine, so they
+        // go through and the client routes them.
+        handle_normal(KeyEvent::from(KeyCode::Char(' ')), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayPause)));
+        handle_normal(KeyEvent::from(KeyCode::Char('=')), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::VolumeRel(5))));
+    }
+
+    /// The one search box points at whichever catalogue the page it is over
+    /// came from.
+    #[test]
+    fn the_prompt_searches_stations_on_a_radio_page() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        {
+            let mut st = state.write();
+            st.main = radio_page(RadioScope::Popular, vec![]);
+            st.input_mode = InputMode::Search;
+            st.input_buffer = "jazz".into();
+        }
+        handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio { scope: RadioScope::Search(q) }) if q == "jazz"
+        ));
+
+        // Anywhere else it is still Spotify.
+        {
+            let mut st = state.write();
+            st.main = MainView::Home;
+            st.input_mode = InputMode::Search;
+            st.input_buffer = "jazz".into();
+        }
+        handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "jazz"));
     }
 }

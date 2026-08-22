@@ -297,6 +297,128 @@ mod tests {
         assert!(lines[10].contains("Playlists"), "{:?}", lines[10]);
         assert!(lines[10].contains("9 playlists"), "{:?}", lines[10]);
         assert!(lines[11].contains("saved and followed"), "{:?}", lines[11]);
+
+        // Radio appends, so every row above it keeps the line it was on.
+        assert!(lines[13].contains("Radio"), "{:?}", lines[13]);
+        assert!(
+            lines[13].trim_end().ends_with("Radio"),
+            "no saved stations yet, so no count: {:?}",
+            lines[13]
+        );
+        assert!(
+            lines[14].contains("live stations from around the world"),
+            "{:?}",
+            lines[14]
+        );
+    }
+
+    /// The Radio row counts what you kept, because the directory's 57,000
+    /// stations are not a number that row could honestly claim.
+    #[test]
+    fn the_radio_row_counts_saved_stations() {
+        let mut st = browse_state();
+        st.main = crate::app::state::MainView::Home;
+        st.radio_favorites = vec![station("a", "Radio Paradise")];
+        let lines = screen(&mut st, 100, 34);
+        let row = lines.iter().find(|l| l.contains("Radio")).unwrap();
+        assert!(row.contains("1 saved station"), "{row:?}");
+
+        st.radio_favorites.push(station("b", "SomaFM"));
+        let lines = screen(&mut st, 100, 34);
+        let row = lines.iter().find(|l| l.contains("Radio")).unwrap();
+        assert!(row.contains("2 saved stations"), "{row:?}");
+    }
+
+    fn station(uuid: &str, name: &str) -> crate::app::state::Station {
+        crate::app::state::Station {
+            uuid: uuid.into(),
+            name: name.into(),
+            url: format!("http://stream/{uuid}"),
+            homepage: String::new(),
+            tags: "eclectic".into(),
+            country: "The United States Of America".into(),
+            countrycode: "US".into(),
+            language: "english".into(),
+            codec: "MP3".into(),
+            bitrate: 128,
+            votes: 12,
+            hls: false,
+        }
+    }
+
+    /// The radio page: a tab strip over a station table, with the saved mark
+    /// on the ones you kept and an `HLS` marker on the ones spot cannot play.
+    #[test]
+    fn the_radio_page_lists_stations_under_its_tabs() {
+        use crate::app::state::{RadioRow, RadioScope, RadioView};
+
+        let mut st = browse_state();
+        st.radio_favorites = vec![station("a", "Radio Paradise")];
+        let mut view = RadioView::new(RadioScope::Popular, 0);
+        let mut hls = station("c", "BBC Radio 6 Music");
+        hls.hls = true;
+        hls.codec = "UNKNOWN".into();
+        hls.bitrate = 0;
+        view.rows = vec![
+            RadioRow::Station(station("a", "Radio Paradise")),
+            RadioRow::Station(station("b", "SomaFM")),
+            RadioRow::Station(hls),
+        ];
+        view.loading = false;
+        st.main = crate::app::state::MainView::Radio(view);
+
+        let lines = screen(&mut st, 100, 34);
+        let joined = lines.join("\n");
+        for tab in ["Popular", "Countries", "Genres", "Saved"] {
+            assert!(joined.contains(tab), "missing tab {tab}: {joined}");
+        }
+        assert!(joined.contains("3 stations"), "{joined}");
+
+        let saved = lines.iter().find(|l| l.contains("Radio Paradise")).unwrap();
+        assert!(
+            saved.contains(super::table::LIKED_MARK),
+            "a kept station wears the mark: {saved:?}"
+        );
+        let unsaved = lines.iter().find(|l| l.contains("SomaFM")).unwrap();
+        assert!(
+            !unsaved.contains(super::table::LIKED_MARK),
+            "an unkept one does not: {unsaved:?}"
+        );
+        assert!(unsaved.contains("MP3 128k"), "{unsaved:?}");
+
+        // Listed, not hidden — dropping these would silently remove the BBC.
+        let bbc = lines.iter().find(|l| l.contains("BBC Radio 6")).unwrap();
+        assert!(bbc.contains("HLS"), "{bbc:?}");
+    }
+
+    /// An empty Saved page says how to fill it rather than showing a blank
+    /// table under column headings.
+    #[test]
+    fn an_empty_saved_page_says_what_to_do() {
+        use crate::app::state::{RadioScope, RadioView};
+
+        let mut st = browse_state();
+        let mut view = RadioView::new(RadioScope::Favorites, 0);
+        view.loading = false;
+        st.main = crate::app::state::MainView::Radio(view);
+        let joined = screen(&mut st, 100, 34).join("\n");
+        assert!(joined.contains("no saved stations yet"), "{joined}");
+    }
+
+    /// The search row is one box pointed at whichever catalogue the page
+    /// below it came from, and it has to say which.
+    #[test]
+    fn the_search_row_retargets_on_a_radio_page() {
+        use crate::app::state::{RadioScope, RadioView};
+
+        let mut st = browse_state();
+        assert!(screen(&mut st, 100, 34)[0].contains("search artists"));
+
+        st.main = crate::app::state::MainView::Radio(RadioView::new(RadioScope::Popular, 0));
+        assert!(
+            screen(&mut st, 100, 34)[0].contains("search radio stations"),
+            "the prompt must retarget"
+        );
     }
 
     #[test]
@@ -372,6 +494,144 @@ mod tests {
             loading: false,
         });
         arrive_via(&mut st, "Jazz");
+        for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+    }
+
+    /// Fetches the real chart and draws it, which is everything between the
+    /// directory and the screen except the client task that wires the two.
+    ///
+    /// Ignored by default — it needs a network. Run it with
+    /// `cargo test ui::tests::live_radio -- --ignored --nocapture`; it prints
+    /// the page, so a column that no longer fits real station names shows up
+    /// rather than passing an assertion about invented ones.
+    #[tokio::test]
+    #[ignore]
+    async fn live_radio_chart_renders() {
+        use crate::app::state::{RadioRow, RadioScope, RadioView};
+        use crate::radio::api::RadioApi;
+
+        let api = RadioApi::new(
+            reqwest::Client::builder()
+                .user_agent(concat!("spot/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap(),
+        );
+        let stations = api.top_voted().await.expect("the chart should load");
+
+        let mut st = browse_state();
+        let mut view = RadioView::new(RadioScope::Popular, 0);
+        view.rows = stations
+            .iter()
+            .take(12)
+            .cloned()
+            .map(RadioRow::Station)
+            .collect();
+        view.loading = false;
+        st.radio_favorites = vec![stations[0].clone()];
+        st.main = crate::app::state::MainView::Radio(view);
+
+        let lines = screen(&mut st, 100, 34);
+        for (i, l) in lines.iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+        // The first station's name must survive the column, or the table is
+        // too narrow to be worth drawing.
+        let head = &stations[0].name;
+        let prefix: String = head.chars().take(8).collect();
+        assert!(
+            lines.iter().any(|l| l.contains(&prefix)),
+            "the top station {head:?} did not reach the screen"
+        );
+    }
+
+    /// The radio page and the bar under it, playing a station.
+    #[test]
+    #[ignore]
+    fn dump_radio() {
+        use crate::app::state::{RadioPlayback, RadioRow, RadioScope, RadioView};
+
+        let mut st = browse_state();
+        let mut view = RadioView::new(RadioScope::Popular, 0);
+        let mut bbc = station("c", "BBC Radio 6 Music");
+        bbc.hls = true;
+        bbc.codec = "UNKNOWN".into();
+        bbc.bitrate = 0;
+        bbc.countrycode = "GB".into();
+        bbc.tags = "alternative,indie music".into();
+        let mut soma = station("b", "SomaFM Groove Salad");
+        soma.tags = "ambient,downtempo,electronic".into();
+        soma.codec = "MP3".into();
+        view.rows = vec![
+            RadioRow::Station(station("a", "Radio Paradise (Main Mix)")),
+            RadioRow::Station(soma.clone()),
+            RadioRow::Station(bbc),
+        ];
+        view.loading = false;
+        st.radio_favorites = vec![station("a", "Radio Paradise (Main Mix)")];
+        st.main = crate::app::state::MainView::Radio(view);
+        st.radio = Some(RadioPlayback {
+            station: soma,
+            is_playing: true,
+            started_at: Instant::now(),
+            title: std::sync::Arc::new(parking_lot::Mutex::new(Some(
+                "Steve Cobby — The Unvarnished Truth".into(),
+            ))),
+            volume_percent: 40,
+        });
+        for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+    }
+
+    /// The facet list, and the player view over a station.
+    #[test]
+    #[ignore]
+    fn dump_radio_countries() {
+        use crate::app::state::{RadioRow, RadioScope, RadioView};
+
+        let mut st = browse_state();
+        let mut view = RadioView::new(RadioScope::Countries, 0);
+        view.rows = [
+            ("US", "The United States Of America", 7051u32),
+            ("DE", "Germany", 5980),
+            (
+                "GB",
+                "The United Kingdom Of Great Britain And Northern Ireland",
+                2146,
+            ),
+        ]
+        .into_iter()
+        .map(|(key, label, count)| RadioRow::Facet {
+            key: key.into(),
+            label: label.into(),
+            count,
+        })
+        .collect();
+        view.loading = false;
+        st.main = crate::app::state::MainView::Radio(view);
+        for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_radio_player() {
+        use crate::app::state::RadioPlayback;
+
+        let mut st = browse_state();
+        st.show_player = true;
+        st.radio = Some(RadioPlayback {
+            station: station("b", "SomaFM Groove Salad"),
+            is_playing: true,
+            started_at: Instant::now(),
+            title: std::sync::Arc::new(parking_lot::Mutex::new(Some(
+                "Steve Cobby — The Unvarnished Truth".into(),
+            ))),
+            volume_percent: 40,
+        });
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
         }

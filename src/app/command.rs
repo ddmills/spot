@@ -1,3 +1,5 @@
+use crate::app::state::{RadioScope, Station};
+
 /// Commands sent from the UI/event layer to the client task.
 #[derive(Debug, Clone)]
 pub enum AppCommand {
@@ -69,4 +71,18 @@ pub enum AppCommand {
     /// `R`: evict the current view from the track cache, re-fetch it, and
     /// reload your playlists.
     Refresh,
+
+    /// Open a page of the radio directory. The scope says which one, and is
+    /// also the page's identity on the back stack — see
+    /// `crate::app::state::radio_key`.
+    LoadRadio {
+        scope: RadioScope,
+    },
+    /// Start a station. Stops Spotify first: the two engines share one output
+    /// device and only one of them may own it.
+    PlayStation(Box<Station>),
+    /// Stop the stream and release the device.
+    StopRadio,
+    /// `L` on a station row: keep it, or stop keeping it.
+    ToggleSavedStation(Box<Station>),
 }

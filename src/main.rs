@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod cover;
 mod event;
+mod radio;
 #[cfg(windows)]
 mod relaunch;
 mod session;
@@ -95,9 +96,17 @@ async fn run() -> Result<()> {
     tokio::spawn(token_refresh_loop(api.clone(), token.expires_at));
 
     let state = Arc::new(RwLock::new(AppState::new()));
-    state.write().audio_tap = audio_tap;
+    {
+        let mut st = state.write();
+        st.audio_tap = Arc::clone(&audio_tap);
+        // Read before the first frame, so Home's Radio row can say how many
+        // stations are behind it without waiting on anything.
+        st.radio_favorites = config::load_radio();
+    }
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(Client::new(api, spirc, Arc::clone(&state), rx).run());
+    // The radio player writes into the same tap librespot's sink does, so the
+    // visualizer follows whichever engine is playing.
+    tokio::spawn(Client::new(api, spirc, Arc::clone(&state), rx, audio_tap).run());
 
     let _ = tx.send(AppCommand::LoadPlaylists);
     let _ = tx.send(AppCommand::RefreshPlayback);
@@ -138,7 +147,7 @@ async fn run_tui(
         if st.should_quit {
             break;
         }
-        let title = window_title(st.playback.as_ref());
+        let title = window_title(st.playback.as_ref(), st.radio.as_ref());
         if title != last_title {
             let _ = crossterm::execute!(std::io::stdout(), SetTitle(&title));
             last_title = title;
@@ -201,12 +210,22 @@ fn warn_about_terminal() {
 /// unrestricted remote data: control characters would terminate or corrupt
 /// the OSC title sequence, so they are stripped, and the whole thing is
 /// capped to a title-bar-friendly width.
-fn window_title(playback: Option<&app::state::PlaybackSnapshot>) -> String {
+fn window_title(
+    playback: Option<&app::state::PlaybackSnapshot>,
+    radio: Option<&app::state::RadioPlayback>,
+) -> String {
     const MAX_WIDTH: usize = 80;
-    let Some(pb) = playback else {
-        return "spot".to_string();
+    // Radio wins, for the same reason the deck draws it first: while a station
+    // is on, the Spotify snapshot is kept but paused, and naming it in the
+    // taskbar would point at the wrong sound.
+    let full = match (radio, playback) {
+        (Some(r), _) => match r.now_title() {
+            Some(title) => format!("♫ {title} — {}", r.station.name),
+            None => format!("♫ {}", r.station.name),
+        },
+        (None, Some(pb)) => format!("♫ {} — {}", pb.track_name, pb.artists),
+        (None, None) => return "spot".to_string(),
     };
-    let full = format!("♫ {} — {}", pb.track_name, pb.artists);
     let mut out = String::new();
     let mut used = 0;
     for c in full.chars().filter(|c| !c.is_control()) {

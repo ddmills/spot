@@ -11,6 +11,8 @@ use crate::api::{Api, PAGE_LIMIT};
 use crate::app::command::AppCommand;
 use crate::app::state::{self, AppState, ArtistView, MainView, TrackList, TrackListKind};
 use crate::cover::{Cover, CoverCache};
+use crate::radio::api::RadioApi;
+use crate::radio::player::RadioPlayer;
 
 /// Where a streamed track fetch pulls its pages from.
 enum TrackSource {
@@ -77,6 +79,12 @@ pub struct Client {
     /// (a 429, say) must not turn into one request per poll for as long as the
     /// record is on.
     liked_probe: Option<String>,
+    /// The radio directory. Shares [`Self::http`], which already carries the
+    /// user agent Radio Browser asks for.
+    radio_api: RadioApi,
+    /// The radio audio thread. Held whether or not radio is in use; the thread
+    /// is idle and the output device is not opened until a station plays.
+    radio_player: RadioPlayer,
 }
 
 impl Client {
@@ -85,7 +93,16 @@ impl Client {
         spirc: Spirc,
         state: Arc<RwLock<AppState>>,
         rx: UnboundedReceiver<AppCommand>,
+        audio_tap: Arc<crate::audio_tap::AudioTap>,
     ) -> Self {
+        // Timeouts rather than defaults: a stalled CDN request would otherwise
+        // leave a generation guard armed indefinitely.
+        let http = reqwest::Client::builder()
+            .connect_timeout(COVER_CONNECT_TIMEOUT)
+            .timeout(COVER_TIMEOUT)
+            .user_agent(concat!("spot/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default();
         Self {
             api,
             spirc,
@@ -95,14 +112,9 @@ impl Client {
             backoff_until: None,
             backoff: BACKOFF_INITIAL,
             cache: Arc::new(Mutex::new(HashMap::new())),
-            // Timeouts rather than defaults: a stalled CDN request would
-            // otherwise leave a generation guard armed indefinitely.
-            http: reqwest::Client::builder()
-                .connect_timeout(COVER_CONNECT_TIMEOUT)
-                .timeout(COVER_TIMEOUT)
-                .user_agent(concat!("spot/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_default(),
+            radio_api: RadioApi::new(http.clone()),
+            radio_player: RadioPlayer::new(audio_tap),
+            http,
             covers: Arc::new(Mutex::new(CoverCache::default())),
             liked_probe: None,
         }
@@ -157,6 +169,21 @@ impl Client {
     async fn handle(&mut self, cmd: AppCommand) -> Result<()> {
         use AppCommand::*;
         match cmd {
+            // Whichever engine owns the device owns the transport. Radio is
+            // checked first everywhere below for that reason: while a station
+            // is on, Spirc is paused and talking to it would start Spotify
+            // playing underneath the stream.
+            PlayPause if self.radio_live() => {
+                let mut st = self.state.write();
+                if let Some(r) = st.radio.as_mut() {
+                    r.is_playing = !r.is_playing;
+                    if r.is_playing {
+                        self.radio_player.resume();
+                    } else {
+                        self.radio_player.pause();
+                    }
+                }
+            }
             PlayPause => {
                 self.spirc.play_pause()?;
                 if let Some(pb) = self.state.write().playback.as_mut() {
@@ -165,6 +192,11 @@ impl Client {
                     pb.is_playing = !pb.is_playing;
                 }
             }
+            VolumeRel(delta) if self.radio_live() => {
+                let current = self.playback_volume();
+                self.set_radio_volume((i16::from(current) + i16::from(delta)).clamp(0, 100) as u8);
+            }
+            SetVolume(pct) if self.radio_live() => self.set_radio_volume(pct.min(100)),
             Next => self.spirc.next()?,
             Prev => self.spirc.prev()?,
             SeekRel(delta_ms) => {
@@ -235,12 +267,14 @@ impl Client {
                 context_uri,
                 offset_uri,
             } => {
+                self.yield_to_spotify();
                 self.ensure_active();
                 self.api
                     .play_context(&context_uri, offset_uri.as_deref())
                     .await?;
             }
             PlayTracks { uris, offset } => {
+                self.yield_to_spotify();
                 self.ensure_active();
                 self.api.play_uris(&uris, offset).await?;
             }
@@ -331,8 +365,217 @@ impl Client {
             }
             RefreshPlayback => self.refresh_playback().await,
             LoadQueue => self.load_queue(),
+            LoadRadio { scope } => self.load_radio(scope),
+            PlayStation(station) => self.play_station(*station).await,
+            StopRadio => self.stop_radio(),
+            ToggleSavedStation(station) => self.toggle_saved_station(*station),
         }
         Ok(())
+    }
+
+    /// Fill a radio page.
+    ///
+    /// The view is installed empty and loading straight away, so the trail and
+    /// the tab strip are on screen while the directory is still answering, and
+    /// the fetch is guarded by `load_generation` exactly as a track page is:
+    /// a page the user has already navigated away from writes nothing.
+    ///
+    /// Saved stations are the one scope that never touches the network — they
+    /// are already in memory, read from `radio.json` at startup.
+    fn load_radio(&self, scope: state::RadioScope) {
+        use state::{RadioRow, RadioScope, RadioView};
+
+        let generation = {
+            let mut st = self.state.write();
+            st.load_generation += 1;
+            let generation = st.load_generation;
+            let mut view = RadioView::new(scope.clone(), generation);
+            if scope == RadioScope::Favorites {
+                view.rows = st
+                    .radio_favorites
+                    .iter()
+                    .cloned()
+                    .map(RadioRow::Station)
+                    .collect();
+                view.loading = false;
+            }
+            st.main = MainView::Radio(view);
+            st.main_to_top();
+            generation
+        };
+        if scope == RadioScope::Favorites {
+            return;
+        }
+
+        let api = self.radio_api.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let rows = match &scope {
+                RadioScope::Popular => api.top_voted().await.map(into_station_rows),
+                RadioScope::Search(q) => api.search(q).await.map(into_station_rows),
+                RadioScope::Country(code) => api.by_country(code).await.map(into_station_rows),
+                RadioScope::Genre(tag) => api.by_tag(tag).await.map(into_station_rows),
+                RadioScope::Countries => api.countries().await.map(into_facet_rows),
+                RadioScope::Genres => api.genres().await.map(into_facet_rows),
+                // Handled above, without a fetch.
+                RadioScope::Favorites => Ok(Vec::new()),
+            };
+
+            let mut st = state.write();
+            // Someone navigated on while the directory was answering.
+            let MainView::Radio(view) = &mut st.main else {
+                return;
+            };
+            if view.generation != generation {
+                return;
+            }
+            view.loading = false;
+            match rows {
+                Ok(rows) => {
+                    view.rows = rows;
+                    st.main_to_top();
+                }
+                Err(e) => {
+                    log::error!("radio directory load failed: {e:#}");
+                    st.toast(format!("could not reach the radio directory: {e}"));
+                }
+            }
+        });
+    }
+
+    /// Start a station, having first got Spotify out of the way.
+    ///
+    /// The two engines share one output device, so this is the only place that
+    /// may decide which of them owns it. Spirc is paused rather than
+    /// deactivated: pausing is instant and local, and leaves the Connect device
+    /// where the user's phone can still see it.
+    async fn play_station(&mut self, station: state::Station) {
+        if let Err(e) = self.spirc.pause() {
+            log::warn!("could not pause Spotify before starting radio: {e}");
+        }
+        let volume = self.playback_volume();
+
+        {
+            let mut st = self.state.write();
+            st.radio = Some(state::RadioPlayback {
+                station: station.clone(),
+                is_playing: true,
+                started_at: Instant::now(),
+                title: self.radio_player.title(),
+                volume_percent: volume,
+            });
+            // The Spotify bar must not keep claiming to be playing behind the
+            // station; the snapshot itself is kept so stopping radio puts the
+            // last track straight back rather than after the next poll.
+            if let Some(pb) = st.playback.as_mut() {
+                pb.is_playing = false;
+            }
+        }
+
+        // The directory's ranking runs on these, and it also hands back the
+        // stream URL it believes in, which is fresher than the one in the row.
+        let url = self
+            .radio_api
+            .click(&station.uuid)
+            .await
+            .unwrap_or_else(|| station.url.clone());
+
+        if let Err(e) = self.radio_player.play(&url, volume).await {
+            log::error!("could not play {}: {e:#}", station.name);
+            let mut st = self.state.write();
+            st.radio = None;
+            st.toast(format!("could not play {}: {e}", station.name));
+            return;
+        }
+        self.state
+            .write()
+            .toast(format!("playing {}", station.name));
+    }
+
+    fn stop_radio(&self) {
+        self.radio_player.stop();
+        self.state.write().radio = None;
+    }
+
+    /// Stop the stream if one is playing, before Spotify takes the device.
+    ///
+    /// Every Spotify play path calls this, which is what keeps "only one engine
+    /// at a time" true rather than merely intended.
+    fn yield_to_spotify(&self) {
+        if self.state.read().radio.is_some() {
+            self.stop_radio();
+        }
+    }
+
+    /// `L` on a station row.
+    ///
+    /// Writes the file immediately rather than at exit: spot has no shutdown
+    /// hook it can rely on, and a starred station that vanishes when the
+    /// terminal closes is worse than no star at all.
+    fn toggle_saved_station(&self, station: state::Station) {
+        let stations = {
+            let mut st = self.state.write();
+            let existing = st
+                .radio_favorites
+                .iter()
+                .position(|f| f.uuid == station.uuid);
+            match existing {
+                Some(i) => {
+                    st.radio_favorites.remove(i);
+                    st.toast(format!("removed {}", station.name));
+                    st.radio_favorites.clone()
+                }
+                None => {
+                    st.radio_favorites.push(station.clone());
+                    st.toast(format!("saved {}", station.name));
+                    st.radio_favorites.clone()
+                }
+            }
+        };
+        if let Err(e) = crate::config::save_radio(&stations) {
+            log::error!("could not save the station list: {e:#}");
+            self.state
+                .write()
+                .toast("could not write the saved-station list");
+            return;
+        }
+        // The Saved page reads `radio_favorites` through this list, so it has
+        // to be rebuilt in place — otherwise unstarring a station on that very
+        // page leaves its row behind.
+        let mut st = self.state.write();
+        if let MainView::Radio(view) = &mut st.main
+            && view.scope == state::RadioScope::Favorites
+        {
+            view.rows = stations.into_iter().map(state::RadioRow::Station).collect();
+            let len = view.rows.len();
+            if st.main_index >= len {
+                st.main_index = len.saturating_sub(1);
+            }
+        }
+    }
+
+    fn radio_live(&self) -> bool {
+        self.state.read().radio.is_some()
+    }
+
+    fn set_radio_volume(&self, percent: u8) {
+        self.radio_player.set_volume(percent);
+        if let Some(r) = self.state.write().radio.as_mut() {
+            r.volume_percent = percent;
+        }
+    }
+
+    /// The volume both engines share, as a percent.
+    ///
+    /// Radio inherits whatever Spotify was at, so starting a station does not
+    /// jump the level, and the one slider on the deck keeps meaning one thing.
+    fn playback_volume(&self) -> u8 {
+        let st = self.state.read();
+        st.radio
+            .as_ref()
+            .map(|r| r.volume_percent)
+            .or_else(|| st.playback.as_ref().map(|pb| pb.volume_percent))
+            .unwrap_or(50)
     }
 
     /// `L` / the liked column / the deck's control: save or unsave one track.
@@ -1082,6 +1325,21 @@ fn spawn_liked_check(api: Api, state: Arc<RwLock<AppState>>, uris: Vec<String>) 
             Err(e) => log::warn!("liked check failed: {e:#}"),
         }
     });
+}
+
+fn into_station_rows(stations: Vec<state::Station>) -> Vec<state::RadioRow> {
+    stations.into_iter().map(state::RadioRow::Station).collect()
+}
+
+fn into_facet_rows(facets: Vec<crate::radio::api::Facet>) -> Vec<state::RadioRow> {
+    facets
+        .into_iter()
+        .map(|f| state::RadioRow::Facet {
+            key: f.code,
+            label: f.name,
+            count: f.stationcount,
+        })
+        .collect()
 }
 
 fn command_touches_playback(cmd: &AppCommand) -> bool {

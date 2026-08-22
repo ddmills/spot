@@ -26,7 +26,7 @@ use super::table::{
     art_w, draw_art, draw_volume, fit, link, meter, right_row, segment, state_spans, width,
 };
 use super::theme;
-use crate::app::state::{HitAreas, PlaybackSnapshot, TrackList, format_duration};
+use crate::app::state::{HitAreas, PlaybackSnapshot, RadioPlayback, TrackList, format_duration};
 use crate::cover::Cover;
 
 /// Rows [`masthead`] occupies: the title, and the metadata under it.
@@ -198,7 +198,7 @@ pub fn masthead(
         height: 1,
         ..area
     };
-    let vol_seg = draw_volume(frame, row, pb, mouse, hit);
+    let vol_seg = draw_volume(frame, row, pb.volume_percent, mouse, hit);
     let meta = Rect {
         width: row.width.saturating_sub(vol_seg.width + 1),
         ..row
@@ -256,6 +256,170 @@ pub fn masthead(
         spans.push(Span::styled(pb.release_year.clone(), dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), meta);
+}
+
+/// The radio deck's masthead: the station, then what it is playing.
+///
+/// The same two rows and the same volume slider as [`masthead`], saying the
+/// two things a broadcast has to say. There is no liked control, because
+/// keeping a *station* is done on its row in the directory — the deck's `★`
+/// means "save this track", and a station has no track to save.
+///
+/// Row 1 is the announced title where the server sends one, and the station's
+/// tags and country where it does not. Something like six popular stations in
+/// ten announce; the rest would leave the row empty, and a blank line under a
+/// name is worse than a quieter fact.
+pub fn radio_masthead(
+    frame: &mut Frame,
+    area: Rect,
+    radio: &RadioPlayback,
+    note: Note,
+    mouse: Option<Position>,
+    hit: &mut HitAreas,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let dim = theme::dim();
+
+    let title_row = Rect { height: 1, ..area };
+    let title = match note {
+        Note::Show => format!("♫ {}", radio.station.name),
+        Note::Hide => radio.station.name.clone(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            fit(&title, title_row.width as usize),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )),
+        title_row,
+    );
+
+    if area.height < MASTHEAD_H {
+        return;
+    }
+    let row = Rect {
+        y: area.y + 1,
+        height: 1,
+        ..area
+    };
+    let vol_seg = draw_volume(frame, row, radio.volume_percent, mouse, hit);
+    let meta = Rect {
+        width: row.width.saturating_sub(vol_seg.width + 1),
+        ..row
+    };
+    if meta.width == 0 {
+        return;
+    }
+
+    let (text, style) = match radio.now_title() {
+        Some(title) => (title, theme::text()),
+        None => (station_subtitle(radio), dim),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(fit(&text, meta.width as usize), style)),
+        meta,
+    );
+}
+
+/// What a station says about itself when it is not announcing a track.
+fn station_subtitle(radio: &RadioPlayback) -> String {
+    let s = &radio.station;
+    let parts: Vec<&str> = [s.tags.as_str(), s.country.as_str()]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect();
+    parts.join(" · ")
+}
+
+/// The radio deck's answer to [`progress`]: `LIVE`, a filled track, and how
+/// long you have been listening.
+///
+/// A broadcast has no length, so there is no ratio to draw and nothing to
+/// seek to — the track is drawn full rather than empty, because the stream is
+/// arriving, not stalled. `hit.gauge` is deliberately left unset: a bar that
+/// looks like the one above a Spotify track but silently ignores clicks would
+/// be worse than one that plainly is not a control.
+pub fn radio_status(frame: &mut Frame, row: Rect, radio: &RadioPlayback) {
+    if row.width <= TIME_W {
+        return;
+    }
+    let live = "LIVE ";
+    let elapsed = format!(" {}", format_duration(radio.elapsed().as_millis() as u64));
+    let track_w = row
+        .width
+        .saturating_sub((width(live) + width(&elapsed)) as u16)
+        .max(1);
+    let mut line = vec![Span::styled(live, theme::green())];
+    // Full, not empty: the whole of a live stream is "now".
+    line.extend(meter(1.0, track_w, false, false));
+    line.push(Span::styled(elapsed, theme::dim()));
+    frame.render_widget(Paragraph::new(Line::from(line)), row);
+}
+
+/// The radio deck's transport: the play/pause pill, and nothing either side.
+///
+/// Previous and next are not drawn rather than drawn dead. A station has no
+/// track before or after it, and a greyed control that never lights is a
+/// question the UI keeps asking and answering. Records `hit.play_btn`, and
+/// clears the other two so a click cannot land on last frame's rects.
+pub fn radio_transport(
+    frame: &mut Frame,
+    row: Rect,
+    radio: &RadioPlayback,
+    mouse: Option<Position>,
+    hit: &mut HitAreas,
+) {
+    hit.prev_btn = Rect::default();
+    hit.next_btn = Rect::default();
+
+    let pill = state_spans(radio.is_playing);
+    let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
+    if row.width < pill_w {
+        return;
+    }
+    let seg = Rect {
+        x: row.x + (row.width - pill_w) / 2,
+        width: pill_w,
+        ..row
+    };
+    let mut spans = Vec::new();
+    let mut x = seg.x;
+    hit.play_btn = segment(&mut spans, &mut x, row, mouse, pill);
+    frame.render_widget(Paragraph::new(Line::from(spans)), seg);
+}
+
+/// The radio deck's bottom row: where the station comes from, and how it
+/// sounds. Shuffle is not here — there is one stream and no order to put it in.
+pub fn radio_context_row(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hit: &mut HitAreas) {
+    hit.shuffle_btn = Rect::default();
+    hit.queue_name = Rect::default();
+    if row.width == 0 {
+        return;
+    }
+    let quality = radio.station.quality();
+    if !quality.is_empty() {
+        right_row(
+            frame,
+            row,
+            None,
+            vec![vec![Span::styled(format!(" {quality} "), theme::dim())]],
+        );
+    }
+    let left = Rect {
+        width: row.width.saturating_sub(width(&quality) as u16 + 2),
+        ..row
+    };
+    if left.width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            fit("internet radio", left.width as usize),
+            theme::dim(),
+        )),
+        left,
+    );
 }
 
 /// One row: elapsed, the track, time remaining.
@@ -340,7 +504,7 @@ pub fn transport(
     // Centred on the row rather than between the two buttons: they are of
     // different widths, and a pill centred between them would not line up with
     // the middle of the progress track above it.
-    let pill = state_spans(pb);
+    let pill = state_spans(pb.is_playing);
     let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
     let edges = (width(PREV_LABEL) + width(NEXT_LABEL)) as u16;
     if row.width >= edges + pill_w + 2 {

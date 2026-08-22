@@ -230,16 +230,19 @@ pub enum HomeItem {
     LikedSongs,
     DiscoverWeekly,
     Playlists,
+    Radio,
 }
 
 impl HomeItem {
     /// Every destination, in the order Home lists them. The two named records
     /// lead, because they are the ones you open by name; Playlists is the
-    /// catch-all under them.
-    pub const ALL: [HomeItem; 3] = [
+    /// catch-all under them, and Radio is last because it is the one row that
+    /// leaves Spotify behind.
+    pub const ALL: [HomeItem; 4] = [
         HomeItem::LikedSongs,
         HomeItem::DiscoverWeekly,
         HomeItem::Playlists,
+        HomeItem::Radio,
     ];
 
     pub fn title(self) -> &'static str {
@@ -247,6 +250,7 @@ impl HomeItem {
             HomeItem::LikedSongs => "Liked Songs",
             HomeItem::DiscoverWeekly => "Discover Weekly",
             HomeItem::Playlists => "Playlists",
+            HomeItem::Radio => "Radio",
         }
     }
 
@@ -256,7 +260,212 @@ impl HomeItem {
             HomeItem::LikedSongs => "everything you have saved",
             HomeItem::DiscoverWeekly => "thirty new tracks every Monday",
             HomeItem::Playlists => "saved and followed",
+            HomeItem::Radio => "live stations from around the world",
         }
+    }
+}
+
+/// A radio station, as the directory describes it and the deck draws it.
+///
+/// Flat, owned and `serde`-able because the favourites file is a list of these:
+/// the directory has no accounts, so a station you keep is a station spot
+/// stores. See `crate::radio::api` for the wire shape this is converted from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Station {
+    pub uuid: String,
+    pub name: String,
+    /// The stream itself, already unwrapped from any `.pls`/`.m3u` by the
+    /// directory.
+    pub url: String,
+    #[serde(default)]
+    pub homepage: String,
+    /// Comma-joined, the way the directory reports it.
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub country: String,
+    #[serde(default)]
+    pub countrycode: String,
+    #[serde(default)]
+    pub language: String,
+    /// "MP3", "AAC+", or "UNKNOWN" — which is normal for an HLS entry.
+    #[serde(default)]
+    pub codec: String,
+    /// Kilobits per second; 0 when the directory does not know.
+    #[serde(default)]
+    pub bitrate: u32,
+    #[serde(default)]
+    pub votes: u32,
+    /// HLS stations cannot be played yet — see `crate::radio::player`. They are
+    /// still listed, because hiding them would silently drop the BBC and most
+    /// other national broadcasters.
+    #[serde(default)]
+    pub hls: bool,
+}
+
+impl Station {
+    /// The right-hand column: what it sounds like, technically.
+    pub fn quality(&self) -> String {
+        if self.hls {
+            return "HLS".to_string();
+        }
+        match (self.bitrate, self.codec.as_str()) {
+            (0, "") | (0, "UNKNOWN") => String::new(),
+            (0, codec) => codec.to_string(),
+            (rate, "") | (rate, "UNKNOWN") => format!("{rate}k"),
+            (rate, codec) => format!("{codec} {rate}k"),
+        }
+    }
+}
+
+/// What a radio page is listing.
+///
+/// One enum rather than one view type per page: every scope resolves to the
+/// same table of rows, and the fetch that fills it is the only thing that
+/// differs. It doubles as the page's identity on the back stack — see
+/// [`radio_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RadioScope {
+    /// The directory's own chart, and where the Radio row lands.
+    Popular,
+    /// The country list, as facets to drill into.
+    Countries,
+    /// The tag list, likewise.
+    Genres,
+    /// Stations in one country, by ISO 3166-1 alpha-2 code.
+    Country(String),
+    /// Stations carrying one tag.
+    Genre(String),
+    /// The stations you kept. Read from disk, not the network.
+    Favorites,
+    Search(String),
+}
+
+impl RadioScope {
+    /// What the page calls itself in the trail and its heading.
+    pub fn title(&self) -> String {
+        match self {
+            RadioScope::Popular => "radio".to_string(),
+            RadioScope::Countries => "countries".to_string(),
+            RadioScope::Genres => "genres".to_string(),
+            RadioScope::Country(code) => code.to_uppercase(),
+            RadioScope::Genre(tag) => tag.clone(),
+            RadioScope::Favorites => "saved stations".to_string(),
+            RadioScope::Search(q) => format!("“{q}”"),
+        }
+    }
+
+    /// The tab this scope belongs under, so drilling into a country still
+    /// leaves Countries lit.
+    pub fn tab(&self) -> RadioTab {
+        match self {
+            RadioScope::Popular | RadioScope::Search(_) => RadioTab::Popular,
+            RadioScope::Countries | RadioScope::Country(_) => RadioTab::Countries,
+            RadioScope::Genres | RadioScope::Genre(_) => RadioTab::Genres,
+            RadioScope::Favorites => RadioTab::Favorites,
+        }
+    }
+}
+
+/// The four ways into the directory, drawn as a tab strip above the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadioTab {
+    Popular,
+    Countries,
+    Genres,
+    Favorites,
+}
+
+impl RadioTab {
+    pub const ALL: [RadioTab; 4] = [
+        RadioTab::Popular,
+        RadioTab::Countries,
+        RadioTab::Genres,
+        RadioTab::Favorites,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            RadioTab::Popular => "Popular",
+            RadioTab::Countries => "Countries",
+            RadioTab::Genres => "Genres",
+            RadioTab::Favorites => "Saved",
+        }
+    }
+
+    /// The scope the tab opens when it is clicked.
+    pub fn scope(self) -> RadioScope {
+        match self {
+            RadioTab::Popular => RadioScope::Popular,
+            RadioTab::Countries => RadioScope::Countries,
+            RadioTab::Genres => RadioScope::Genres,
+            RadioTab::Favorites => RadioScope::Favorites,
+        }
+    }
+}
+
+/// One row of a radio page: a station to play, or a facet to drill into.
+#[derive(Debug, Clone)]
+pub enum RadioRow {
+    /// A country or genre, with how many stations it holds. `key` is what the
+    /// query needs (a country code, a tag); `label` is what the row says.
+    Facet {
+        key: String,
+        label: String,
+        count: u32,
+    },
+    Station(Station),
+}
+
+/// A browsable page of the radio directory.
+#[derive(Debug, Clone)]
+pub struct RadioView {
+    pub scope: RadioScope,
+    pub rows: Vec<RadioRow>,
+    pub loading: bool,
+    /// Matches `AppState.load_generation` while a fetch owns this view, on the
+    /// same reasoning as [`TrackList::generation`].
+    pub generation: u64,
+}
+
+impl RadioView {
+    pub fn new(scope: RadioScope, generation: u64) -> Self {
+        Self {
+            scope,
+            rows: Vec::new(),
+            loading: true,
+            generation,
+        }
+    }
+}
+
+/// What is playing, when what is playing is a radio station.
+///
+/// Deliberately not a [`PlaybackSnapshot`]: a broadcast has no duration to
+/// scrub, no album to open and nothing to like, and filling those fields with
+/// zeroes would have the deck draw controls that lead nowhere.
+#[derive(Debug, Clone)]
+pub struct RadioPlayback {
+    pub station: Station,
+    pub is_playing: bool,
+    /// When this station started, for the elapsed counter that stands in for a
+    /// progress bar.
+    pub started_at: Instant,
+    /// The track the server last announced, when it announces one at all —
+    /// about six popular stations in ten do. Written from the decoder thread,
+    /// which is why it is behind its own lock rather than a plain field.
+    pub title: Arc<parking_lot::Mutex<Option<String>>>,
+    pub volume_percent: u8,
+}
+
+impl RadioPlayback {
+    /// The announced track, if there is one worth drawing.
+    pub fn now_title(&self) -> Option<String> {
+        self.title.lock().clone()
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 }
 
@@ -411,6 +620,8 @@ pub enum MainView {
     Tracks(TrackList),
     Search(SearchResults),
     Artist(ArtistView),
+    /// The one page that is not Spotify: the internet radio directory.
+    Radio(RadioView),
 }
 
 /// What to call a view in the trail: the name of the particular thing on
@@ -429,6 +640,7 @@ pub fn view_title(view: &MainView) -> String {
             format!("“{}”", results.query)
         }
         MainView::Search(_) => "search".to_string(),
+        MainView::Radio(v) => v.scope.title(),
     }
 }
 
@@ -512,6 +724,11 @@ pub enum ViewKey {
     /// beside it. The row at the top of the screen already says which query
     /// is live.
     Search,
+    /// Keyed by [`radio_key`]. A station search *does* carry its query, unlike
+    /// [`ViewKey::Search`]: the radio pages are a path you walk into — chart,
+    /// countries, one country — and a search is a stop on it rather than a
+    /// second screen laid over the app.
+    Radio(String),
 }
 
 pub fn liked_key() -> String {
@@ -524,6 +741,21 @@ pub fn playlist_key(id: &str) -> String {
 
 pub fn album_key(id: &str) -> String {
     format!("album:{id}")
+}
+
+/// A radio page's identity. Every scope spells to something different, so
+/// Countries and one country are two pages on the path rather than one page
+/// that replaces itself.
+pub fn radio_key(scope: &RadioScope) -> String {
+    match scope {
+        RadioScope::Popular => "radio".to_string(),
+        RadioScope::Countries => "radio:countries".to_string(),
+        RadioScope::Genres => "radio:genres".to_string(),
+        RadioScope::Country(code) => format!("radio:country:{code}"),
+        RadioScope::Genre(tag) => format!("radio:genre:{tag}"),
+        RadioScope::Favorites => "radio:saved".to_string(),
+        RadioScope::Search(q) => format!("radio:search:{q}"),
+    }
 }
 
 /// A view's identity, or `None` for a list that never reaches the main pane —
@@ -541,6 +773,7 @@ pub fn view_key(view: &MainView) -> Option<ViewKey> {
         // Liked Songs and empty for a playlist that was not in `playlists`
         // when it opened, so two unrelated pages would compare equal on it.
         MainView::Tracks(list) => list.cache_key.clone().map(ViewKey::Tracks),
+        MainView::Radio(v) => Some(ViewKey::Radio(radio_key(&v.scope))),
     }
 }
 
@@ -574,6 +807,8 @@ pub struct HitAreas {
     /// The always-on search row at the top of the browse screen.
     pub search_box: Rect,
     pub search_tabs: Vec<(Rect, SearchTab)>,
+    /// The radio page's tab strip, in the same spirit as [`Self::search_tabs`].
+    pub radio_tabs: Vec<(Rect, RadioTab)>,
     /// The main pane's flat line model, in the same spirit as
     /// [`Self::library_lines`]: for each content line of [`Self::main_list`],
     /// the row it belongs to, or `None` for a heading, a column header, or a
@@ -702,6 +937,14 @@ pub struct AppState {
     /// matches, so the column says "these are the ones you follow".
     pub me_id: Option<String>,
 
+    /// The station playing, when one is. Mutually exclusive with
+    /// [`Self::playback`] by construction: `client` stops one engine before it
+    /// starts the other, so the deck never has two things to draw.
+    pub radio: Option<RadioPlayback>,
+    /// Stations you kept, loaded from disk at startup. The directory has no
+    /// accounts, so this list is the whole of "saved".
+    pub radio_favorites: Vec<Station>,
+
     pub main: MainView,
     /// Back-navigation history (Backspace pops), bottoming out at Home.
     pub view_stack: Vec<ViewSnapshot>,
@@ -786,6 +1029,8 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             playback: None,
+            radio: None,
+            radio_favorites: Vec::new(),
             playlists: Vec::new(),
             liked: std::collections::HashMap::new(),
             me_id: None,
@@ -859,6 +1104,11 @@ impl AppState {
                 .map(|p| plural(p.track_count, "track"))
                 .unwrap_or_default(),
             HomeItem::Playlists => plural(self.playlists.len() as u32, "playlist"),
+            // Only what you kept. The directory's 57,000 stations are not a
+            // number this row could honestly claim, and the count is here to
+            // say how much of yours is behind the door.
+            HomeItem::Radio if self.radio_favorites.is_empty() => String::new(),
+            HomeItem::Radio => plural(self.radio_favorites.len() as u32, "saved station"),
         }
     }
 
@@ -875,6 +1125,7 @@ impl AppState {
                 SearchTab::Playlists => results.playlists.len(),
             },
             MainView::Artist(v) => v.len(),
+            MainView::Radio(v) => v.rows.len(),
         }
     }
 

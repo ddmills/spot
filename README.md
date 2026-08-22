@@ -71,6 +71,7 @@ and can't be changed.
 ## Where it keeps things
 
 - `%APPDATA%\spot\auth.json` — the Web API refresh token
+- `%APPDATA%\spot\radio.json` — your saved radio stations
 - `%LOCALAPPDATA%\spot\creds` — the playback session credentials
 - `%LOCALAPPDATA%\spot\audio` — streamed audio cache, capped at 2 GiB
 - `%LOCALAPPDATA%\spot\spot.log` — the log, rewritten each run
@@ -98,9 +99,9 @@ One pane, full width. `♫ spot` sits at the top left of both the browse screen 
 player view: clicking it — or pressing `H` — goes Home, which is where the app opens and
 where the back stack bottoms out.
 
-Home lists **Liked Songs**, **Discover Weekly** (only when you follow it) and
-**Playlists**, which holds everything you've saved or followed. A Home row opens on one
-click, anywhere on it. From a playlist, a track row leads to its album or artist. Every
+Home lists **Liked Songs**, **Discover Weekly** (only when you follow it),
+**Playlists** — everything you've saved or followed — and **Radio**. A Home row opens
+on one click, anywhere on it. From a playlist, a track row leads to its album or artist. Every
 page spells the path that reached it across its top row — `HOME  ›  MUSE  ›  BLACK
 HOLES` — with the page you're on at the head and every step before it clickable. A crumb
 is a jump rather than a run of single steps: clicking `HOME` from three pages deep
@@ -117,6 +118,33 @@ page you're on stay put, with an `…` standing for what was dropped.
 The player view draws the same path over the page waiting underneath, and clicking any of
 it closes the player and lands you there.
 
+## Radio
+
+Home's last row is **Radio**: internet stations, which have nothing to do with Spotify.
+Stations come from [Radio Browser](https://api.radio-browser.info), the community station
+directory — no account, no API key, around 57,000 stations across 241 countries. The page
+has four tabs (`←` / `→`, or click them): **Popular**, the directory's own most-voted chart;
+**Countries** and **Genres**, which you drill into; and **Saved**, the ones you kept.
+Pressing `/` on any radio page searches stations rather than Spotify — the search row at
+the top of the screen says which of the two it is pointed at.
+
+`Enter` plays the selected station, and `Enter` on the station already playing stops it.
+`L` saves a station, or unsaves it; saved stations live in `%APPDATA%\spot\radio.json`,
+because the directory has no accounts to keep them in. Playing a station reports a click
+back to the directory — that is the only ranking signal the chart has, and spot reads that
+chart on every screen of this feature.
+
+Radio and Spotify never play at once: starting a station pauses Spotify, and starting a
+Spotify track stops the station. The bottom bar and the player view (`v`) both switch to
+the station, and the spectrum analyzer keeps working, because both engines feed the same
+PCM tap. About six popular stations in ten announce their current track over ICY metadata;
+where one does, it's the line under the station name and it's what the window title says.
+
+Stations that stream over **HLS** are listed and marked, but spot can't play them yet —
+that is around 6% of the directory, and it does include most BBC and national-broadcaster
+streams. They're shown rather than hidden because a directory that quietly omits the BBC
+is a worse answer than a row that says why it won't play.
+
 ## Keys
 
 | Key | Action |
@@ -131,16 +159,16 @@ it closes the player and lands you there.
 | `Ctrl-d/u` | half page down / up |
 | `H` | go home |
 | `v` | toggle player view (Esc closes) |
-| `← / →` | switch search tab |
+| `← / →` | switch tab (search results, radio pages) |
 | `Backspace` | back to the previous view |
 | `Esc` | back to the previous view · closes an overlay |
 | `Enter` | drill into the selected row, or play it |
 | `x` | play without opening (a playlist row, or the current view) |
 | `a` | add selected track to queue |
-| `L` | like / unlike the track — the selected row, or the playing one in the player view |
+| `L` | like / unlike the track — the selected row, or the playing one in the player view; on a station row, save it |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction |
-| `/` | search Spotify |
+| `/` | search Spotify — or, on a radio page, the station directory |
 | `R` | refresh the current view and your playlists |
 | `?` | help overlay |
 | `q`, `Ctrl-c` | quit |

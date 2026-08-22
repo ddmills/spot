@@ -212,6 +212,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // and the visualizer's smoothing state are written.
     let AppState {
         playback,
+        radio,
         queue,
         queue_index,
         queue_list,
@@ -319,6 +320,88 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let transport_area = band(rows.transport);
     let list_head_area = band(rows.list_head);
     let queue_area = band(rows.queue);
+
+    // A station uses the same bands in the same order, minus the two things a
+    // broadcast has not got: a sleeve and a queue. The spectrum takes the rows
+    // the cover would have had, which is the one place the radio player looks
+    // better than the Spotify one.
+    if let Some(r) = radio.as_ref() {
+        if rows.header > 0 {
+            deck::radio_masthead(frame, header_area, r, deck::Note::Hide, mouse, hit);
+            hit.now_playing = Rect {
+                height: header_area.height.min(deck::MASTHEAD_H),
+                ..header_area
+            };
+        }
+        let tall = Rect {
+            y: art_area.y,
+            height: art_area.height + viz_band.height,
+            ..inner
+        };
+        let (_, used) = band_layout(inner.width);
+        let field = match used <= inner.width {
+            true => Rect {
+                x: inner.x + (inner.width - used) / 2,
+                width: used,
+                ..tall
+            },
+            false => Rect::default(),
+        };
+        if field.height >= 2 && field.width >= 5 {
+            draw_visualizer(frame, field, audio_tap, viz);
+            hit.viz = field;
+        }
+        if rows.progress > 0 {
+            let pad = if rows.art > 0 { 1 } else { PROGRESS_PAD };
+            deck::radio_status(
+                frame,
+                Rect {
+                    y: progress_area.y + pad,
+                    height: 1,
+                    ..progress_area
+                },
+                r,
+            );
+        }
+        if rows.transport > 0 {
+            deck::radio_transport(
+                frame,
+                Rect {
+                    height: 1,
+                    ..transport_area
+                },
+                r,
+                mouse,
+                hit,
+            );
+        }
+        if rows.list_head > 0 {
+            deck::radio_context_row(
+                frame,
+                Rect {
+                    height: 1,
+                    ..list_head_area
+                },
+                r,
+                hit,
+            );
+        }
+        // Where the queue would be. Said once, quietly: an empty table with
+        // column headings over it would look like a list that failed to load.
+        if queue_area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "a live stream has no queue — it is whatever the station is playing",
+                    theme::dim(),
+                )),
+                Rect {
+                    height: 1,
+                    ..queue_area
+                },
+            );
+        }
+        return;
+    }
 
     let Some(pb) = playback.as_ref() else {
         deck::no_playback_hint(frame, header_area);

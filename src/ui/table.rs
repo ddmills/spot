@@ -13,7 +13,7 @@ use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarStat
 use unicode_width::UnicodeWidthChar;
 
 use super::theme;
-use crate::app::state::{HitAreas, PlaybackSnapshot};
+use crate::app::state::HitAreas;
 use crate::cover::Cover;
 
 /// Truncate with an ellipsis or pad with spaces to exactly `w` display
@@ -433,8 +433,8 @@ fn pulse_at(phase: f32) -> Style {
 /// while audio is running, a square `■` when it is not — the shape transports
 /// have used for stop since tape decks. Colour alone would be the whole signal
 /// otherwise, which is a poor one to lean on.
-pub fn state_spans(pb: &PlaybackSnapshot) -> Vec<Span<'static>> {
-    let (glyph, style, word) = if pb.is_playing {
+pub fn state_spans(is_playing: bool) -> Vec<Span<'static>> {
+    let (glyph, style, word) = if is_playing {
         ("●", pulse_style(Instant::now()), "playing")
     } else {
         ("■", theme::stopped_dim(), "paused")
@@ -443,7 +443,7 @@ pub fn state_spans(pb: &PlaybackSnapshot) -> Vec<Span<'static>> {
         Span::styled(format!(" {glyph}"), style),
         Span::styled(
             format!(" {:<7} ", word),
-            if pb.is_playing {
+            if is_playing {
                 theme::green()
             } else {
                 theme::dim()
@@ -467,20 +467,20 @@ pub const VOL_TRACK_W: u16 = 16;
 pub fn draw_volume(
     frame: &mut Frame,
     row: Rect,
-    pb: &PlaybackSnapshot,
+    volume_percent: u8,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) -> Rect {
     let dim = theme::dim();
     let label = Span::styled(" vol ", dim);
-    let pct = Span::styled(format!(" {:>3}% ", pb.volume_percent), dim);
+    let pct = Span::styled(format!(" {volume_percent:>3}% "), dim);
     let label_w = label.width() as u16;
     let seg_w = label_w + VOL_TRACK_W + pct.width() as u16;
     let hover =
         mouse.is_some_and(|m| m.y == row.y && seg_w <= row.width && m.x >= row.right() - seg_w);
     let mut parts = vec![label];
     parts.extend(meter(
-        pb.volume_percent as f64 / 100.0,
+        f64::from(volume_percent) / 100.0,
         VOL_TRACK_W,
         true,
         hover,

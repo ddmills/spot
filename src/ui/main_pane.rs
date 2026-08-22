@@ -40,6 +40,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // exactly what the old section label was.
     let trail = state.trail();
     let me_id = state.me_id.clone();
+    // The station playing, if one is, so a radio page can mark its row the way
+    // a track table marks the playing track.
+    let playing_station = state.radio.as_ref().map(|r| r.station.url.clone());
     // Home's rows and their tails, resolved before the split borrow below —
     // both read `playlists`, which the borrow takes.
     let home: Vec<(HomeItem, String)> = state
@@ -52,6 +55,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let AppState {
         main,
         playlists,
+        radio_favorites,
         main_list,
         hit,
         liked,
@@ -60,6 +64,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..
     } = state;
     let liked = &*liked;
+    let radio_favorites = &*radio_favorites;
     let page_art = &*page_art;
     let playlists = &*playlists;
     // The *browsed* album's sleeve, not the playing one — see
@@ -105,6 +110,18 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ),
         MainView::Artist(v) => draw_artist(
             frame, list_area, v, page_art, main_index, main_list, hit, &marks, mouse, liked, &trail,
+        ),
+        MainView::Radio(v) => draw_radio(
+            frame,
+            list_area,
+            v,
+            radio_favorites,
+            playing_station.as_deref(),
+            main_index,
+            main_list,
+            hit,
+            mouse,
+            &trail,
         ),
     }
 }
@@ -299,6 +316,259 @@ fn draw_playlists(
     super::clamp_offset(list_state, count, rows_area.height as usize);
     frame.render_stateful_widget(List::new(items), rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
+}
+
+/// Width of the station table's saved column: the mark, then a space.
+const STATION_SAVE_W: usize = 2;
+/// Width of the right-aligned quality cell ("AAC+ 128k", "HLS").
+const STATION_QUALITY_W: usize = 10;
+/// Width of the facet list's right-aligned station count.
+const FACET_COUNT_W: usize = 7;
+
+/// Column widths for the station table, from the pane's inner width. Tags are
+/// the first thing dropped: they are the only column a station reads fine
+/// without.
+struct StationCols {
+    name: usize,
+    tags: usize,
+    country: usize,
+}
+
+impl StationCols {
+    fn new(width: usize) -> Self {
+        let fixed = STATION_SAVE_W + STATION_QUALITY_W + 3 * COL_GAP.len();
+        let flex = width.saturating_sub(fixed);
+        // Below this the tag list is a few clipped letters saying nothing, so
+        // the name takes the space instead.
+        if flex < 44 {
+            return Self {
+                name: flex.saturating_sub(6),
+                tags: 0,
+                country: 6.min(flex),
+            };
+        }
+        let name = flex * 5 / 10;
+        let country = 6;
+        Self {
+            name,
+            tags: flex.saturating_sub(name + country),
+            country,
+        }
+    }
+}
+
+fn station_header(cols: &StationCols) -> Line<'static> {
+    let mut text = format!(
+        "{}{}{COL_GAP}",
+        " ".repeat(STATION_SAVE_W),
+        fit("Station", cols.name)
+    );
+    if cols.tags > 0 {
+        text.push_str(&fit("Tags", cols.tags));
+        text.push_str(COL_GAP);
+    }
+    text.push_str(&fit("Where", cols.country));
+    text.push_str(COL_GAP);
+    text.push_str(&format!("{:>STATION_QUALITY_W$}", "Stream"));
+    Line::styled(text, theme::dim())
+}
+
+/// One station row.
+///
+/// The saved mark reuses the track table's `★`, and for the same reason: this
+/// is the same gesture on the same key, and a second glyph for it would say
+/// there were two kinds of keeping.
+fn station_row(
+    s: &crate::app::state::Station,
+    cols: &StationCols,
+    saved: bool,
+    playing: bool,
+    selected: bool,
+) -> ListItem<'static> {
+    let mark = if playing {
+        Span::styled("♫ ", theme::accent())
+    } else if saved {
+        Span::styled(format!("{} ", super::table::LIKED_MARK), theme::accent())
+    } else {
+        Span::raw("  ")
+    };
+    // An HLS station is listed but cannot be played, so it is drawn as
+    // something that is there rather than something that is offered. Hiding
+    // them would quietly remove the BBC and most national broadcasters from
+    // the directory, which is a worse lie than a dim row.
+    let name_style = if s.hls { theme::dim() } else { theme::text() };
+
+    let mut spans = vec![mark, Span::styled(fit(&s.name, cols.name), name_style)];
+    spans.push(Span::raw(COL_GAP));
+    if cols.tags > 0 {
+        spans.push(Span::styled(fit(&s.tags, cols.tags), theme::dim()));
+        spans.push(Span::raw(COL_GAP));
+    }
+    let where_ = if s.countrycode.is_empty() {
+        s.country.as_str()
+    } else {
+        s.countrycode.as_str()
+    };
+    spans.push(Span::styled(fit(where_, cols.country), theme::dim()));
+    spans.push(Span::raw(COL_GAP));
+    // Right-aligned against the header, which is too — `fit` pads on the
+    // right, so it would left-align the cell under a right-aligned label.
+    let quality = fit(&s.quality(), STATION_QUALITY_W).trim_end().to_string();
+    spans.push(Span::styled(
+        format!("{quality:>STATION_QUALITY_W$}"),
+        theme::dim(),
+    ));
+
+    let mut line = Line::from(spans);
+    if selected {
+        super::table::apply_selection(&mut line);
+    }
+    ListItem::new(line)
+}
+
+/// One country or genre row: a name and how many stations are behind it.
+fn facet_row(label: &str, count: u32, width: usize, selected: bool) -> ListItem<'static> {
+    let name_w = width.saturating_sub(STATION_SAVE_W + FACET_COUNT_W + COL_GAP.len());
+    let mut line = Line::from(vec![
+        Span::raw(" ".repeat(STATION_SAVE_W)),
+        Span::styled(fit(label, name_w), theme::text()),
+        Span::raw(COL_GAP),
+        Span::styled(format!("{count:>FACET_COUNT_W$}"), theme::dim()),
+    ]);
+    if selected {
+        super::table::apply_selection(&mut line);
+    }
+    ListItem::new(line)
+}
+
+/// The radio directory: a tab strip over one table of rows.
+///
+/// Every scope draws through here — the chart, a country's stations, the ones
+/// you kept — because they are all the same table with a different query
+/// behind them. Drilling into a country pushes another of these pages, so the
+/// trail reads `HOME › COUNTRIES › GB` and Esc walks back out of it.
+#[allow(clippy::too_many_arguments)]
+fn draw_radio(
+    frame: &mut Frame,
+    area: Rect,
+    view: &crate::app::state::RadioView,
+    favorites: &[crate::app::state::Station],
+    playing_url: Option<&str>,
+    main_index: usize,
+    list_state: &mut ListState,
+    hit: &mut HitAreas,
+    mouse: Option<Position>,
+    trail: &[Crumb],
+) {
+    use crate::app::state::{RadioRow, RadioTab};
+
+    let facets = matches!(view.rows.first(), Some(RadioRow::Facet { .. }));
+    let total = (!view.rows.is_empty()).then(|| {
+        let n = view.rows.len();
+        let label = match (facets, n) {
+            (true, 1) => "1 entry".to_string(),
+            (true, n) => format!("{n} entries"),
+            (false, 1) => "1 station".to_string(),
+            (false, n) => format!("{n} stations"),
+        };
+        Span::styled(label, theme::dim())
+    });
+    let inner = section_body(
+        frame,
+        area,
+        trail,
+        view.loading && view.rows.is_empty(),
+        total,
+        mouse,
+        hit,
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // The tab strip, then a blank, then the table — the same rhythm the search
+    // page uses, so the two browse screens scroll the same way.
+    let mut body = inner;
+    if inner.height >= 4 {
+        let row = Rect { height: 1, ..inner };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut x = row.x;
+        tab_segments(
+            &mut spans,
+            &mut x,
+            row,
+            mouse,
+            &RadioTab::ALL,
+            view.scope.tab(),
+            RadioTab::title,
+            &mut hit.radio_tabs,
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        body = Rect {
+            y: inner.y + 2,
+            height: inner.height - 2,
+            ..inner
+        };
+    }
+
+    if view.rows.is_empty() {
+        hit.main_list = body;
+        empty_message(frame, body, radio_empty_hint(view));
+        return;
+    }
+
+    let cols = StationCols::new(body.width as usize);
+    let mut rows_area = body;
+    // Facet lists get no header row: "Country / Stations" over a list of
+    // countries says only what the tab above it already said.
+    if !facets && body.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(station_header(&cols)),
+            Rect { height: 1, ..body },
+        );
+        let skip = if body.height >= 3 { 2 } else { 1 };
+        rows_area = Rect {
+            y: body.y + skip,
+            height: body.height - skip,
+            ..body
+        };
+    }
+    hit.main_list = rows_area;
+
+    let items: Vec<ListItem> = view
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| match row {
+            RadioRow::Facet { label, count, .. } => {
+                facet_row(label, *count, rows_area.width as usize, i == main_index)
+            }
+            RadioRow::Station(s) => station_row(
+                s,
+                &cols,
+                favorites.iter().any(|f| f.uuid == s.uuid),
+                playing_url == Some(s.url.as_str()),
+                i == main_index,
+            ),
+        })
+        .collect();
+    let count = items.len();
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    frame.render_stateful_widget(List::new(items), rows_area, list_state);
+    super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
+}
+
+/// What to say on a radio page with nothing on it.
+fn radio_empty_hint(view: &crate::app::state::RadioView) -> &'static str {
+    use crate::app::state::RadioScope;
+    if view.loading {
+        return "loading stations…";
+    }
+    match view.scope {
+        RadioScope::Favorites => "no saved stations yet — press L on one to keep it",
+        RadioScope::Search(_) => "no stations by that name",
+        _ => "nothing here",
+    }
 }
 
 /// Rows an album card's sleeve spans, and the gap between it and the card's

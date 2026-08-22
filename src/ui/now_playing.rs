@@ -38,6 +38,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // written.
     let AppState {
         playback,
+        radio,
         queue,
         toast,
         hit,
@@ -66,6 +67,23 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..area
     };
     if body.height == 0 {
+        return;
+    }
+
+    // Radio first: while a station is on, Spotify is paused and its snapshot
+    // is kept only so stopping the stream puts the last track straight back.
+    // Drawing it would have the bar report something that is not making any
+    // sound.
+    if let Some(r) = radio {
+        hit.now_playing = area;
+        draw_radio(
+            frame,
+            body,
+            r,
+            toast.as_ref().map(|(m, _)| m.as_str()),
+            mouse,
+            hit,
+        );
         return;
     }
 
@@ -118,23 +136,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if text.height < 3 {
         return;
     }
-    if let Some((msg, _)) = toast
-        && text.width > TOAST_MIN_W
-    {
-        // `fit` pads to exactly the width; trim it back so the right-alignment
-        // puts the text against the edge rather than the padding.
-        let msg = fit(msg, (text.width - 1) as usize).trim_end().to_string();
-        frame.render_widget(
-            Paragraph::new(Line::styled(msg, Style::default().fg(theme::WARN)))
-                .alignment(Alignment::Right),
-            Rect {
-                y: text.y + 2,
-                width: text.width - 1,
-                height: 1,
-                ..text
-            },
-        );
-    }
+    draw_toast(
+        frame,
+        row_at(text, 2),
+        toast.as_ref().map(|(msg, _)| msg.as_str()),
+    );
 
     // Row 3: elapsed, the track, time remaining.
     if text.height < 4 {
@@ -183,6 +189,75 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         queue.as_ref(),
         mouse,
         hit,
+    );
+}
+
+/// The bar, when what is playing is a radio station.
+///
+/// The same six rows in the same order as the Spotify bar, so the eye does not
+/// have to relearn the bottom of the screen when the source changes: station,
+/// what it is playing, the toast, a LIVE marker where the progress track goes,
+/// the transport, and a row saying where the sound is coming from. No sleeve —
+/// `cover` is allowlisted to Spotify's CDN and decodes JPEG only, while station
+/// artwork is mostly SVG, so there would be nothing to draw but a placeholder
+/// taking cells the name can use.
+fn draw_radio(
+    frame: &mut Frame,
+    body: Rect,
+    radio: &crate::app::state::RadioPlayback,
+    toast: Option<&str>,
+    mouse: Option<ratatui::layout::Position>,
+    hit: &mut crate::app::state::HitAreas,
+) {
+    deck::radio_masthead(frame, body, radio, deck::Note::Show, mouse, hit);
+
+    if body.height < 3 {
+        return;
+    }
+    draw_toast(frame, row_at(body, 2), toast);
+
+    if body.height < 4 {
+        return;
+    }
+    deck::radio_status(frame, row_at(body, 3), radio);
+
+    if body.height < 5 {
+        return;
+    }
+    deck::radio_transport(frame, row_at(body, 4), radio, mouse, hit);
+
+    if body.height < deck::DECK_H {
+        return;
+    }
+    deck::radio_context_row(frame, row_at(body, 6), radio, hit);
+}
+
+/// One row of `area`, `n` rows down.
+fn row_at(area: Rect, n: u16) -> Rect {
+    Rect {
+        y: area.y + n,
+        height: 1,
+        ..area
+    }
+}
+
+/// The message row, right-aligned against the edge. Shared so the two decks
+/// cannot drift on where the app says things.
+fn draw_toast(frame: &mut Frame, row: Rect, toast: Option<&str>) {
+    let Some(msg) = toast else { return };
+    if row.width <= TOAST_MIN_W {
+        return;
+    }
+    // `fit` pads to exactly the width; trim it back so the right-alignment puts
+    // the text against the edge rather than the padding.
+    let msg = fit(msg, (row.width - 1) as usize).trim_end().to_string();
+    frame.render_widget(
+        Paragraph::new(Line::styled(msg, Style::default().fg(theme::WARN)))
+            .alignment(Alignment::Right),
+        Rect {
+            width: row.width - 1,
+            ..row
+        },
     );
 }
 

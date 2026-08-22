@@ -35,6 +35,18 @@ unicode-width = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 zune-jpeg = "0.5"
 zune-core = "0.5"
+# Internet radio, played by spot itself: these streams are ordinary HTTP audio
+# and cannot go through the Connect device. rodio is pinned to the version
+# librespot-playback already resolves so only one copy is compiled - it arrives
+# here with its symphonia decoders switched on, which librespot does not use.
+rodio = { version = "0.21", default-features = false, features = ["playback", "mp3", "symphonia-aac"] }
+# `stream-download` turns a live HTTP stream into the `Read + Seek` rodio's
+# decoder needs; `icy-metadata` reads the StreamTitle Icecast servers
+# interleave into it. Both build on reqwest 0.13 while rspotify still pins
+# 0.12, so two copies of that one wrapper crate are compiled - hyper, h2,
+# native-tls and tokio underneath it are shared.
+stream-download = { version = "0.24.1", default-features = false, features = ["reqwest-native-tls"] }
+icy-metadata = "0.6"
 
 # Only for the double-click relaunch in src/relaunch.rs.
 [target.'cfg(windows)'.dependencies]

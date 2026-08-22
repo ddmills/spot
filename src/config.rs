@@ -59,3 +59,45 @@ pub fn clear_auth() {
         let _ = fs::remove_file(path);
     }
 }
+
+/// The stations you kept.
+///
+/// Its own file rather than a field of [`SavedAuth`]: one holds a credential
+/// and is rewritten whenever Spotify hands out a new refresh token, the other
+/// is a library and is rewritten when you star something. A radio directory has
+/// no accounts to keep this in, so keeping it is spot's job.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavedRadio {
+    #[serde(default)]
+    pub stations: Vec<crate::app::state::Station>,
+}
+
+fn radio_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("radio.json"))
+}
+
+/// Read the saved stations, or an empty list.
+///
+/// A missing file is the ordinary first-run case and a corrupt one is not worth
+/// stopping for — the list rebuilds itself the moment you star a station.
+pub fn load_radio() -> Vec<crate::app::state::Station> {
+    let Ok(path) = radio_file() else {
+        return Vec::new();
+    };
+    let Ok(data) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<SavedRadio>(&data)
+        .map(|saved| saved.stations)
+        .unwrap_or_default()
+}
+
+pub fn save_radio(stations: &[crate::app::state::Station]) -> Result<()> {
+    let path = radio_file()?;
+    let saved = SavedRadio {
+        stations: stations.to_vec(),
+    };
+    fs::write(&path, serde_json::to_string_pretty(&saved)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}

@@ -25,6 +25,8 @@ use crate::app::state::{AppState, InputMode, MainView};
 
 /// Shown when the box is empty, in place of the query.
 const PLACEHOLDER: &str = "search artists, albums, playlists…";
+/// The same box on a radio page, where it queries the station directory.
+const RADIO_PLACEHOLDER: &str = "search radio stations…";
 
 /// Cells between the mark and the search prompt. Wider than a word space so
 /// the two read as separate controls rather than as one phrase.
@@ -87,6 +89,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let text = match (typing, &state.main) {
         (true, _) => format!("{}▏", state.input_buffer),
         (false, MainView::Search(r)) if !r.query.is_empty() => r.query.clone(),
+        // On a radio page the prompt searches the station directory, not
+        // Spotify — see `event::handle_search_input`. The row says so, because
+        // one box that quietly meant two different catalogues depending on the
+        // page behind it would be a trap.
+        (false, MainView::Radio(v)) => match &v.scope {
+            crate::app::state::RadioScope::Search(q) if !q.is_empty() => q.clone(),
+            _ => RADIO_PLACEHOLDER.to_string(),
+        },
         (false, _) => PLACEHOLDER.to_string(),
     };
 
