@@ -49,6 +49,28 @@ pub(super) const TIME_W: u16 = 5 + 6;
 const PREV_LABEL: &str = " ◂◂ previous ";
 const NEXT_LABEL: &str = " ▸▸ next ";
 
+/// The liked control at the right end of the title row, in both states.
+/// Padded like
+/// every other pill on the deck so hovering it lights a run rather than a
+/// glyph, and of a fixed width so nothing under the cursor moves when the
+/// state flips.
+///
+/// The same solid glyph either way — the word beside it is what says which
+/// state you are in, so the pair never comes down to telling one glyph from
+/// a hollow twin by its shade.
+/// Built from [`super::table::LIKED_MARK`] at draw time rather than spelled
+/// out here: the table's column and this control wear the same mark, and a
+/// second copy of the glyph is a second thing to forget. Both states are the
+/// same width, so nothing under the cursor moves when one becomes the other.
+fn like_label(liked: bool) -> String {
+    let mark = super::table::LIKED_MARK;
+    if liked {
+        format!(" {mark} liked ")
+    } else {
+        format!(" {mark} like  ")
+    }
+}
+
 /// What both views say when nothing is playing, said once.
 pub fn no_playback_hint(frame: &mut Frame, area: Rect) {
     frame.render_widget(
@@ -107,11 +129,13 @@ pub enum Note {
     Hide,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn masthead(
     frame: &mut Frame,
     area: Rect,
     pb: &PlaybackSnapshot,
     note: Note,
+    liked: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -120,18 +144,46 @@ pub fn masthead(
     }
     let dim = theme::dim();
 
-    // Row 0: the track title, as large as a terminal allows.
+    // Row 0: the track title, as large as a terminal allows, with the liked
+    // control opposite it. The state pill used to hold that end; it moved down to the
+    // transport, which left the one control the deck was missing a home.
+    //
+    // Drawn only once the saved state is known — an episode has no track id to
+    // save, and a control that cannot say which way it would go is worse than
+    // none at all. `right_row` drops it whole on a row too narrow for it, so the
+    // title never has to share its cells with half a control.
     let title_row = Rect { height: 1, ..area };
+    let like = liked.filter(|_| pb.track_uri.is_some());
+    if let Some(liked) = like {
+        let style = if liked { theme::accent() } else { dim };
+        let label = like_label(liked);
+        hit.like_btn = right_row(
+            frame,
+            title_row,
+            mouse,
+            vec![vec![Span::styled(label, style)]],
+        )[0];
+    }
     let title = match note {
         Note::Show => format!("♫ {}", pb.track_name),
         Note::Hide => pb.track_name.clone(),
     };
+    // One cell of daylight between the title and the control, so a title that
+    // runs the full width ends in an ellipsis rather than against the pill.
+    let title_w = if hit.like_btn.is_empty() {
+        title_row.width
+    } else {
+        title_row.width.saturating_sub(hit.like_btn.width + 1)
+    };
     frame.render_widget(
         Paragraph::new(Line::styled(
-            fit(&title, title_row.width as usize),
+            fit(&title, title_w as usize),
             theme::accent().add_modifier(Modifier::BOLD),
         )),
-        title_row,
+        Rect {
+            width: title_w,
+            ..title_row
+        },
     );
 
     // Row 1: artists · album · year, with the volume slider right-aligned.
@@ -465,7 +517,9 @@ mod tests {
     #[test]
     fn the_masthead_writes_two_rows_and_their_controls() {
         let pb = snapshot();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, Note::Show, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
         assert!(lines[0].starts_with("♫ Song Title"), "{:?}", lines[0]);
         // The state pill left this row for the transport; the title has the
         // whole width to itself now.
@@ -482,12 +536,69 @@ mod tests {
         assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
     }
 
+    /// The control holds the right end of the title row, says which way it would
+    /// go, and keeps one width in both states so nothing under the cursor
+    /// moves when it flips.
+    #[test]
+    fn the_masthead_carries_a_liked_control_for_the_playing_track() {
+        let pb = snapshot();
+        let (liked_lines, liked_hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, Some(true), None, h)
+        });
+        let (plain_lines, plain_hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, Some(false), None, h)
+        });
+
+        // The same mark either way; the word is what changes, so the two
+        // states never come down to telling one glyph's shade from another's.
+        let mark = super::super::table::LIKED_MARK;
+        assert!(
+            liked_lines[0].contains(&format!("{mark} liked")),
+            "{:?}",
+            liked_lines[0]
+        );
+        assert!(
+            plain_lines[0].contains(&format!("{mark} like ")),
+            "{:?}",
+            plain_lines[0]
+        );
+        assert_eq!(liked_hit.like_btn, plain_hit.like_btn);
+        assert_eq!(liked_hit.like_btn.y, 0, "the control left the title row");
+        assert_eq!(liked_hit.like_btn.right(), 80);
+        // The title still leads the row, and stops clear of the control.
+        assert!(liked_lines[0].starts_with("♫ Song Title"));
+    }
+
+    /// Nothing known about the track, so no control: one that cannot say
+    /// which way it would go is worse than no control. Same for an episode,
+    /// which has no track id to save.
+    #[test]
+    fn the_liked_control_waits_for_an_answer() {
+        let pb = snapshot();
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
+        let mark = super::super::table::LIKED_MARK;
+        assert!(!lines[0].contains(mark));
+        assert!(hit.like_btn.is_empty());
+
+        let mut episode = snapshot();
+        episode.track_uri = None;
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &episode, Note::Show, Some(false), None, h)
+        });
+        assert!(!lines[0].contains(mark), "{:?}", lines[0]);
+        assert!(hit.like_btn.is_empty());
+    }
+
     /// The metadata row starts flush with the title's `♫`, not indented past
     /// it — the masthead is one block, not a note with a hanging column.
     #[test]
     fn the_metadata_row_is_not_indented() {
         let pb = snapshot();
-        let (_, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, Note::Show, None, h));
+        let (_, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
         assert_eq!(hit.now_artist.x, 0);
     }
 
@@ -497,7 +608,9 @@ mod tests {
         let mut pb = snapshot();
         pb.artist_id = None;
         pb.album_id = None;
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, Note::Show, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
         assert!(lines[1].contains("Artist Name · Album Name"));
         assert!(hit.now_artist.is_empty() && hit.now_album.is_empty());
     }
@@ -510,7 +623,9 @@ mod tests {
         let mut pb = snapshot();
         pb.artists = "高橋洋子".into();
         pb.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
-        let (lines, hit, _) = render(60, 2, |f, a, h| masthead(f, a, &pb, Note::Show, None, h));
+        let (lines, hit, _) = render(60, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
         let row = &lines[1];
         assert!(
             !row.trim_end().ends_with('·'),
@@ -530,7 +645,9 @@ mod tests {
     fn a_self_titled_album_is_still_printed() {
         let mut pb = snapshot();
         pb.album = "Artist Name".into();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, Note::Show, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
         assert!(
             lines[1].starts_with("Artist Name · Artist Name · 2020"),
             "{:?}",
@@ -634,7 +751,7 @@ mod tests {
         for width in 0..40u16 {
             render(width.max(1), 2, |f, a, h| {
                 let a = Rect { width, ..a };
-                masthead(f, a, &pb, Note::Show, None, h);
+                masthead(f, a, &pb, Note::Show, Some(true), None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, h);
                 transport(f, Rect { height: 1, ..a }, &pb, None, h);
                 context_row(f, Rect { height: 1, ..a }, &pb, Some(&q), None, h);

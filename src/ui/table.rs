@@ -209,6 +209,17 @@ pub fn brand(frame: &mut Frame, row: Rect, mouse: Option<Position>) -> Rect {
 /// Cells the mark occupies: `♫`, a space, and four letters.
 pub const BRAND_W: u16 = 6;
 
+/// The mark a saved ("liked") track wears — in the track table's column and
+/// on the deck's control, so the two cannot drift.
+///
+/// A star rather than a heart. `♥` U+2665 is nominally the *black* heart
+/// suit, but plenty of terminal fonts draw it as an outline — including the
+/// one this was built against — which leaves it indistinguishable from `♡`
+/// and turns the saved state into something you cannot read. `★` is solid
+/// where `☆` is not, and the app says "liked" in words everywhere it
+/// matters anyway.
+pub const LIKED_MARK: &str = "★";
+
 /// Lay hoverable segments out flush with `row`'s right edge and draw them as
 /// one line, returning each group's hit rect. A row too narrow to hold them
 /// draws nothing and returns empty rects, which can never be hit — so a

@@ -606,6 +606,11 @@ pub struct HitAreas {
     pub main_artist_col: Rect,
     /// Album column of the track table; clicking a cell opens the album.
     pub main_album_col: Rect,
+    /// Liked column of the track table; clicking a cell likes or unlikes that
+    /// row. The whole two-cell column, not the glyph: an unliked row draws
+    /// nothing at all until the pointer is over it, so the cell is the only
+    /// target there is.
+    pub main_like_col: Rect,
     /// Artist name in the now-playing info row.
     pub now_artist: Rect,
     /// Album name in the now-playing info row.
@@ -617,6 +622,11 @@ pub struct HitAreas {
     pub play_btn: Rect,
     pub next_btn: Rect,
     pub shuffle_btn: Rect,
+    /// The deck's liked control, on the title row of both views: likes or
+    /// unlikes the
+    /// playing track. Empty while its saved state is still unknown — a control
+    /// that cannot say which way it would go is worse than no control.
+    pub like_btn: Rect,
     /// Volume slider track only; click position maps linearly to percent.
     pub volume_slider: Rect,
     /// The playing queue's name on the deck's context row. Clicking it

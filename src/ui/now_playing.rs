@@ -43,6 +43,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         hit,
         mouse_pos,
         cover,
+        liked,
         ..
     } = state;
     let mouse = *mouse_pos;
@@ -101,7 +102,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Rows 0-1: the title, then the metadata with the volume slider opposite.
     // The play state used to hold the title's right edge; it now sits under
     // the progress track, between previous and next.
-    deck::masthead(frame, text, pb, deck::Note::Show, mouse, hit);
+    let like = pb
+        .track_uri
+        .as_ref()
+        .and_then(|uri| liked.get(uri).copied());
+    deck::masthead(frame, text, pb, deck::Note::Show, like, mouse, hit);
+
     // The whole bar is the wheel target, sleeve included, which is wider than
     // the two rows `masthead` claims for the player's benefit. Assigned after
     // it, not before.

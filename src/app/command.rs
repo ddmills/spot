@@ -26,6 +26,11 @@ pub enum AppCommand {
         offset: usize,
     },
     AddToQueue(String),
+    /// `L`, the liked column, and the deck's control: save or unsave one track.
+    SetLiked {
+        uri: String,
+        liked: bool,
+    },
     Search(String),
     LoadPlaylists,
     LoadLikedSongs,

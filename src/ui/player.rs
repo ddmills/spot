@@ -220,6 +220,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         audio_tap,
         mouse_pos,
         cover: state_cover,
+        liked,
         ..
     } = state;
     let mouse = *mouse_pos;
@@ -328,7 +329,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if rows.header > 0 {
         // No `♫` on the title here: the mark two rows above owns the note and
         // the column. See [`deck::Note`].
-        deck::masthead(frame, header_area, pb, deck::Note::Hide, mouse, hit);
+        let like = pb
+            .track_uri
+            .as_ref()
+            .and_then(|uri| liked.get(uri).copied());
+        deck::masthead(frame, header_area, pb, deck::Note::Hide, like, mouse, hit);
+
         // Only the two written rows are the volume wheel's target: a wheel on
         // the blank one below is a scroll. (The bottom bar claims its whole
         // height instead — see `super::now_playing`.)

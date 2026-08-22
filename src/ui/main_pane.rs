@@ -636,6 +636,9 @@ fn artist_body(
                 }
                 .intersection(body)
             };
+            if cols.like {
+                hit.main_like_col = rect(cols.like_offset(), LIKE_W);
+            }
             hit.main_artist_col = rect(cols.artist_offset(), cols.artist);
             if let Some(off) = cols.album_offset() {
                 hit.main_album_col = rect(off, cols.album);
@@ -645,7 +648,9 @@ fn artist_body(
             // claimed the pointer.
             hover_cell = mouse
                 .and_then(|m| {
-                    if hit.main_artist_col.contains(m) {
+                    if hit.main_like_col.contains(m) {
+                        Some((m, HoverCol::Like))
+                    } else if hit.main_artist_col.contains(m) {
                         Some((m, HoverCol::Artist))
                     } else if hit.main_album_col.contains(m) {
                         Some((m, HoverCol::Album))
@@ -684,7 +689,7 @@ fn artist_body(
                         RowMark::None
                     },
                     i == main_index,
-                    liked.get(&v.top.tracks[ti].uri).copied().unwrap_or(false),
+                    liked.get(&v.top.tracks[ti].uri).copied(),
                     hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
                 )
             }
@@ -1323,20 +1328,21 @@ const YEAR_W: usize = 4;
 const COL_GAP: &str = "   ";
 /// Leading marker column: "▶ " playing, "→ " next up.
 const PREFIX_W: usize = 2;
-/// Liked column: "♥ " or blank.
-const HEART_W: usize = 2;
+/// Liked column: the mark when saved, blank when not — it comes back under
+/// the pointer. See [`track_row`] and [`super::table::LIKED_MARK`].
+const LIKE_W: usize = 2;
 /// Minimum width of the track-number column, right-aligned.
 const NO_W: usize = 3;
 
 /// Column widths for the track table, derived from the pane's inner width.
-/// Narrow panes drop the year first, then the album, then the heart.
+/// Narrow panes drop the year first, then the album, then the liked mark.
 struct TrackCols {
     name: usize,
     artist: usize,
     /// 0 = hidden.
     album: usize,
     year: bool,
-    heart: bool,
+    like: bool,
     track_no: bool,
     /// Width of the number column, grown to fit the largest number.
     no_w: usize,
@@ -1346,12 +1352,12 @@ impl TrackCols {
     fn new(width: usize, max_no: u32) -> Self {
         let year = width >= 70;
         let show_album = width >= 50;
-        let heart = width >= 60;
+        let like = width >= 60;
         let track_no = width >= 40;
         let no_w = max_no.to_string().len().max(NO_W);
         let mut flex = width.saturating_sub(PREFIX_W + DUR_W + COL_GAP.len());
-        if heart {
-            flex = flex.saturating_sub(HEART_W);
+        if like {
+            flex = flex.saturating_sub(LIKE_W);
         }
         if track_no {
             flex = flex.saturating_sub(no_w + COL_GAP.len());
@@ -1368,7 +1374,7 @@ impl TrackCols {
                 artist,
                 album: flex - name - artist,
                 year,
-                heart,
+                like,
                 track_no,
                 no_w,
             }
@@ -1380,21 +1386,31 @@ impl TrackCols {
                 artist: flex - name,
                 album: 0,
                 year,
-                heart,
+                like,
                 track_no,
                 no_w,
             }
         }
     }
 
-    /// Column offset (from the row start) of the artist cell.
-    fn artist_offset(&self) -> usize {
+    /// Column offset (from the row start) of the liked cell, shown or not.
+    fn like_offset(&self) -> usize {
         let mut x = PREFIX_W;
         if self.track_no {
             x += self.no_w + COL_GAP.len();
         }
-        if self.heart {
-            x += HEART_W;
+        x
+    }
+
+    /// Column offset (from the row start) of the artist cell.
+    ///
+    /// Built on [`Self::like_offset`] rather than repeating its arithmetic:
+    /// the two columns are adjacent, and a click rect that disagrees with the
+    /// glyph it covers is the bug this exists to prevent.
+    fn artist_offset(&self) -> usize {
+        let mut x = self.like_offset();
+        if self.like {
+            x += LIKE_W;
         }
         x + self.name + COL_GAP.len()
     }
@@ -1408,6 +1424,7 @@ impl TrackCols {
 /// Which clickable cell of a track row the mouse is over.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HoverCol {
+    Like,
     Artist,
     Album,
 }
@@ -1449,8 +1466,8 @@ fn track_header(cols: &TrackCols, sort: Option<TrackSort>) -> Line<'static> {
     if cols.track_no {
         text = format!("{text}{:>w$}{COL_GAP}", "#", w = cols.no_w);
     }
-    if cols.heart {
-        text = format!("{text}{}", fit("♥", HEART_W));
+    if cols.like {
+        text = format!("{text}{}", fit(super::table::LIKED_MARK, LIKE_W));
     }
     text = format!(
         "{text}{}{COL_GAP}{}",
@@ -1485,7 +1502,7 @@ fn track_row(
     no: u32,
     mark: RowMark,
     selected: bool,
-    liked: bool,
+    liked: Option<bool>,
     hover: Option<HoverCol>,
 ) -> ListItem<'static> {
     let dim = theme::dim();
@@ -1515,11 +1532,31 @@ fn track_row(
             dim,
         ));
     }
-    if cols.heart {
-        spans.push(Span::styled(
-            fit(if liked { "♥" } else { "" }, HEART_W),
-            theme::accent(),
-        ));
+    if cols.like {
+        // The mark or nothing — never the same shape at two brightnesses. A
+        // column of hollow glyphs beside a column of solid ones reads as one
+        // mark lit two ways, which is exactly what it must not be mistaken
+        // for, and it leaves the page speckled with a glyph that means "no".
+        //
+        // So an unsaved track shows nothing, and hovering the cell brings the
+        // mark up as an offer. That reveal is also the only thing that says
+        // the column can be clicked at all: without it a blank cell has
+        // nothing to invite the pointer.
+        let hovered = hover == Some(HoverCol::Like);
+        let (glyph, style) = match liked {
+            Some(true) => (super::table::LIKED_MARK, theme::accent()),
+            // An unchecked row offers the same mark: `library_add` on a track
+            // you already have is a no-op, so the worst a premature press can
+            // do is confirm what was already true.
+            _ if hovered => (super::table::LIKED_MARK, dim),
+            _ => ("", dim),
+        };
+        let style = if hovered {
+            super::table::hover_style(style)
+        } else {
+            style
+        };
+        spans.push(Span::styled(fit(glyph, LIKE_W), style));
     }
     spans.push(Span::styled(fit(&t.name, cols.name), name_style));
     spans.push(Span::raw(COL_GAP));
@@ -1630,7 +1667,10 @@ struct PlaylistCols {
     owner: usize,
 }
 
-/// Leading marker column: `♥ ` on Liked Songs, `♫ ` on the playing context.
+/// Leading marker column: `♫ ` on the playing context, blank otherwise.
+///
+/// It used to carry a mark on Liked Songs too, back when that was a row of
+/// this list rather than an entry on Home.
 const PL_MARK_W: usize = 2;
 
 impl PlaylistCols {
@@ -1786,13 +1826,18 @@ fn render_track_table(
         }
         .intersection(rows_area)
     };
+    if cols.like {
+        hit.main_like_col = cell_col(cols.like_offset(), LIKE_W);
+    }
     hit.main_artist_col = cell_col(cols.artist_offset(), cols.artist);
     if let Some(off) = cols.album_offset() {
         hit.main_album_col = cell_col(off, cols.album);
     }
     let hover_cell: Option<(usize, HoverCol)> = mouse.and_then(|m| {
         let row = |y: u16| list_state.offset() + (y - rows_area.y) as usize;
-        if hit.main_artist_col.contains(m) {
+        if hit.main_like_col.contains(m) {
+            Some((row(m.y), HoverCol::Like))
+        } else if hit.main_artist_col.contains(m) {
             Some((row(m.y), HoverCol::Artist))
         } else if hit.main_album_col.contains(m) {
             Some((row(m.y), HoverCol::Album))
@@ -1827,7 +1872,7 @@ fn render_track_table(
                 no,
                 mark,
                 i == main_index,
-                liked.get(&tracks[ti].uri).copied().unwrap_or(false),
+                liked.get(&tracks[ti].uri).copied(),
                 hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
             )
         })
@@ -2726,14 +2771,91 @@ mod tests {
         assert_eq!(text_at(st.hit.main_album_col, 5), "Album");
     }
 
+    /// The mark or nothing. An unsaved row is blank rather than wearing a
+    /// hollow twin: one shape at two brightnesses reads as one thing lit two
+    /// ways, and the page ends up speckled with a glyph that means "no".
     #[test]
-    fn heart_column_marks_liked_rows_only() {
+    fn the_liked_column_marks_saved_rows_and_leaves_the_rest_blank() {
+        let mut st = tracks_state(vec![
+            track("Alpha", "A"),
+            track("Beta", "B"),
+            track("Gamma", "C"),
+        ]);
+        st.liked.insert("spotify:track:Alpha".into(), true);
+        st.liked.insert("spotify:track:Beta".into(), false);
+        // Label, blank, band(3), header, spacer, then the rows from y7.
+        let lines = render(&mut st, 90, 11);
+        let mark = super::super::table::LIKED_MARK;
+        assert!(lines[7].contains(mark), "{:?}", lines[7]);
+        // Unsaved and unchecked look the same, and neither wears a twin.
+        for row in [8, 9] {
+            assert!(!lines[row].contains(mark), "row {row}: {:?}", lines[row]);
+        }
+    }
+
+    /// The blank cell has to invite the pointer somehow, so hovering it brings
+    /// the mark up — the same one a saved row wears, on the same hover pill
+    /// every other clickable cell gets.
+    #[test]
+    fn hovering_the_liked_column_offers_the_mark() {
+        let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
+        // Draw once to find out where the column landed.
+        render(&mut st, 90, 10);
+        let col = st.hit.main_like_col;
+        assert!(!col.is_empty());
+        st.mouse_pos = Some(Position {
+            x: col.x,
+            y: col.y + 1,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let cell = buffer
+            .cell(Position {
+                x: col.x,
+                y: col.y + 1,
+            })
+            .unwrap();
+        assert_eq!(
+            cell.symbol(),
+            super::super::table::LIKED_MARK,
+            "the hover offered no mark"
+        );
+        assert_eq!(cell.bg, theme::DIM, "the hover drew no pill");
+        // The row the pointer is not on stays blank.
+        assert_eq!(
+            buffer
+                .cell(Position { x: col.x, y: col.y })
+                .unwrap()
+                .symbol(),
+            " "
+        );
+    }
+
+    /// The column is a click target, so its rect has to sit over the glyphs it
+    /// covers — the whole two cells, not just the one the mark is drawn in.
+    #[test]
+    fn the_liked_column_records_a_clickable_rect() {
         let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
         st.liked.insert("spotify:track:Alpha".into(), true);
-        // Label, blank, band(3), header, spacer, then the rows at y7 and y8.
-        let lines = render(&mut st, 90, 10);
-        assert!(lines[7].contains("♥"));
-        assert!(!lines[8].contains("♥"));
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let col = st.hit.main_like_col;
+        assert_eq!(col.width, 2);
+        assert_eq!(col.height, 2, "the column outran the filled rows");
+        assert!(st.hit.main_list.contains(Position { x: col.x, y: col.y }));
+        assert_eq!(
+            buffer
+                .cell(Position { x: col.x, y: col.y })
+                .unwrap()
+                .symbol(),
+            super::super::table::LIKED_MARK
+        );
+        // And it stops where the title starts.
+        assert!(col.right() <= st.hit.main_artist_col.x);
     }
 
     #[test]

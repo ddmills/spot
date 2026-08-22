@@ -137,6 +137,7 @@ it closes the player and lands you there.
 | `Enter` | drill into the selected row, or play it |
 | `x` | play without opening (a playlist row, or the current view) |
 | `a` | add selected track to queue |
+| `L` | like / unlike the track — the selected row, or the playing one in the player view |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction |
 | `/` | search Spotify |

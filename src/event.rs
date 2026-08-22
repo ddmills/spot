@@ -143,6 +143,11 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         };
         if index < st.main_len() {
             st.main_index = index;
+            if st.hit.main_like_col.contains(pos) {
+                st.last_main_click = None;
+                toggle_like_selection(st, tx);
+                return;
+            }
             if st.hit.main_artist_col.contains(pos) {
                 st.last_main_click = None;
                 open_artist_of_selection(st, tx);
@@ -274,6 +279,13 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         } else {
             open_player(st, tx);
         }
+        return;
+    }
+
+    // The deck's liked control is about the playing track, which is what the
+    // row it sits on is about — not the selection on the page underneath.
+    if st.hit.like_btn.contains(pos) {
+        toggle_like_playing(st, tx);
         return;
     }
 
@@ -429,6 +441,8 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
         }
         KeyCode::Enter => activate_selection(&mut state.write(), tx),
         KeyCode::Char('a') => queue_selection(&mut state.write(), tx),
+        KeyCode::Char('L') => toggle_like_selection(&mut state.write(), tx),
+
         KeyCode::Char('b') => open_album_of_selection(&mut state.write(), tx),
         KeyCode::Char('B') => open_artist_of_selection(&mut state.write(), tx),
         KeyCode::Char('x') => play_without_opening(&mut state.write(), tx),
@@ -1190,6 +1204,57 @@ fn queue_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     }
 }
 
+/// `L`, and the liked column: like or unlike the track the view is about.
+///
+/// Which track that is depends on where you are. In a track list it is the
+/// selected row. In the player it is the *playing* track — the whole screen is
+/// about that record, and the queue underneath is a list you press Enter on
+/// rather than one the view is reporting. Everywhere else there is no track
+/// under the cursor to mean, so it falls back to what is playing, which is the
+/// one track every screen has in common (the deck names it at the bottom of
+/// all of them).
+fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    if st.show_player {
+        return toggle_like_playing(st, tx);
+    }
+    let uri = match &st.main {
+        MainView::Tracks(list) => list
+            .display
+            .get(st.main_index)
+            .map(|&i| list.tracks[i].uri.clone()),
+        MainView::Search(results) if st.search_tab == SearchTab::Tracks => {
+            results.tracks.get(st.main_index).map(|t| t.uri.clone())
+        }
+        MainView::Artist(v) => match v.row(st.main_index) {
+            Some(ArtistRow::Track(t)) => Some(t.uri.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match uri {
+        Some(uri) => send_like(st, uri, tx),
+        None => toggle_like_playing(st, tx),
+    }
+}
+
+/// The deck's liked control, and `L` wherever there is no track row to mean.
+fn toggle_like_playing(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(uri) = st.playback.as_ref().and_then(|pb| pb.track_uri.clone()) else {
+        return;
+    };
+    send_like(st, uri, tx);
+}
+
+/// Flip whatever is known about `uri` and ask the client to make it so.
+///
+/// An unknown track is treated as unliked, so the first press saves it: the
+/// saved check runs for every list we load and for the playing track, so by
+/// the time there is a mark to press the answer is nearly always in hand.
+fn send_like(st: &AppState, uri: String, tx: &UnboundedSender<AppCommand>) {
+    let liked = !st.liked.get(&uri).copied().unwrap_or(false);
+    let _ = tx.send(AppCommand::SetLiked { uri, liked });
+}
+
 /// Play the selected album straight from its card, without opening it — the
 /// card's own ▶ play, and the artist page's answer to `x`.
 fn play_selected_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
@@ -1279,6 +1344,121 @@ mod tests {
             device_name: "dev".into(),
             fetched_at: Instant::now(),
         }
+    }
+
+    /// A two-track list with the first row already saved.
+    fn liked_state() -> AppState {
+        let mut st = AppState::new();
+        let mut list = TrackList::new("Black Holes", "Muse · 2006", None, None);
+        list.kind = TrackListKind::Album;
+        list.append(vec![
+            track("Starlight", Some("a1")),
+            track("Hysteria", Some("a1")),
+        ]);
+        st.main = MainView::Tracks(list);
+        st.liked.insert("spotify:track:Starlight".into(), true);
+        st
+    }
+
+    /// `L` flips whatever is known about the selected row: the saved one is
+    /// unsaved, and a row nothing is known about is saved.
+    #[test]
+    fn like_toggles_the_selected_row_both_ways() {
+        for (index, uri, want) in [
+            (0, "spotify:track:Starlight", false),
+            (1, "spotify:track:Hysteria", true),
+        ] {
+            let (tx, mut rx) = channel();
+            let mut st = liked_state();
+            st.main_index = index;
+            toggle_like_selection(&mut st, &tx);
+            match rx.try_recv() {
+                Ok(AppCommand::SetLiked { uri: got, liked }) => {
+                    assert_eq!(got, uri);
+                    assert_eq!(liked, want, "row {index} flipped the wrong way");
+                }
+                other => panic!("row {index} sent {other:?}"),
+            }
+        }
+    }
+
+    /// In the player the view is about the playing track, not about whichever
+    /// queue row the cursor happens to be resting on.
+    #[test]
+    fn like_in_the_player_targets_the_playing_track() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.show_player = true;
+        // The selection says Starlight; playback says Uprising.
+        st.main_index = 0;
+        st.playback = Some(playing("spotify:album:a1"));
+        toggle_like_selection(&mut st, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
+                if uri == "spotify:track:Uprising" && liked)
+        );
+    }
+
+    /// Nothing selectable on the page, so `L` falls back to what is playing —
+    /// the one track every screen has in common.
+    #[test]
+    fn like_on_a_page_without_tracks_falls_back_to_playback() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = MainView::Playlists;
+        st.playback = Some(playing("spotify:album:a1"));
+        toggle_like_selection(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, .. })
+                if uri == "spotify:track:Uprising"));
+
+        // With nothing playing either there is no track to mean, and the key
+        // does nothing rather than guessing.
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = MainView::Playlists;
+        toggle_like_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Clicking the liked column likes that row — and only likes it: the
+    /// click must not also arm the double-click that would start playback.
+    #[test]
+    fn clicking_the_liked_column_likes_that_row() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.hit.main_list = Rect::new(0, 0, 90, 10);
+        st.hit.main_like_col = Rect::new(4, 0, 2, 2);
+
+        handle_click(&mut st, Position { x: 4, y: 1 }, &tx);
+        assert_eq!(st.main_index, 1, "the click did not select the row");
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
+                if uri == "spotify:track:Hysteria" && liked)
+        );
+        assert!(
+            st.last_main_click.is_none(),
+            "the liked cell armed a double-click"
+        );
+
+        // A click on the same row outside the column is an ordinary select.
+        handle_click(&mut st, Position { x: 20, y: 1 }, &tx);
+        assert!(rx.try_recv().is_err());
+        assert!(st.last_main_click.is_some());
+    }
+
+    /// The deck's liked control is about the playing track, whichever page is
+    /// underneath it.
+    #[test]
+    fn clicking_the_decks_control_likes_the_playing_track() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.playback = Some(playing("spotify:album:a1"));
+        st.hit.like_btn = Rect::new(70, 20, 9, 1);
+        handle_click(&mut st, Position { x: 72, y: 20 }, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
+                if uri == "spotify:track:Uprising" && liked)
+        );
     }
 
     /// Both halves of the artist page name albums on screen, so both must

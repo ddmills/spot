@@ -334,6 +334,28 @@ impl Api {
         Ok(pairs.into_iter().map(|(u, _)| u).zip(flags).collect())
     }
 
+    /// Save or unsave one track in the user's library.
+    ///
+    /// `library_add` / `library_remove` rather than the `current_user_saved_tracks_*`
+    /// pair: those are deprecated in rspotify 0.16 and are thin wrappers over these
+    /// anyway. The read side (`tracks_liked`) already goes through the Library API.
+    pub async fn set_track_liked(&self, uri: &str, liked: bool) -> Result<()> {
+        let id = LibraryId::Track(TrackId::from_uri(uri)?);
+        if liked {
+            self.client.library_add([id]).await
+        } else {
+            self.client.library_remove([id]).await
+        }
+        .with_context(|| {
+            if liked {
+                "failed to save the track"
+            } else {
+                "failed to unsave the track"
+            }
+        })?;
+        Ok(())
+    }
+
     pub async fn add_to_queue(&self, uri: &str) -> Result<()> {
         let id = TrackId::from_uri(uri)?;
         self.client

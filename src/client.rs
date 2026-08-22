@@ -71,6 +71,12 @@ pub struct Client {
     /// CDN stays warm across track changes.
     http: reqwest::Client,
     covers: Arc<Mutex<CoverCache>>,
+    /// The playing track we last asked the saved-check about, so a poll every
+    /// three seconds does not keep asking. It is asked once per track and the
+    /// answer only changes when we change it — and an answer that never comes
+    /// (a 429, say) must not turn into one request per poll for as long as the
+    /// record is on.
+    liked_probe: Option<String>,
 }
 
 impl Client {
@@ -98,6 +104,7 @@ impl Client {
                 .build()
                 .unwrap_or_default(),
             covers: Arc::new(Mutex::new(CoverCache::default())),
+            liked_probe: None,
         }
     }
 
@@ -241,6 +248,7 @@ impl Client {
                 self.api.add_to_queue(&uri).await?;
                 self.state.write().toast("added to queue");
             }
+            SetLiked { uri, liked } => self.set_liked(uri, liked).await,
             Search(query) => {
                 self.state.write().loading = true;
                 let result = self.api.search(&query).await;
@@ -327,6 +335,37 @@ impl Client {
         Ok(())
     }
 
+    /// `L` / the liked column / the deck's control: save or unsave one track.
+    ///
+    /// The map is written before the request so the mark flips on the
+    /// keypress rather than a round trip later, and put back if the call
+    /// fails — an optimistic mark that survives its own error is a mark
+    /// that lies about your library. Errors are handled here rather than
+    /// returned for that reason.
+    async fn set_liked(&self, uri: String, liked: bool) {
+        let previous = self.state.write().liked.insert(uri.clone(), liked);
+        match self.api.set_track_liked(&uri, liked).await {
+            Ok(()) => {
+                self.state.write().toast(if liked {
+                    "added to Liked Songs"
+                } else {
+                    "removed from Liked Songs"
+                });
+                // The saved-tracks page is now stale; the next open must
+                // fetch it rather than serve the cached copy.
+                self.cache.lock().remove(&state::liked_key());
+            }
+            Err(e) => {
+                let mut st = self.state.write();
+                match previous {
+                    Some(was) => st.liked.insert(uri, was),
+                    None => st.liked.remove(&uri),
+                };
+                st.toast(format!("error: {e}"));
+            }
+        }
+    }
+
     /// Fill the player view's queue from the playing context. Ad-hoc
     /// (context-less) playback is covered by the event layer snapshotting
     /// the played list, so only playlist/album contexts are fetched here;
@@ -397,7 +436,7 @@ impl Client {
     /// Queue-pane sibling of `start_track_fetch`: same cache + page loop,
     /// but writes `AppState.queue` under `queue_generation` so it never
     /// interferes with main-view loads. Skips the liked-check side fetch
-    /// (the queue pane shows no hearts).
+    /// (the queue pane shows no liked marks).
     fn start_queue_fetch(
         &self,
         mut list: TrackList,
@@ -791,6 +830,24 @@ impl Client {
                         pb.is_playing = false;
                     }
                 }
+                // The deck draws a liked mark for the playing track, which is not
+                // necessarily in any loaded list, so its saved state has to be
+                // asked for on its own. Once per track — see `liked_probe`;
+                // after that the map owns the answer and `set_liked` keeps it.
+                let unchecked = {
+                    let st = self.state.read();
+                    st.playback
+                        .as_ref()
+                        .and_then(|pb| pb.track_uri.clone())
+                        .filter(|uri| {
+                            !st.liked.contains_key(uri) && self.liked_probe.as_ref() != Some(uri)
+                        })
+                };
+                if let Some(uri) = unchecked {
+                    self.liked_probe = Some(uri.clone());
+                    spawn_liked_check(self.api.clone(), self.state.clone(), vec![uri]);
+                }
+
                 // Art rides along with the poll, so a change of art is just a
                 // change of URL. Compare against what is installed rather
                 // than against the album id: the CDN URL is what we would
