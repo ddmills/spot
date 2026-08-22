@@ -48,11 +48,6 @@ const COL_GAP: &str = "   ";
 /// Leading marker column: "▶ " on the playing row, blank elsewhere.
 const PREFIX_W: usize = 2;
 
-/// Widest the player lays itself out, in cells. Past this the block, the
-/// progress bar and the queue stop reading as one column and start reading as
-/// three things pinned to opposite edges of the terminal.
-const MAX_PLAYER_W: u16 = 100;
-
 /// Row heights for the sections above the queue, each including the blank
 /// spacer rows around it. The progress band leads with two of them: the bar
 /// belongs to the visualizer, but sitting directly under the field it reads
@@ -70,15 +65,11 @@ const VIZ_H: u16 = 9;
 /// Blank rows the progress band puts above its bar.
 const PROGRESS_PAD: u16 = 2;
 
-/// Rows the mark takes at the top of the view: the mark itself, then a blank.
-/// The same rhythm the browse screen's top row uses, so the two views' content
-/// starts on the same line.
-const BRAND_H: u16 = 2;
-/// Cells between the mark and the trail pinned opposite it, kept clear even
-/// on a row wide enough that the two would not otherwise touch — so a long
-/// path is dropped rather than crowding the wordmark. Matches the gap the
-/// browse screen's top row leaves beside the same mark.
-const BRAND_TRAIL_GAP: u16 = 6;
+/// The header's identity band — the mark and the path — under the name this
+/// view knows it by. Both bands come from [`super`] rather than being restated
+/// here: the masthead starts on the line a browse page's list does, so
+/// toggling `v` moves nothing.
+const BRAND_H: u16 = super::NAV_H;
 
 /// Cover-art block heights, in rows. A terminal cell is about twice as tall as
 /// it is wide and a `▀` cell stacks two pixels (see [`deck::sleeve`]), so an R-row
@@ -206,8 +197,59 @@ impl Rows {
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    // Resolved before the split borrow below, which takes `queue` mutably.
-    let main_trail = state.trail();
+    // No border and no title: the view fills the terminal, and a pane frame
+    // around the only thing on screen is just noise. One cell of side padding
+    // keeps text off the edge, matching what `pane_block` gave us.
+    //
+    // Everything below lays itself out across this column, and the column is
+    // the whole terminal: masthead, progress bar, transport and queue all
+    // stretch with it, so a wide screen gets a wide player rather than a
+    // fixed-width one floating in the middle of one.
+    let mut inner = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // The mark and the path, claimed before the row budget below gets to
+    // spend anything — but never at the cost of the masthead, since a screen
+    // showing nothing but a wordmark is worse than one showing the track.
+    //
+    // Just the one band: the header's other two rows are the search prompt,
+    // which this view does not draw (see `top_row::draw`), so the rows go to
+    // the queue rather than sitting blank. That is the one place the two
+    // views' layouts part company — everything below here starts two rows
+    // higher than a browse page's content does.
+    //
+    // The row itself is the browse screen's own, drawn from the browse
+    // screen's own code — the path included, which here is the path of the
+    // page waiting underneath. Sharing the function rather than restating it
+    // is what stops the two drifting.
+    //
+    // No count: the player's list is the queue, and the page underneath's
+    // total is not a fact about what is on screen.
+    //
+    // Before the split borrow below, which takes the state apart.
+    let head = match inner.height >= BRAND_H + deck::MASTHEAD_H {
+        true => BRAND_H,
+        false => 0,
+    };
+    if head > 0 {
+        let band = Rect {
+            height: head,
+            ..inner
+        };
+        super::top_row::draw(frame, band, state, main_pane::PageHeader::default());
+    }
+    inner = Rect {
+        y: inner.y + head,
+        height: inner.height - head,
+        ..inner
+    };
+
     // Split borrows: queue/playback are read while list state, hit areas
     // and the visualizer's smoothing state are written.
     let AppState {
@@ -226,79 +268,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     } = state;
     let mouse = *mouse_pos;
     let state_cover = state_cover.as_deref();
-
-    // No border and no title: the view fills the terminal, and a pane frame
-    // around the only thing on screen is just noise. One cell of side padding
-    // keeps text off the edge, matching what `pane_block` gave us.
-    let inner = Rect {
-        x: area.x + 1,
-        width: area.width.saturating_sub(2),
-        ..area
-    };
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-    // Cap and centre. Everything below lays out inside this column, so the
-    // block, the progress bar and the queue stay one object on a wide screen
-    // rather than drifting to opposite edges of it.
-    let w = inner.width.min(MAX_PLAYER_W);
-    let mut inner = Rect {
-        x: inner.x + (inner.width - w) / 2,
-        width: w,
-        ..inner
-    };
-
-    // The mark, in the same column the browse screen puts it in, so toggling
-    // `v` never appears to move it. It is the only labelled way out of this
-    // view for a mouse, so it is claimed before the row budget below gets to
-    // spend anything — but only where the masthead still fits under it, since
-    // a screen showing nothing but a wordmark is worse than one showing the
-    // track.
-    if inner.height >= BRAND_H + deck::MASTHEAD_H {
-        let row = Rect { height: 1, ..inner };
-        hit.home_btn = super::table::brand(frame, row, mouse);
-        // The queue's name on the context row already toggles this view, but
-        // it names what is *playing*; this names the page waiting underneath,
-        // which is what you are going back to.
-        //
-        // The browse screen's own path, right-aligned: the player is an
-        // overlay rather than a page, so it borrows the trail of what is
-        // behind it. Its head closes the view; a crumb before the head closes
-        // it *and* goes there, which is what clicking a step of a path means
-        // wherever else it is drawn.
-        let field = Rect {
-            x: row.x + super::table::BRAND_W + BRAND_TRAIL_GAP,
-            width: row
-                .width
-                .saturating_sub(super::table::BRAND_W + BRAND_TRAIL_GAP),
-            ..row
-        };
-        let (trail, ellipsis) = main_pane::fit_trail(&main_trail, false, field.width);
-        let width = main_pane::trail_width(&trail, false, ellipsis);
-        // All or nothing, as everything pinned to this edge is: a path clipped
-        // by the row would read as a shorter one than it is.
-        if width <= field.width {
-            hit.close_player = main_pane::draw_trail(
-                frame,
-                Rect {
-                    x: field.right() - width,
-                    width,
-                    ..field
-                },
-                &trail,
-                false,
-                ellipsis,
-                true,
-                mouse,
-                hit,
-            );
-        }
-        inner = Rect {
-            y: inner.y + BRAND_H,
-            height: inner.height - BRAND_H,
-            ..inner
-        };
-    }
 
     let rows = Rows::new(inner.width, inner.height);
     let mut y = inner.y;
@@ -338,7 +307,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             height: art_area.height + viz_band.height,
             ..inner
         };
-        let (_, used) = band_layout(inner.width);
+        let used = band_layout(inner.width).used;
         let field = match used <= inner.width {
             true => Rect {
                 x: inner.x + (inner.width - used) / 2,
@@ -432,11 +401,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let field = if rows.art > 0 {
         draw_block(frame, art_area, pb, state_cover, hit)
     } else {
-        // The stacked field spans the pane, up to the band cap; centre
-        // whatever the cap leaves over rather than banking it on one side.
+        // The stacked field spans the pane; centre the odd cell its stride
+        // cannot fill rather than banking it on one side.
         // `band_layout` has a minimum band count, so a very narrow pane asks
         // for more cells than it has, and the field is simply not drawn.
-        let (_, used) = band_layout(inner.width);
+        let used = band_layout(inner.width).used;
         match used <= inner.width {
             true => Rect {
                 x: inner.x + (inner.width - used) / 2,
@@ -520,16 +489,59 @@ fn draw_block(
     }
 }
 
-/// Band count and the width the field occupies, for a rect `width` cells wide.
+/// How the spectrum divides a rect: how many bands, how wide their bars, and
+/// the width the field ends up occupying.
+struct Bands {
+    n: usize,
+    /// Cells the narrow bars take. The first [`wide`](Self::wide) bands get one
+    /// more, which is how the field fills a rect the stride does not divide.
+    bar: u16,
+    wide: u16,
+    used: u16,
+}
+
+impl Bands {
+    /// Band `b`'s left edge, as an offset into the field.
+    fn x(&self, b: usize) -> u16 {
+        b as u16 * (self.bar + 1) + (b as u16).min(self.wide)
+    }
+
+    fn width(&self, b: usize) -> u16 {
+        self.bar + u16::from((b as u16) < self.wide)
+    }
+}
+
+/// How a rect `width` cells wide divides into bands.
 ///
-/// `n` bands take `n * BAND_STRIDE - 1` cells: a bar and a gap each, less the
-/// trailing gap nothing follows. The field fills any rect up to [`MAX_BANDS`]
-/// and stops widening past it, rather than slicing the spectrum ever finer as
-/// the pane grows. Below [`MIN_BANDS`] it asks for more cells than the rect
-/// has, and the caller declines to draw.
-fn band_layout(width: u16) -> (usize, u16) {
+/// A band is a bar and the gap column after it, less the trailing gap nothing
+/// follows. Bars are one cell wide until the band count reaches [`MAX_BANDS`];
+/// past that the bands stop multiplying and start widening, so a very wide
+/// pane gets a coarser spectrum that still fills it rather than a fine one
+/// stopping short of the edge. Below [`MIN_BANDS`] it asks for more cells than
+/// the rect has, and the caller declines to draw.
+fn band_layout(width: u16) -> Bands {
     let n = width.div_ceil(BAND_STRIDE).clamp(MIN_BANDS, MAX_BANDS);
-    (n as usize, n * BAND_STRIDE - 1)
+    // The stride that fits `n` bands in the rect, and the cells left over
+    // after it — the `+ 1` on both pays for the gap the last bar does not
+    // need. The leftovers go one apiece to the leading bands rather than into
+    // a gap at the field's right edge. Only a capped field has any to share
+    // out: below the cap the band count itself grew to take them, leaving at
+    // most the one cell a two-cell stride cannot fill.
+    let capped = n == MAX_BANDS;
+    let stride = match capped {
+        true => ((width + 1) / n).max(BAND_STRIDE),
+        false => BAND_STRIDE,
+    };
+    let wide = match capped {
+        true => (width + 1).saturating_sub(n * stride),
+        false => 0,
+    };
+    Bands {
+        n: n as usize,
+        bar: stride - 1,
+        wide,
+        used: n * stride - 1 + wide,
+    }
 }
 
 /// One band's animation state, in rows rather than 0..=1.
@@ -572,34 +584,37 @@ fn draw_visualizer(
     tap: &crate::audio_tap::AudioTap,
     viz: &mut VizState,
 ) {
-    let (n_bands, used) = band_layout(area.width);
+    let bands = band_layout(area.width);
     // The band count is clamped, so a very narrow rect asks for more cells than
     // it has; drawing anyway would spill the field past its own right edge.
-    if used > area.width || area.height == 0 {
+    if bands.used > area.width || area.height == 0 {
         return;
     }
     let fresh = tap.is_fresh(FRESH_WITHIN);
-    viz.update(tap, n_bands, fresh, Instant::now());
+    viz.update(tap, bands.n, fresh, Instant::now());
 
     let rows = area.height;
     let h = rows as f32;
     // Every cell carries its own color, so this paints the buffer directly;
     // going through `Paragraph` would mean one `Span` per cell.
     let buf = frame.buffer_mut();
-    for b in 0..n_bands {
+    for b in 0..bands.n {
         let col = Column {
             bar: viz.bars()[b] * h,
             glow: viz.glow()[b] * h,
         };
         // The gap column after each bar is simply never written.
-        let x = area.x + b as u16 * BAND_STRIDE;
+        let x = area.x + bands.x(b);
+        let bar_w = bands.width(b);
         for row in 0..rows {
             let (ch, style) = viz_cell(&col, rows - row, rows);
             // A stale tap means paused or playing elsewhere: keep the shape,
             // drop the color.
             let style = if fresh { style } else { theme::dim() };
-            if let Some(cell) = buf.cell_mut((x, area.y + row)) {
-                cell.set_char(ch).set_style(style);
+            for x in x..x + bar_w {
+                if let Some(cell) = buf.cell_mut((x, area.y + row)) {
+                    cell.set_char(ch).set_style(style);
+                }
             }
         }
     }
@@ -831,16 +846,32 @@ mod tests {
         st
     }
 
-    /// Render `height` rows *of the player itself*, with the mark's two rows
+    /// Render `height` rows *of the player itself*, with the header's rows
     /// above them dropped.
     ///
     /// The terminal is made that much taller so the view's own row budget is
     /// the `height` asked for, and every row index below is measured from
-    /// under the mark — so the layout these tests describe is the same one
-    /// they described before the mark went in. [`render_raw`] sees the whole
-    /// screen, mark included.
+    /// under the header — so the layout these tests describe is the same one
+    /// they described before the header went in. [`render_raw`] sees the whole
+    /// screen, header included.
     fn render(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
         render_raw(state, width, height + BRAND_H).split_off(BRAND_H as usize)
+    }
+
+    /// A page to sit behind the player, so its borrowed path has a step on it
+    /// that is not the page itself. Home draws no crumb, so a path one deep
+    /// from Home is a head and nothing else.
+    fn artist(name: &str) -> crate::app::state::ArtistView {
+        crate::app::state::ArtistView {
+            id: "r1".into(),
+            uri: "spotify:artist:r1".into(),
+            name: name.into(),
+            image_url: None,
+            genres: vec![],
+            top: TrackList::new(name, "", None, None),
+            albums: vec![],
+            loading: false,
+        }
     }
 
     fn render_raw(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
@@ -856,48 +887,95 @@ mod tests {
             .collect()
     }
 
-    /// The player is an overlay rather than a page, so it borrows the trail of
-    /// what is behind it, pinned opposite the mark. Its head is the way out —
-    /// unlike the browse screen's, where the head is the page you are already
-    /// on and leads nowhere.
+    /// The header is the browse screen's top row: the mark, then the path.
+    /// The player is an overlay rather than a page, so it borrows the path of
+    /// what is behind it — and its head is the way out, unlike the browse
+    /// screen's, where the head is the page you are already on and leads
+    /// nowhere.
+    ///
+    /// And it is only that row. The prompt the browse screen carries two rows
+    /// under it is not drawn here, so the masthead starts where the blank
+    /// under the path ends.
     #[test]
-    fn the_mark_row_carries_the_browse_screens_own_path() {
+    fn the_header_carries_the_browse_screens_own_row_and_path() {
         let mut st = playing_state();
         st.main_index = 2;
+        st.push_view();
+        st.main = MainView::Artist(artist("Muse"));
         st.push_view();
         st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
 
         let lines = render_raw(&mut st, 80, 26);
-        assert!(lines[0].starts_with(" ♫ spot"), "{:?}", lines[0]);
-        assert!(
-            lines[0].trim_end().ends_with("HOME  ›  BLACK HOLES"),
-            "{:?}",
-            lines[0]
+        assert_eq!(
+            lines[0].trim_end(),
+            " ♫ spot   MUSE  ›  BLACK HOLES",
+            "the mark does not lead the path"
         );
+        assert!(lines[1].trim().is_empty(), "{:?}", lines[1]);
+        assert!(!lines[2].contains("/  search"), "{:?}", lines[2]);
+        assert!(lines[2].contains("Beta"), "the masthead took the row");
+        assert!(st.hit.search_box.is_empty());
+
         // The head closes the view; the step before it is a crumb like any
         // other, and clicking it closes the view *and* goes there.
         assert!(!st.hit.close_player.is_empty());
         assert_eq!(st.hit.crumbs.len(), 1);
-        assert_eq!(st.hit.crumbs[0].1, CrumbTarget::Depth(0));
-        assert!(st.hit.crumbs[0].0.right() < st.hit.close_player.x);
-        // And it keeps clear of the mark rather than crowding it.
+        assert_eq!(st.hit.crumbs[0].1, CrumbTarget::Depth(1));
+        // Left to right, and clear of the mark rather than crowding it.
+        assert_eq!(st.hit.crumbs[0].0.y, 0);
         assert!(st.hit.crumbs[0].0.x > st.hit.home_btn.right());
+        assert!(st.hit.crumbs[0].0.right() < st.hit.close_player.x);
     }
 
-    /// A row with no space for the whole path drops it rather than clipping
-    /// it, like everything else pinned to this edge — and then the view has no
-    /// labelled way out but the mark, which is why the mark is claimed first.
+    /// A row too narrow for the whole path sheds its ancestors and keeps the
+    /// page you are on — the browse screen's behaviour, and here also the
+    /// labelled way out, since the head is what closes the view.
     #[test]
-    fn a_narrow_mark_row_drops_the_path_and_keeps_the_mark() {
+    fn a_narrow_header_sheds_the_path_but_keeps_the_page() {
         let mut st = playing_state();
         st.push_view();
+        st.main = MainView::Artist(artist("Muse"));
+        st.push_view();
         st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
-        let lines = render_raw(&mut st, 22, 26);
+        let lines = render_raw(&mut st, 30, 26);
         assert!(lines[0].starts_with(" ♫ spot"), "{:?}", lines[0]);
         assert!(!lines[0].contains('›'), "{:?}", lines[0]);
-        assert!(st.hit.close_player.is_empty());
-        assert!(st.hit.crumbs.is_empty());
+        assert!(lines[0].contains("BLACK HOLES"), "{:?}", lines[0]);
+        assert!(st.hit.crumbs.is_empty(), "no ancestor survived the shed");
+        assert!(!st.hit.close_player.is_empty(), "no way out of the view");
         assert!(!st.hit.home_btn.is_empty());
+    }
+
+    /// The shortest view that still gets a header: the masthead has to fit
+    /// under it, because a screen showing nothing but a wordmark is worse than
+    /// one showing the track. A row shorter than that and the header goes.
+    #[test]
+    fn the_header_survives_down_to_the_masthead_and_no_further() {
+        let short = |h: u16| {
+            let mut st = playing_state();
+            st.push_view();
+            st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+            let lines = render_raw(&mut st, 80, h);
+            (st, lines)
+        };
+
+        let (st, lines) = short(BRAND_H + deck::MASTHEAD_H);
+        assert!(lines[0].starts_with(" ♫ spot"), "{:?}", lines[0]);
+        assert!(lines[0].contains("BLACK HOLES"), "{:?}", lines[0]);
+        assert!(!st.hit.home_btn.is_empty());
+        assert!(!st.hit.close_player.is_empty());
+        // The masthead starts right under it — no prompt, and no gap where
+        // one would have been on the browse screen.
+        assert!(
+            lines[BRAND_H as usize].contains("Beta"),
+            "{:?}",
+            lines[BRAND_H as usize]
+        );
+
+        let (st, lines) = short(BRAND_H + deck::MASTHEAD_H - 1);
+        assert!(!lines[0].contains("spot"), "{:?}", lines[0]);
+        assert!(st.hit.home_btn.is_empty());
+        assert!(st.hit.close_player.is_empty());
     }
 
     #[test]
@@ -1101,60 +1179,56 @@ mod tests {
         (field, painted)
     }
 
-    /// Bars are one cell wide on a two-cell stride — a blank column between
-    /// every pair — and the run ends on a bar rather than a trailing gap, at
-    /// every width the layout produces.
+    /// Bars are separated by a blank column and the run ends on a bar rather
+    /// than a trailing gap, at every width the layout produces.
     #[test]
     fn bars_are_gapped_and_fill_the_field_at_every_width() {
-        for width in [40u16, 80, 94, 200] {
+        for width in [40u16, 80, 94, 200, 400] {
             let (field, painted) = painted_bottom_row(width);
-            let (n, used) = band_layout(field.width);
-            assert!(n <= MAX_BANDS as usize, "{width}: {n} bands");
-            assert_eq!(
-                used,
-                n as u16 * BAND_STRIDE - 1,
-                "{width}: wrong field width"
+            let bands = band_layout(field.width);
+            assert!(bands.n <= MAX_BANDS as usize, "{width}: {} bands", bands.n);
+            assert!(
+                bands.used <= field.width,
+                "{width}: the field overflows its rect"
             );
-            assert!(used <= field.width, "{width}: the field overflows its rect");
-            assert_eq!(painted.len(), n, "{width}: bands lost");
-            let expected: Vec<u16> = (0..n as u16).map(|i| field.x + i * BAND_STRIDE).collect();
+            let expected: Vec<u16> = (0..bands.n)
+                .flat_map(|b| {
+                    let x = field.x + bands.x(b);
+                    x..x + bands.width(b)
+                })
+                .collect();
+            assert_eq!(painted, expected, "{width}: bars are not gapped");
             assert_eq!(
-                painted, expected,
-                "{width}: bars are not gapped on the stride"
+                expected.last().unwrap() - field.x + 1,
+                bands.used,
+                "{width}: the run does not end on a bar"
             );
         }
     }
 
-    /// Past the cap the field stops widening, which is what keeps a very wide
-    /// pane from slicing the spectrum into a horizon line.
+    /// Past the cap the bands stop multiplying and start widening, so a very
+    /// wide pane fills with a coarser spectrum rather than a horizon line —
+    /// and rather than a fine one stopping short of the pane's edge.
     #[test]
-    fn a_very_wide_pane_caps_the_band_count() {
-        let (n, used) = band_layout(500);
-        assert_eq!(n, MAX_BANDS as usize, "{n} bands");
-        assert_eq!(
-            used,
-            MAX_BANDS * BAND_STRIDE - 1,
-            "field kept growing past the cap"
-        );
+    fn a_very_wide_pane_widens_the_bars_at_the_band_cap() {
+        let bands = band_layout(500);
+        assert_eq!(bands.n, MAX_BANDS as usize, "{} bands", bands.n);
+        assert!(bands.bar > 1, "the bars did not widen");
+        assert_eq!(bands.used, 500, "the field stopped short of the pane");
     }
 
-    /// The player lays itself out in a centred column of at most
-    /// [`MAX_PLAYER_W`], so a wide terminal does not pin the block, the
-    /// progress bar and the queue to opposite edges.
+    /// The view spans the terminal: the block starts at the screen's own
+    /// margin and the progress bar and queue run to the far side of it, so a
+    /// wide terminal gets a wide player rather than a fixed column floating in
+    /// the middle of one.
     #[test]
-    fn a_wide_terminal_centres_a_capped_column() {
+    fn a_wide_terminal_gets_the_whole_width() {
         let width = 200;
         let mut st = playing_state();
         let mut terminal = Terminal::new(TestBackend::new(width, 30 + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let inner_w = width - 2 * PANE_INSET;
-        let left = PANE_INSET + (inner_w - MAX_PLAYER_W) / 2;
-        let column = Rect {
-            x: left,
-            y: 0,
-            width: MAX_PLAYER_W,
-            height: 30,
-        };
+
         for (name, r) in [
             ("art", st.hit.art),
             ("viz", st.hit.viz),
@@ -1162,15 +1236,22 @@ mod tests {
             ("next", st.hit.next_btn),
         ] {
             assert!(!r.is_empty(), "{name} was not drawn");
-            assert_eq!(
-                r.intersection(column),
-                r,
-                "{name} escapes the centred column"
-            );
         }
         assert_eq!(
-            st.hit.art.x, left,
-            "the block does not start at the column's edge"
+            st.hit.art.x, PANE_INSET,
+            "the block does not start at the screen margin"
+        );
+        // The progress bar and the queue are what have to grow — the sleeve is
+        // square and the spectrum stops at its band cap.
+        assert_eq!(
+            st.hit.gauge.width,
+            inner_w - deck::TIME_W,
+            "the progress bar did not take the width"
+        );
+        assert_eq!(
+            st.hit.player_queue.width,
+            inner_w - QUEUE_GUTTER,
+            "the queue did not take the width"
         );
     }
 
@@ -1792,26 +1873,32 @@ mod tests {
 
     #[test]
     fn band_layout_fills_its_rect_up_to_the_cap() {
-        for width in 5..=300u16 {
-            let (n, used) = band_layout(width);
-            let n = n as u16;
+        for width in 5..=500u16 {
+            let b = band_layout(width);
+            let n = b.n as u16;
             assert!(
                 (MIN_BANDS..=MAX_BANDS).contains(&n),
                 "width {width} gave {n} bands"
             );
-            // A bar and a gap per band, less the gap after the last one.
-            assert_eq!(used, n * BAND_STRIDE - 1, "width {width}");
+            // Every band is a bar and the gap after it, less the gap after the
+            // last one — whatever the bars are individually worth.
+            let used: u16 = (0..b.n).map(|i| b.width(i) + 1).sum::<u16>() - 1;
+            assert_eq!(used, b.used, "width {width}");
+            assert_eq!(b.x(b.n - 1) + b.width(b.n - 1), b.used, "width {width}");
             // It never overruns the rect it was given, except at the minimum
             // band count where the pane is simply too narrow to draw at all.
             assert!(
-                used <= width || n == MIN_BANDS,
-                "width {width} overrun by {used}"
+                b.used <= width || n == MIN_BANDS,
+                "width {width} overrun by {}",
+                b.used
             );
             // And it leaves nothing unused — at most the one odd cell a
-            // two-cell stride cannot fill — until the cap bites.
+            // two-cell stride cannot fill, since past the cap the bars widen
+            // to take the rest.
             assert!(
-                width.saturating_sub(used) <= 1 || n == MAX_BANDS,
-                "width {width} only used {used}"
+                width.saturating_sub(b.used) <= 1,
+                "width {width} only used {}",
+                b.used
             );
         }
     }

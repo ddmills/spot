@@ -22,8 +22,15 @@ use crate::app::state::{AppState, HitAreas};
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
-/// Rows the top row takes: the mark and the search prompt, then a blank.
-const TOP_H: u16 = 2;
+/// Rows the identity row takes: the `♫ spot` mark and the path beside it,
+/// then a blank.
+const NAV_H: u16 = 2;
+/// Rows the search prompt takes under it: the prompt, then a blank.
+const SEARCH_H: u16 = 2;
+/// The header both views wear, and the line their content starts on. Neither
+/// view spells these rows out for itself: the whole point is that toggling the
+/// player moves nothing. Drawn by [`top_row`] either way.
+const HEAD_H: u16 = NAV_H + SEARCH_H;
 /// Rows the bottom bar takes: a rule, the deck's seven rows beside the
 /// sleeve, then a blank. See [`now_playing`].
 const BAR_H: u16 = 1 + deck::DECK_H + 1;
@@ -54,9 +61,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             .direction(Direction::Vertical)
             .horizontal_margin(1)
             .constraints([
-                // The mark and the prompt, then a blank row. Fixed, so
-                // entering and leaving search mode moves nothing below it.
-                Constraint::Length(TOP_H),
+                // The mark and the path, a blank, the prompt, a blank. Fixed,
+                // so entering and leaving search mode moves nothing below it.
+                Constraint::Length(HEAD_H),
                 Constraint::Min(1),
                 Constraint::Length(BAR_H),
             ])
@@ -65,7 +72,12 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         // One column. The left nav used to take 30 cells of it — its playlists
         // are a page of their own now, reached from Home, and the pane it was
         // crowding gets the width back. See `main_pane::draw_playlists`.
-        top_row::draw(frame, rows[0], state);
+        //
+        // The page's own contribution to the header — its count, and whether
+        // it is still loading — read off before the header is drawn, because
+        // the row it goes on is not the pane's to draw.
+        let page = main_pane::page_header(state);
+        top_row::draw(frame, rows[0], state, page);
         main_pane::draw(frame, rows[1], state);
         now_playing::draw(frame, rows[2], state);
     }
@@ -200,9 +212,8 @@ mod tests {
         let mut searching = browse_state();
         searching.input_mode = crate::app::state::InputMode::Search;
         let after = screen(&mut searching, 100, 34);
-        // Row 0 is the prompt itself and is expected to differ; nothing else
-        // may move.
-        for y in 1..34 {
+        // The prompt row itself is expected to differ; nothing else may move.
+        for y in (0..34).filter(|&y| y != NAV_H as usize) {
             assert_eq!(before[y], after[y], "row {y} moved when search opened");
         }
     }
@@ -218,9 +229,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
         terminal.draw(|f| draw(f, &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        // Row 2 is the label row, one cell in from the screen margin.
+        // Row 0 carries the mark and the path; the head of the path is the
+        // accent run on it, one gap past the mark.
+        let head_x = table::BRAND_W + top_row::MARK_GAP + 1;
         assert_eq!(
-            buffer.cell(Position { x: 1, y: 2 }).unwrap().fg,
+            buffer.cell(Position { x: head_x, y: 0 }).unwrap().fg,
             theme::accent_color()
         );
         // The track table reaches the far side: with the rail gone, the header
@@ -237,29 +250,77 @@ mod tests {
         );
     }
 
-    /// The mark leads the top row in both views, in the same column, so
-    /// toggling the player never appears to move it.
+    /// Both views lead with the same row: the mark, then the path.
+    ///
+    /// Drawn from the same code in both — `top_row::nav_row` for the row,
+    /// `main_pane::draw_trail` for the path — so this is the test that catches
+    /// them drifting. Toggling the player must not move a cell of it.
+    ///
+    /// The prompt under it is the browse screen's alone: the player has no
+    /// list to search into, and the rows go to its queue instead.
     #[test]
-    fn the_mark_leads_the_top_row_in_both_views() {
+    fn the_nav_row_is_the_same_in_both_views() {
+        // Two pages deep, so the path has a step on it as well as a head.
+        // Home draws no crumb, so one step down from Home is a head alone.
+        let nested = || {
+            use crate::app::state::{ArtistView, MainView};
+            let mut st = browse_state();
+            st.main = MainView::Home;
+            st.push_view();
+            st.main = MainView::Artist(ArtistView {
+                id: "r1".into(),
+                uri: "spotify:artist:r1".into(),
+                name: "Muse".into(),
+                image_url: None,
+                genres: vec![],
+                top: TrackList::new("Muse", "", None, None),
+                albums: vec![],
+                loading: false,
+            });
+            st.push_view();
+            st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+            st
+        };
+        let mut browse = nested();
+        let mut player = nested();
+        player.show_player = true;
+
+        let a = screen(&mut browse, 100, 34);
+        let b = screen(&mut player, 100, 34);
+        let nav = NAV_H as usize;
+        assert_eq!(&a[..nav], &b[..nav], "the nav row differs between views");
+        // Not vacuously equal: it really is the mark and the path.
+        assert_eq!(
+            a[0].trim_end(),
+            " ♫ spot   MUSE  ›  BLACK HOLES",
+            "{:?}",
+            a[0]
+        );
+        assert!(a[1].trim().is_empty(), "{:?}", a[1]);
+
+        // The prompt is on the browse screen only, and the player spends the
+        // rows it would have taken on what it is actually showing.
+        assert!(a[nav].contains("/  search"), "{:?}", a[nav]);
+        assert!(!b[nav].contains("/  search"), "{:?}", b[nav]);
+        assert!(!browse.hit.search_box.is_empty());
+        assert!(player.hit.search_box.is_empty(), "the player has no prompt");
+
         // Column 0 is the screen's own one-cell margin, which both views inset
         // themselves by.
-        let mut st = browse_state();
-        assert!(
-            screen(&mut st, 100, 34)[0].starts_with(" ♫ spot"),
-            "{:?}",
-            screen(&mut st, 100, 34)[0]
-        );
-        assert_eq!(st.hit.home_btn.x, 1, "the mark sits at the screen margin");
-        assert_eq!(st.hit.home_btn.width, table::BRAND_W);
-
-        let browse_mark = st.hit.home_btn;
-        let mut st = browse_state();
-        st.show_player = true;
-        assert!(screen(&mut st, 100, 34)[0].starts_with(" ♫ spot"));
+        assert_eq!(browse.hit.home_btn.x, 1, "the mark sits at the margin");
+        assert_eq!(browse.hit.home_btn.width, table::BRAND_W);
         assert_eq!(
-            st.hit.home_btn, browse_mark,
+            browse.hit.home_btn, player.hit.home_btn,
             "the mark moved when the player opened"
         );
+        // The ancestors are controls on both. Only the head disagrees: on the
+        // browse screen it is the page you are already on and leads nowhere,
+        // while in the player it closes the view.
+        let rects = |st: &AppState| -> Vec<_> { st.hit.crumbs.iter().map(|(r, _)| *r).collect() };
+        assert_eq!(rects(&browse), rects(&player));
+        assert_eq!(rects(&browse).len(), 1);
+        assert!(browse.hit.close_player.is_empty());
+        assert!(!player.hit.close_player.is_empty());
     }
 
     /// Home is what the app opens onto, and the mark is what gets back to it.
@@ -278,7 +339,8 @@ mod tests {
         });
         st.main = crate::app::state::MainView::Home;
         let lines = screen(&mut st, 100, 34);
-        assert!(lines[2].contains("HOME"));
+        // Home draws no crumb: the mark is already the way there.
+        assert_eq!(lines[0].trim_end(), " ♫ spot", "{:?}", lines[0]);
         assert!(lines[4].contains("Liked Songs"), "{:?}", lines[4]);
         // No count: its length is not known until it is opened.
         assert!(
@@ -413,11 +475,11 @@ mod tests {
         use crate::app::state::{RadioScope, RadioView};
 
         let mut st = browse_state();
-        assert!(screen(&mut st, 100, 34)[0].contains("search artists"));
+        assert!(screen(&mut st, 100, 34)[NAV_H as usize].contains("search artists"));
 
         st.main = crate::app::state::MainView::Radio(RadioView::new(RadioScope::Popular, 0));
         assert!(
-            screen(&mut st, 100, 34)[0].contains("search radio stations"),
+            screen(&mut st, 100, 34)[NAV_H as usize].contains("search radio stations"),
             "the prompt must retarget"
         );
     }

@@ -1256,13 +1256,19 @@ impl AppState {
     /// remembered. The stack already held the whole chain — it was simply
     /// never shown.
     ///
-    /// Home is one crumb and no ancestors, which draws exactly as the old
-    /// `HOME` label did.
+    /// Home is not on it, at either end. The `♫ spot` mark sits at the head of
+    /// the same row and *is* the way home, so a `HOME ›` in front of every
+    /// path was a second control saying what the first one already said —
+    /// and on Home itself a crumb naming the page the mark points at. The
+    /// depths of the crumbs that remain are unchanged, so what they pop back
+    /// to is unaffected: this drops a step from what is *drawn*, not from the
+    /// stack.
     pub fn trail(&self) -> Vec<Crumb> {
         let mut out: Vec<Crumb> = self
             .view_stack
             .iter()
             .enumerate()
+            .filter(|(_, snap)| !matches!(snap.view, MainView::Home))
             .map(|(depth, snap)| Crumb {
                 label: snap.title(),
                 target: CrumbTarget::Depth(depth),
@@ -1280,10 +1286,13 @@ impl AppState {
                 target: CrumbTarget::Artist { id, name },
             });
         }
-        out.push(Crumb {
-            label: view_title(&self.main),
-            target: CrumbTarget::Current,
-        });
+        // Home draws no head either, so its row is the mark and nothing else.
+        if !matches!(self.main, MainView::Home) {
+            out.push(Crumb {
+                label: view_title(&self.main),
+                target: CrumbTarget::Current,
+            });
+        }
         out
     }
 

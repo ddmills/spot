@@ -368,6 +368,12 @@ fn handle_search_input(
             st.input_mode = InputMode::Normal;
             st.input_buffer.clear();
             if !query.is_empty() {
+                // Belt and braces: the prompt is not drawn over the player and
+                // `/` is inert there, so this mode should not be reachable
+                // with the player up. `navigate` would not close it if it
+                // were — nothing there knows it is open — and results the
+                // player was hiding would be worse than a redundant line.
+                st.show_player = false;
                 // The prompt searches whatever you are looking at. On a radio
                 // page that is the station directory — the two catalogues have
                 // nothing to do with each other, and one box that quietly
@@ -560,7 +566,9 @@ fn handle_player_key(
         KeyCode::Char('G') => queue_set(&mut state.write(), usize::MAX),
         KeyCode::Enter => play_from_queue(&mut state.write(), tx),
         // Browse-only keys are inert here rather than acting on the
-        // invisible panes underneath.
+        // invisible panes underneath. `/` is one of them again: the header
+        // draws no prompt over the player, so the key would put you in a mode
+        // with nothing on screen to show what you were typing.
         KeyCode::Char('/' | '1' | '2' | 'b' | 'B' | 'o' | 'O' | 'a' | 'x' | '[' | ']')
         | KeyCode::Tab
         | KeyCode::BackTab
@@ -1823,7 +1831,7 @@ mod tests {
         // Searching again from the results replaces rather than stacks.
         navigate(&mut st, AppCommand::Search("pixies".into()), &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "pixies"));
-        assert_eq!(labels(&st), ["home", "“muse”"], "the old query was stacked");
+        assert_eq!(labels(&st), ["“muse”"], "the old query was stacked");
     }
 
     /// …and from a page *above* an earlier search, the new query takes that
@@ -1969,7 +1977,10 @@ mod tests {
         st.main_index = 1;
         activate_selection(&mut st, &tx);
         assert!(matches!(st.main, MainView::Playlists));
-        assert_eq!(labels(&st), ["home", "playlists"]);
+        // Home draws no crumb of its own — the mark beside the path is the
+        // way there — so the path below it starts at the page you opened.
+        assert_eq!(labels(&st), ["playlists"]);
+        assert_eq!(st.view_stack.len(), 1, "Home is still on the stack");
 
         activate_selection(&mut st, &tx);
         assert!(
@@ -1981,7 +1992,7 @@ mod tests {
         st.main = MainView::Tracks(TrackList::new("trendy", "", None, None));
         // Each drill-in adds a step rather than replacing the one before it,
         // which is what the trail on the section row spells out.
-        assert_eq!(labels(&st), ["home", "playlists", "trendy"]);
+        assert_eq!(labels(&st), ["playlists", "trendy"]);
     }
 
     /// Liked Songs and Discover Weekly are Home rows of their own. Discover
@@ -2257,7 +2268,7 @@ mod tests {
         // The page is pushed on the keypress and the directory answers later,
         // so until it does the head is still the page you left.
         st.main = radio_page(RadioScope::Popular, vec![]);
-        assert_eq!(labels(&st), ["home", "radio"]);
+        assert_eq!(labels(&st), ["radio"]);
     }
 
     /// A facet row is a door and a station row is a thing to play, so Enter
@@ -2457,5 +2468,65 @@ mod tests {
         }
         handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "jazz"));
+    }
+
+    /// The search row is drawn at the top of the player too, so `/` has to
+    /// reach it from there. It used to be inert in this view, along with the
+    /// keys that act on the invisible panes underneath — but the prompt is on
+    /// screen, and a control you can see and cannot use is worse than none.
+    #[test]
+    fn slash_is_inert_in_the_player() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        state.write().show_player = true;
+        handle_normal(KeyEvent::from(KeyCode::Char('/')), &state, &tx);
+        assert_eq!(
+            state.read().input_mode,
+            InputMode::Normal,
+            "nothing on screen would show what you were typing"
+        );
+        assert!(state.read().show_player, "and it does not leave the view");
+
+        // `v` first, and then it works like anywhere else.
+        state.write().show_player = false;
+        handle_normal(KeyEvent::from(KeyCode::Char('/')), &state, &tx);
+        assert_eq!(state.read().input_mode, InputMode::Search);
+    }
+
+    /// The prompt is not drawn over the player and `/` is inert there, so
+    /// this state should not be reachable — but if it ever is, the results
+    /// have to be visible when they land.
+    #[test]
+    fn a_query_submitted_from_the_player_closes_it() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        {
+            let mut st = state.write();
+            st.show_player = true;
+            st.input_mode = InputMode::Search;
+            st.input_buffer = "muse".into();
+        }
+        handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+        assert!(!state.read().show_player);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "muse"));
+    }
+
+    /// Backing out of the prompt is not a navigation, so it leaves you where
+    /// you were — as does submitting nothing.
+    #[test]
+    fn leaving_the_prompt_empty_handed_keeps_the_player_open() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        for key in [KeyCode::Esc, KeyCode::Enter] {
+            {
+                let mut st = state.write();
+                st.show_player = true;
+                st.input_mode = InputMode::Search;
+                st.input_buffer = "  ".into();
+            }
+            handle_search_input(KeyEvent::from(key), &state, &tx);
+            assert!(state.read().show_player, "{key:?} left the player");
+            assert_eq!(state.read().input_mode, InputMode::Normal);
+        }
     }
 }

@@ -35,10 +35,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         uri: state.playback.as_ref().and_then(|p| p.track_uri.clone()),
         context: state.playback.as_ref().and_then(|p| p.context_uri.clone()),
     };
-    // Resolved before the split borrow below, which takes `main` mutably.
-    // Every page draws one: Home's is a single crumb naming itself, which is
-    // exactly what the old section label was.
-    let trail = state.trail();
     let me_id = state.me_id.clone();
     // The station playing, if one is, so a radio page can mark its row the way
     // a track table marks the playing track.
@@ -84,32 +80,27 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     };
 
     match main {
-        MainView::Home => draw_home(
-            frame, list_area, &home, main_index, main_list, hit, mouse, &trail,
-        ),
+        MainView::Home => draw_home(frame, list_area, &home, main_index, main_list, hit, mouse),
         MainView::Playlists => draw_playlists(
             frame,
             list_area,
             playlists,
             me_id.as_deref(),
-            loading,
             main_index,
             main_list,
             hit,
             &marks,
-            mouse,
-            &trail,
         ),
         MainView::Tracks(list) => draw_tracks(
             frame, list_area, list, view_cover, loading, main_index, main_list, hit, &marks, liked,
-            mouse, &trail,
+            mouse,
         ),
         MainView::Search(results) => draw_search(
             frame, list_area, results, loading, search_tab, main_index, main_list, hit, &marks,
-            mouse, liked, &trail,
+            mouse, liked,
         ),
         MainView::Artist(v) => draw_artist(
-            frame, list_area, v, page_art, main_index, main_list, hit, &marks, mouse, liked, &trail,
+            frame, list_area, v, page_art, main_index, main_list, hit, &marks, mouse, liked,
         ),
         MainView::Radio(v) => draw_radio(
             frame,
@@ -121,7 +112,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             main_list,
             hit,
             mouse,
-            &trail,
         ),
     }
 }
@@ -158,11 +148,8 @@ fn draw_home(
     list_state: &mut ListState,
     hit: &mut HitAreas,
     mouse: Option<Position>,
-    trail: &[Crumb],
 ) {
-    // Home is the bottom of the stack, so its trail is one crumb naming
-    // itself — the same `HOME` the section label drew.
-    let inner = section_body(frame, area, trail, false, None, mouse, hit);
+    let inner = body_area(area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -251,36 +238,12 @@ fn draw_playlists(
     area: Rect,
     playlists: &[crate::app::state::Playlist],
     me_id: Option<&str>,
-    loading: bool,
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
     marks: &PlayMarks,
-    mouse: Option<Position>,
-    trail: &[Crumb],
 ) {
-    // The count belongs on the trail's row, which is otherwise empty past the
-    // path — the same place a track page puts its totals. `section_body`
-    // draws it, so the trail knows to keep clear of it.
-    let total = (!playlists.is_empty()).then(|| {
-        Span::styled(
-            format!(
-                "{} playlist{}",
-                playlists.len(),
-                if playlists.len() == 1 { "" } else { "s" }
-            ),
-            theme::dim(),
-        )
-    });
-    let inner = section_body(
-        frame,
-        area,
-        trail,
-        loading && playlists.is_empty(),
-        total,
-        mouse,
-        hit,
-    );
+    let inner = body_area(area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -458,30 +421,11 @@ fn draw_radio(
     list_state: &mut ListState,
     hit: &mut HitAreas,
     mouse: Option<Position>,
-    trail: &[Crumb],
 ) {
     use crate::app::state::{RadioRow, RadioTab};
 
     let facets = matches!(view.rows.first(), Some(RadioRow::Facet { .. }));
-    let total = (!view.rows.is_empty()).then(|| {
-        let n = view.rows.len();
-        let label = match (facets, n) {
-            (true, 1) => "1 entry".to_string(),
-            (true, n) => format!("{n} entries"),
-            (false, 1) => "1 station".to_string(),
-            (false, n) => format!("{n} stations"),
-        };
-        Span::styled(label, theme::dim())
-    });
-    let inner = section_body(
-        frame,
-        area,
-        trail,
-        view.loading && view.rows.is_empty(),
-        total,
-        mouse,
-        hit,
-    );
+    let inner = body_area(area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -630,9 +574,8 @@ fn draw_artist(
     marks: &PlayMarks,
     mouse: Option<Position>,
     liked: &std::collections::HashMap<String, bool>,
-    trail: &[Crumb],
 ) {
-    let inner = section_body(frame, area, trail, v.loading, None, mouse, hit);
+    let inner = body_area(area);
     let body = artist_band(frame, inner, v, page_art, hit, mouse);
     if v.len() == 0 {
         hit.main_list = body;
@@ -1332,8 +1275,6 @@ fn scroll_col(body: Rect) -> Rect {
         height: body.height,
     }
 }
-/// Cells between the trail and anything pinned to the right of its row.
-const BACK_GAP: u16 = 3;
 /// Longest a single crumb is spelled before eliding.
 pub(super) const HEAD_W: usize = 24;
 /// Longest an *ancestor* crumb is spelled. Shorter than the head: the page you
@@ -1519,59 +1460,83 @@ pub(super) fn draw_trail(
     head
 }
 
-/// Draw the pane's trail row and return the area left for its content.
+/// What a page contributes to the header [`super::top_row`] draws above it.
 ///
-/// This replaces `theme::pane_block`, and then the section label that replaced
-/// *that*. The label named the page's kind (`ALBUM`) and carried a `← <name>`
-/// pill three cells after it — so the one control that means "go back" landed
-/// in a different column on every page, and drew the parent to the right of
-/// the child it pointed away from. The row now spells the path instead:
-/// ancestors dim and clickable, the page you are on in accent at the head,
-/// anchored at the pane's own margin whatever is on screen.
+/// The path and the count sit on a row the pane does not own — the two views
+/// share that row, and the player draws it over whatever page is waiting
+/// underneath. So a page hands these up rather than drawing them: see
+/// [`page_header`].
+#[derive(Default)]
+pub(super) struct PageHeader {
+    /// Whether the page's own contents are still in flight. Spelled out after
+    /// the head of the path, which is what names the page.
+    pub loading: bool,
+    /// A total to pin opposite the path, where a page has one.
+    pub count: Option<Span<'static>>,
+}
+
+/// Read a page's [`PageHeader`] off the state.
 ///
-/// `right`, when a page has a count to pin opposite the trail, claims its
-/// cells first — the trail is what shortens when the row is tight, because a
-/// path shed from the front still reads as a path while a half-drawn count
-/// reads as a fault.
-fn section_body(
-    frame: &mut Frame,
-    area: Rect,
-    trail: &[Crumb],
-    loading: bool,
-    right: Option<Span<'static>>,
-    mouse: Option<Position>,
-    hit: &mut HitAreas,
-) -> Rect {
-    let body = Rect {
+/// `loading` is per page rather than global: `state.loading` is about the
+/// pages that fetch through the client, while the artist and radio views
+/// carry their own flag, and the two list pages only say so while they have
+/// nothing to show yet.
+pub(super) fn page_header(st: &AppState) -> PageHeader {
+    let plural = |n: usize, one: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {one}s"),
+    };
+    match &st.main {
+        MainView::Home => PageHeader::default(),
+        MainView::Playlists => PageHeader {
+            loading: st.loading && st.playlists.is_empty(),
+            count: (!st.playlists.is_empty())
+                .then(|| Span::styled(plural(st.playlists.len(), "playlist"), theme::dim())),
+        },
+        // A track page has a flag of its own for the rows still coming in,
+        // over and above the client-wide one — see `draw_tracks`.
+        MainView::Tracks(list) => PageHeader {
+            loading: st.loading || list.loading,
+            count: None,
+        },
+        MainView::Search(_) => PageHeader {
+            loading: st.loading,
+            count: None,
+        },
+        MainView::Artist(v) => PageHeader {
+            loading: v.loading,
+            count: None,
+        },
+        MainView::Radio(v) => PageHeader {
+            loading: v.loading && v.rows.is_empty(),
+            count: (!v.rows.is_empty()).then(|| {
+                let facets = matches!(
+                    v.rows.first(),
+                    Some(crate::app::state::RadioRow::Facet { .. })
+                );
+                let word = if facets { "entry" } else { "station" };
+                let label = match (facets, v.rows.len()) {
+                    (true, 1) => "1 entry".to_string(),
+                    (true, n) => format!("{n} entries"),
+                    (false, n) => plural(n, word),
+                };
+                Span::styled(label, theme::dim())
+            }),
+        },
+    }
+}
+
+/// The pane's content area: everything but the column the scrollbar rides in.
+///
+/// This is all that is left of the old `section_body`, and before that of
+/// `theme::pane_block` and the section label between them. The label named the
+/// page's kind (`ALBUM`) and carried a `← <name>` pill after it; the path that
+/// replaced it lived on the pane's own first row. Both are now in the header
+/// two rows above, drawn once for both views — see [`super::top_row`].
+fn body_area(area: Rect) -> Rect {
+    Rect {
         width: area.width.saturating_sub(GUTTER),
         ..area
-    };
-    if body.height == 0 || body.width == 0 {
-        return body;
-    }
-    let label_row = Rect { height: 1, ..body };
-    let reserve = right
-        .as_ref()
-        .map(|s| s.width() as u16 + BACK_GAP)
-        .unwrap_or(0);
-    let row = Rect {
-        width: label_row.width.saturating_sub(reserve),
-        ..label_row
-    };
-
-    hit.crumbs.clear();
-    if row.width > 0 {
-        let (shown, ellipsis) = fit_trail(trail, loading, row.width);
-        draw_trail(frame, row, &shown, loading, ellipsis, false, mouse, hit);
-    }
-    if let Some(span) = right {
-        super::table::right_row(frame, label_row, None, vec![vec![span]]);
-    }
-    // Trail, blank, content — the rhythm the player's masthead uses.
-    Rect {
-        y: body.y + 2,
-        height: body.height.saturating_sub(2),
-        ..body
     }
 }
 
@@ -2166,19 +2131,9 @@ fn draw_tracks(
     marks: &PlayMarks,
     liked: &std::collections::HashMap<String, bool>,
     mouse: Option<Position>,
-    trail: &[Crumb],
 ) {
     let loading = list.loading || global_loading;
-    // Every track page is drilled into from somewhere now — a playlist off
-    // the Playlists page, an album off a track row — so every one of them has
-    // a path to draw. It used to be albums only, because a playlist was
-    // opened from a rail that never went away and had nowhere to lead back to.
-    //
-    // The row used to name the *kind* of page (`ALBUM`) and hang a back pill
-    // off it. The kind is what the header band under it already says — a
-    // sleeve and a year, or an owner — so the row spends itself on the path
-    // instead, which nothing else on screen was saying.
-    let inner = section_body(frame, area, trail, loading, None, mouse, hit);
+    let inner = body_area(area);
     let body = header_band(frame, inner, list, cover, loading, hit, mouse);
     if list.display.is_empty() && !loading {
         hit.main_list = body;
@@ -2214,12 +2169,8 @@ fn draw_search(
     marks: &PlayMarks,
     mouse: Option<Position>,
     liked: &std::collections::HashMap<String, bool>,
-    trail: &[Crumb],
 ) {
-    // Search replaces whatever page you were on, so it says which one — the
-    // row at the top of the screen leads here from anywhere, and without the
-    // trail nothing on the page says what Esc would put back.
-    let inner = section_body(frame, area, trail, loading, None, mouse, hit);
+    let inner = body_area(area);
 
     let tab_len = match search_tab {
         SearchTab::Tracks => results.tracks.len(),
@@ -2452,9 +2403,32 @@ mod tests {
         }
     }
 
+    /// Rows the header takes above the pane. The path a page draws is on it,
+    /// so these tests draw it too — the pane no longer owns that row, but
+    /// [`fit_trail`] and [`draw_trail`] are still what puts a path on it.
+    const HEAD: usize = super::super::HEAD_H as usize;
+
+    /// Draw the header and the pane under it, as [`super::super::draw`] lays
+    /// them out. Row 0 is the mark and the path, row 2 the search prompt, row
+    /// [`HEAD`] the first row of the pane.
+    fn screen(state: &mut AppState, frame: &mut Frame) {
+        let head = Rect {
+            height: frame.area().height.min(HEAD as u16),
+            ..frame.area()
+        };
+        let body = Rect {
+            y: frame.area().y + head.height,
+            height: frame.area().height - head.height,
+            ..frame.area()
+        };
+        let page = page_header(state);
+        super::super::top_row::draw(frame, head, state, page);
+        draw(frame, body, state);
+    }
+
     fn render(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), state)).unwrap();
+        terminal.draw(|f| screen(state, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..height)
             .map(|y| {
@@ -2503,11 +2477,11 @@ mod tests {
         // The sleeve branch is the good one: art on the left, metadata stacked
         // beside it, and the table pushed down past the taller band.
         let w = super::super::table::art_w(ART_H) as usize;
-        assert!(with_art[2].chars().take(w).all(|c| c == '▀' || c == '♫'));
-        assert!(with_art[3].contains("Donna The Buffalo · 2018"));
-        assert!(with_art[9].contains("Title"));
+        assert!(with_art[4].chars().take(w).all(|c| c == '▀' || c == '♫'));
+        assert!(with_art[5].contains("Donna The Buffalo · 2018"));
+        assert!(with_art[11].contains("Title"));
         // Without one it collapses onto three rows and loses the artwork.
-        assert!(!no_art[2].chars().take(w).all(|c| c == '▀' || c == '♫'));
+        assert!(!no_art[4].chars().take(w).all(|c| c == '▀' || c == '♫'));
     }
 
     /// The album page is the one browse view that is *about* a record, so it
@@ -2516,13 +2490,13 @@ mod tests {
     #[test]
     fn an_album_page_draws_its_sleeve_beside_stacked_metadata() {
         let mut st = album_state();
-        let lines = render(&mut st, 90, 20);
-        assert!(lines[0].starts_with("DANCE IN THE STREET"));
+        let lines = render(&mut st, 90, 22);
+        assert!(lines[0].contains("DANCE IN THE STREET"));
         // Sleeve occupies the left 12 cells of the six band rows.
         // No cover is decoded in the test, so this is the placeholder swatch:
         // half-blocks with a single ♫ in the middle.
         let w = super::super::table::art_w(ART_H) as usize;
-        for row in lines.iter().take(8).skip(2) {
+        for row in lines.iter().take(10).skip(4) {
             let sleeve: String = row.chars().take(w).collect();
             assert!(
                 sleeve.chars().all(|c| c == '▀' || c == '♫'),
@@ -2530,13 +2504,13 @@ mod tests {
             );
         }
         // Metadata stacks in the column beside it.
-        assert!(lines[2].contains("Dance In The Street"));
-        assert!(lines[3].contains("Donna The Buffalo · 2018"));
-        assert!(lines[4].contains("2 tracks"));
-        assert!(lines[6].contains("▶ play"));
+        assert!(lines[4].contains("Dance In The Street"));
+        assert!(lines[5].contains("Donna The Buffalo · 2018"));
+        assert!(lines[6].contains("2 tracks"));
+        assert!(lines[8].contains("▶ play"));
         assert!(!st.hit.header_play_btn.is_empty());
         // The table starts after the band and its spacer.
-        assert!(lines[9].contains("Title"));
+        assert!(lines[11].contains("Title"));
     }
 
     /// Arrive at the state's page from Home, so its trail has a real ancestor
@@ -2551,49 +2525,50 @@ mod tests {
     /// them spells the path that got it there. The playlist page used to be
     /// the exception, because it was opened from a rail that never went away.
     ///
-    /// The trail is anchored at the pane's own margin, which is the point of
-    /// it: the `← <name>` pill this replaced sat three cells after a section
-    /// label whose width was the page's kind, so the one control that means
-    /// "go back" landed in a different column on every page.
+    /// The trail is anchored right after the mark, which is the point of it:
+    /// the `← <name>` pill this replaced sat three cells after a section label
+    /// whose width was the page's kind, so the one control that means "go
+    /// back" landed in a different column on every page.
+    ///
+    /// Home contributes no crumb at either end — the mark beside the path is
+    /// already the way there.
     #[test]
     fn pages_spell_the_path_that_reached_them() {
+        // The column every path starts in: after the mark and its gap.
+        let x0 = super::super::table::BRAND_W + super::super::top_row::MARK_GAP;
+
         let mut st = album_state();
         from_home(&mut st);
         st.main_index = 0;
-        let lines = render(&mut st, 90, 20);
-        assert_eq!(st.hit.crumbs.len(), 1, "one ancestor, and it leads home");
-        assert_eq!(st.hit.crumbs[0].1, CrumbTarget::Depth(0));
+        let lines = render(&mut st, 90, 22);
         assert!(
-            lines[0].starts_with("HOME  ›  DANCE IN THE STREET"),
-            "{:?}",
-            lines[0]
+            st.hit.crumbs.is_empty(),
+            "Home is the only step behind it, and it draws none: {:?}",
+            st.hit.crumbs
         );
-        assert_eq!(st.hit.crumbs[0].0.x, 0, "the trail starts at the margin");
+        assert!(lines[0].contains("DANCE IN THE STREET"), "{:?}", lines[0]);
+        assert!(!lines[0].contains('›'), "{:?}", lines[0]);
 
-        // And it starts in the same column whatever the page is called —
-        // which the pill, drawn after a variable-width label, never did.
-        let x = st.hit.crumbs[0].0.x;
-        let mut st = artist_state();
-        from_home(&mut st);
-        let lines = render(&mut st, 90, 20);
-        assert!(lines[0].starts_with("HOME  ›  MUSE"), "{:?}", lines[0]);
-        assert_eq!(st.hit.crumbs[0].0.x, x);
+        // And the head starts in the same column whatever the page is called
+        // — which the pill, drawn after a variable-width label, never did.
+        // Columns, not bytes: the `♫` in the mark is three bytes wide and one
+        // cell.
+        let col =
+            |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count() as u16);
+        assert_eq!(col(&lines[0], "DANCE"), Some(x0));
 
-        let mut st = tracks_state(vec![track("One", "Donna")]);
-        from_home(&mut st);
-        let lines = render(&mut st, 90, 20);
-        assert!(lines[0].starts_with("HOME  ›  MY LIST"), "{:?}", lines[0]);
-        assert_eq!(st.hit.crumbs[0].0.x, x);
-
-        // Search too: it replaces the page you were on, and the trail is what
-        // says which one Esc would put back.
-        // Search names itself by its query, so the trail says what the list
-        // below it is answering as well as where Esc would put you.
-        let mut st = search_state();
-        from_home(&mut st);
-        let lines = render(&mut st, 90, 20);
-        assert!(lines[0].starts_with("HOME  ›  “MUSE”"), "{:?}", lines[0]);
-        assert_eq!(st.hit.crumbs[0].0.x, x);
+        for (mut st, name) in [
+            (artist_state(), "MUSE"),
+            (tracks_state(vec![track("One", "Donna")]), "MY LIST"),
+            // Search too: it replaces the page you were on, and names itself
+            // by its query, so the row says what the list below it is
+            // answering as well as where Esc would put you.
+            (search_state(), "“MUSE”"),
+        ] {
+            from_home(&mut st);
+            let lines = render(&mut st, 90, 22);
+            assert_eq!(col(&lines[0], name), Some(x0), "{name}: {:?}", lines[0]);
+        }
     }
 
     /// The whole path, not just one step of it. The pill this replaced could
@@ -2617,21 +2592,20 @@ mod tests {
         st.push_view();
         st.main = album_state().main;
 
-        let lines = render(&mut st, 90, 20);
+        let lines = render(&mut st, 90, 22);
         // The ancestor elides at `ANCESTOR_W` while the head keeps `HEAD_W`:
         // the page you are on is what the row is about, a step behind it only
         // has to be recognizable enough to aim at.
         assert!(
-            lines[0].starts_with("HOME  ›  DONNA THE BUF…  ›  DANCE IN THE STREET"),
+            lines[0].contains("DONNA THE BUF…  ›  DANCE IN THE STREET"),
             "{:?}",
             lines[0]
         );
-        // Both ancestors lead somewhere, at the depth each was pushed to; the
-        // page itself is a title rather than a control, so it gets no rect.
-        assert_eq!(st.hit.crumbs.len(), 2);
-        assert_eq!(st.hit.crumbs[0].1, CrumbTarget::Depth(0));
-        assert_eq!(st.hit.crumbs[1].1, CrumbTarget::Depth(1));
-        assert!(st.hit.crumbs[0].0.x < st.hit.crumbs[1].0.x);
+        // The ancestor leads somewhere, at the depth it was pushed to. Home
+        // sits below it at depth 0 and draws nothing, and the page itself is
+        // a title rather than a control, so neither gets a rect.
+        assert_eq!(st.hit.crumbs.len(), 1);
+        assert_eq!(st.hit.crumbs[0].1, CrumbTarget::Depth(1));
     }
 
     /// A path too long for the row loses its *middle*, not its front.
@@ -2652,9 +2626,9 @@ mod tests {
             st.push_view();
         }
         st.main = page;
-        let lines = render(&mut st, 90, 20);
+        let lines = render(&mut st, 90, 22);
         assert!(
-            lines[0].starts_with("HOME  ›  …  ›  TWO  ›  THREE  ›  MY LIST"),
+            lines[0].contains("…  ›  TWO  ›  THREE  ›  MY LIST"),
             "{:?}",
             lines[0]
         );
@@ -2667,9 +2641,9 @@ mod tests {
 
         // The narrow ancestors earn their keep here: at the head's width this
         // row would hold two steps, and it holds three.
-        let lines = render(&mut st, 80, 20);
+        let lines = render(&mut st, 80, 22);
         assert!(
-            lines[0].starts_with("HOME  ›  …  ›  TWO  ›  THREE  ›  MY LIST"),
+            lines[0].contains("…  ›  TWO  ›  THREE  ›  MY LIST"),
             "{:?}",
             lines[0]
         );
@@ -2702,20 +2676,19 @@ mod tests {
                 snapshot_id: "s".into(),
             },
         ];
-        st.push_view();
-        let lines = render(&mut st, 90, 20);
-        assert!(lines[0].starts_with("PLAYLISTS"), "{:?}", lines[0]);
+        let lines = render(&mut st, 90, 22);
+        assert!(lines[0].contains("PLAYLISTS"), "{:?}", lines[0]);
         assert!(lines[0].contains("2 playlists"), "{:?}", lines[0]);
-        assert!(lines[2].contains("Title") && lines[2].contains("Owner"));
+        assert!(lines[4].contains("Title") && lines[4].contains("Owner"));
         // Playlists only: Liked Songs is a Home row, and is not one of these.
         assert!(!lines.iter().any(|l| l.contains("Liked Songs")));
-        assert!(lines[4].contains("trendy") && lines[4].contains("18"));
+        assert!(lines[6].contains("trendy") && lines[6].contains("18"));
         assert!(
-            !lines[4].contains("Dalton M"),
+            !lines[6].contains("Dalton M"),
             "your own name is not information: {:?}",
-            lines[4]
+            lines[6]
         );
-        assert!(lines[5].contains("NPR Music"), "{:?}", lines[5]);
+        assert!(lines[7].contains("NPR Music"), "{:?}", lines[7]);
     }
 
     /// Nothing pushed means nothing to go back to — except on an album page,
@@ -2731,9 +2704,9 @@ mod tests {
                 t.artist_id = Some("r1".into());
             }
         }
-        let lines = render(&mut st, 90, 20);
+        let lines = render(&mut st, 90, 22);
         assert!(
-            lines[0].starts_with("DONNA  ›  DANCE IN THE STREET"),
+            lines[0].contains("DONNA  ›  DANCE IN THE STREET"),
             "{:?}",
             lines[0]
         );
@@ -2748,13 +2721,9 @@ mod tests {
         // Without an artist id there is nowhere to go, so the page stands
         // alone: one crumb, its own name, and nothing to click.
         let mut st = album_state();
-        let lines = render(&mut st, 90, 20);
+        let lines = render(&mut st, 90, 22);
         assert!(st.hit.crumbs.is_empty());
-        assert!(
-            lines[0].starts_with("DANCE IN THE STREET"),
-            "{:?}",
-            lines[0]
-        );
+        assert!(lines[0].contains("DANCE IN THE STREET"), "{:?}", lines[0]);
         assert!(!lines[0].contains('›'));
     }
 
@@ -2766,10 +2735,10 @@ mod tests {
     fn a_narrow_pane_sheds_the_trail_but_keeps_the_page() {
         let mut st = album_state();
         from_home(&mut st);
-        let lines = render(&mut st, 12, 20);
+        let lines = render(&mut st, 34, 22);
         assert!(st.hit.crumbs.is_empty(), "{:?}", st.hit.crumbs);
         assert!(!lines[0].contains("HOME"), "{:?}", lines[0]);
-        assert!(lines[0].starts_with("DANCE"), "{:?}", lines[0]);
+        assert!(lines[0].contains("DANCE"), "{:?}", lines[0]);
     }
 
     /// The decoded sleeve carries the URL it came from, and the band checks it.
@@ -2792,18 +2761,18 @@ mod tests {
         // Matching URLs: the decoded cover is drawn.
         let mut st = album_state();
         st.view_cover = Some(sleeve("https://i.scdn.co/image/abc"));
-        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 22)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        let art_fg = buf.cell(Position { x: 0, y: 2 }).unwrap().fg;
+        let art_fg = buf.cell(Position { x: 0, y: 4 }).unwrap().fg;
         assert_eq!(art_fg, ratatui::style::Color::Rgb(200, 40, 40));
 
         // The slot still holds the *other* album's sleeve: the band falls back
         // to the placeholder rather than hanging it on this record.
         let mut st = album_state();
         st.view_cover = Some(sleeve("https://i.scdn.co/image/SOMETHING-ELSE"));
-        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 22)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let lines: Vec<String> = (0..20)
             .map(|y| {
@@ -2814,12 +2783,12 @@ mod tests {
             .collect();
         // Still a block, so the layout does not jump — just not that cover.
         assert!(
-            lines[2].starts_with('▀'),
+            lines[4].starts_with('▀'),
             "the band lost its block: {:?}",
-            lines[2]
+            lines[4]
         );
         assert_ne!(
-            buf.cell(Position { x: 0, y: 2 }).unwrap().fg,
+            buf.cell(Position { x: 0, y: 4 }).unwrap().fg,
             ratatui::style::Color::Rgb(200, 40, 40),
             "a different album's sleeve was drawn"
         );
@@ -2836,14 +2805,14 @@ mod tests {
             }
             st
         }] {
-            let lines = render(&mut st, 90, 20);
+            let lines = render(&mut st, 90, 22);
             assert!(
                 !lines.iter().any(|l| l.contains('▀')),
                 "a sleeve appeared: {lines:#?}"
             );
             // Name and totals share row 2, as they always did.
-            assert!(lines[2].contains("tracks"));
-            assert!(lines[3].contains("▶ play"));
+            assert!(lines[4].contains("tracks"));
+            assert!(lines[5].contains("▶ play"));
         }
     }
 
@@ -2889,8 +2858,8 @@ mod tests {
             states.push(st);
         }
         for st in &mut states {
-            let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
-            terminal.draw(|f| draw(f, f.area(), st)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+            terminal.draw(|f| screen(st, f)).unwrap();
             let buffer = terminal.backend().buffer().clone();
             for y in 0..16 {
                 for x in 0..100 {
@@ -2917,25 +2886,25 @@ mod tests {
             track("Gamma", "Cyd"),
         ]);
         st.playback = Some(playing("spotify:track:Beta"));
-        let lines = render(&mut st, 90, 12);
+        let lines = render(&mut st, 90, 14);
         // Trail + blank, then the band (summary, ▶ play, spacer),
         // then the column header + spacer, then the rows.
-        assert!(lines[0].starts_with("MY LIST"));
-        assert!(lines[2].contains("My List"));
-        assert!(lines[2].contains("3 tracks · 4 min"));
-        assert!(lines[3].contains("▶ play"));
+        assert!(lines[0].contains("MY LIST"));
+        assert!(lines[4].contains("My List"));
+        assert!(lines[4].contains("3 tracks · 4 min"));
+        assert!(lines[5].contains("▶ play"));
         assert!(!st.hit.header_play_btn.is_empty());
-        assert!(lines[5].contains("Title"));
-        assert!(lines[5].contains("Artist"));
-        assert!(lines[5].contains("Album"));
-        assert!(lines[5].contains("Time"));
-        assert!(lines[7].contains("Alpha"));
+        assert!(lines[7].contains("Title"));
+        assert!(lines[7].contains("Artist"));
+        assert!(lines[7].contains("Album"));
+        assert!(lines[7].contains("Time"));
+        assert!(lines[9].contains("Alpha"));
         // No frame, so rows start at column 0.
-        assert!(lines[8].starts_with("▶ ") && lines[8].contains("Beta"));
+        assert!(lines[10].starts_with("▶ ") && lines[10].contains("Beta"));
         // Only the playing row is marked; there is no next-up arrow.
-        assert!(lines[9].starts_with("  ") && lines[9].contains("Gamma"));
+        assert!(lines[11].starts_with("  ") && lines[11].contains("Gamma"));
         assert!(!lines.iter().any(|l| l.contains("→")));
-        assert!(lines[7].contains("1:23"));
+        assert!(lines[9].contains("1:23"));
         assert!(!st.hit.main_list.is_empty());
         // Not one box-drawing character anywhere on the pane.
         assert!(
@@ -2951,8 +2920,8 @@ mod tests {
             track("残酷な天使のテーゼ、とても長いタイトル", "高橋洋子"),
             track("emoji 🎵🎵🎵🎵 name", "🎤 artist"),
         ]);
-        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         // Label, blank, band (summary / ▶ play / spacer), column header,
         // spacer, then the rows at y7..=9.
@@ -2963,9 +2932,9 @@ mod tests {
                 .find(|&x| buffer.cell(Position { x, y }).unwrap().symbol() == ":")
                 .expect("no duration on this row")
         };
-        let x0 = colon_x(7);
-        assert_eq!(colon_x(8), x0);
-        assert_eq!(colon_x(9), x0);
+        let x0 = colon_x(9);
+        assert_eq!(colon_x(10), x0);
+        assert_eq!(colon_x(11), x0);
     }
 
     #[test]
@@ -2974,17 +2943,17 @@ mod tests {
         let mut st = tracks_state(tracks);
         st.main_index = 1;
         *st.main_list.offset_mut() = 10;
-        render(&mut st, 80, 14);
+        render(&mut st, 80, 16);
         // Drawing must not reset the wheel-scrolled offset.
         assert_eq!(st.main_list.offset(), 10);
 
         // Scroll back: the selected row still carries the highlight.
         *st.main_list.offset_mut() = 0;
-        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         // border + pad + band(3) + header + spacer + row 0; selected is index 1
-        let row_y = 8;
+        let row_y = 10;
         assert!((1..79u16).any(|x| {
             let cell = buffer.cell(Position { x, y: row_y }).unwrap();
             cell.fg == theme::BRIGHT && cell.modifier.contains(Modifier::BOLD)
@@ -3006,12 +2975,12 @@ mod tests {
             };
             list.rebuild_display();
         }
-        let lines = render(&mut st, 90, 12);
-        assert!(lines[3].contains("sort: title ▲"));
-        assert!(lines[5].contains("Title▲"));
-        assert!(lines[7].contains("Apple"));
-        assert!(lines[8].contains("Mango"));
-        assert!(lines[9].starts_with("▶ ") && lines[9].contains("Zebra"));
+        let lines = render(&mut st, 90, 14);
+        assert!(lines[5].contains("sort: title ▲"));
+        assert!(lines[7].contains("Title▲"));
+        assert!(lines[9].contains("Apple"));
+        assert!(lines[10].contains("Mango"));
+        assert!(lines[11].starts_with("▶ ") && lines[11].contains("Zebra"));
         // Playback follows context order, so the next-up guess is hidden.
         assert!(!lines.iter().any(|l| l.contains("→ ")));
     }
@@ -3019,8 +2988,8 @@ mod tests {
     #[test]
     fn artist_and_album_columns_record_clickable_rects() {
         let mut st = tracks_state(vec![track("Alpha", "Ann"), track("Beta", "Bob")]);
-        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         for rect in [st.hit.main_artist_col, st.hit.main_album_col] {
@@ -3055,11 +3024,11 @@ mod tests {
         st.liked.insert("spotify:track:Alpha".into(), true);
         st.liked.insert("spotify:track:Beta".into(), false);
         // Label, blank, band(3), header, spacer, then the rows from y7.
-        let lines = render(&mut st, 90, 11);
+        let lines = render(&mut st, 90, 13);
         let mark = super::super::table::LIKED_MARK;
-        assert!(lines[7].contains(mark), "{:?}", lines[7]);
+        assert!(lines[9].contains(mark), "{:?}", lines[9]);
         // Unsaved and unchecked look the same, and neither wears a twin.
-        for row in [8, 9] {
+        for row in [10, 11] {
             assert!(!lines[row].contains(mark), "row {row}: {:?}", lines[row]);
         }
     }
@@ -3071,7 +3040,7 @@ mod tests {
     fn hovering_the_liked_column_offers_the_mark() {
         let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
         // Draw once to find out where the column landed.
-        render(&mut st, 90, 10);
+        render(&mut st, 90, 12);
         let col = st.hit.main_like_col;
         assert!(!col.is_empty());
         st.mouse_pos = Some(Position {
@@ -3079,8 +3048,8 @@ mod tests {
             y: col.y + 1,
         });
 
-        let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let cell = buffer
             .cell(Position {
@@ -3110,8 +3079,8 @@ mod tests {
     fn the_liked_column_records_a_clickable_rect() {
         let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
         st.liked.insert("spotify:track:Alpha".into(), true);
-        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
         let col = st.hit.main_like_col;
@@ -3132,7 +3101,7 @@ mod tests {
     #[test]
     fn header_band_absent_on_short_panes() {
         let mut st = tracks_state(vec![track("A", "B")]);
-        let lines = render(&mut st, 80, 8); // body height 6 < 8
+        let lines = render(&mut st, 80, 10); // body height 6 < 8
         assert!(!lines.iter().any(|l| l.contains("▶ play")));
         assert!(st.hit.header_play_btn.is_empty());
     }
@@ -3140,7 +3109,7 @@ mod tests {
     #[test]
     fn empty_playlist_shows_hint() {
         let mut st = tracks_state(Vec::new());
-        let lines = render(&mut st, 60, 10);
+        let lines = render(&mut st, 60, 12);
         assert!(lines.iter().any(|l| l.contains("this playlist is empty")));
     }
 
@@ -3151,9 +3120,9 @@ mod tests {
             list.loading = true;
             list.total = Some(200);
         }
-        let lines = render(&mut st, 70, 12);
-        assert!(lines[0].starts_with("MY LIST (LOADING…)"));
-        assert!(lines[2].contains("0 of 200 tracks"));
+        let lines = render(&mut st, 70, 14);
+        assert!(lines[0].contains("MY LIST (LOADING…)"));
+        assert!(lines[4].contains("0 of 200 tracks"));
         assert!(!lines.iter().any(|l| l.contains("this playlist is empty")));
     }
 
@@ -3174,8 +3143,8 @@ mod tests {
             if let MainView::Tracks(list) = &mut st.main {
                 list.kind = kind;
             }
-            let lines = render(&mut st, 70, 10);
-            assert!(lines[0].starts_with("MY LIST"), "{kind:?}: {:?}", lines[0]);
+            let lines = render(&mut st, 70, 12);
+            assert!(lines[0].contains("MY LIST"), "{kind:?}: {:?}", lines[0]);
         }
     }
 
@@ -3214,8 +3183,8 @@ mod tests {
     #[test]
     fn search_tab_hit_rects_match_rendered_labels() {
         let mut st = search_state();
-        let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         assert_eq!(st.hit.search_tabs.len(), 4);
         for (rect, tab) in &st.hit.search_tabs {
@@ -3234,12 +3203,12 @@ mod tests {
     fn album_tab_renders_columns() {
         let mut st = search_state();
         st.search_tab = SearchTab::Albums;
-        let lines = render(&mut st, 90, 14);
-        assert!(lines[5].contains("Album"));
-        assert!(lines[5].contains("Artist"));
-        assert!(lines[5].contains("Year"));
-        assert!(lines[7].contains("Black Holes"));
-        assert!(lines[7].contains("2006"));
+        let lines = render(&mut st, 90, 16);
+        assert!(lines[7].contains("Album"));
+        assert!(lines[7].contains("Artist"));
+        assert!(lines[7].contains("Year"));
+        assert!(lines[9].contains("Black Holes"));
+        assert!(lines[9].contains("2006"));
     }
 
     /// An album row's *name* is a link, the way the Album column of a track
@@ -3249,7 +3218,7 @@ mod tests {
     fn an_album_row_registers_its_name_as_a_click_target() {
         let mut st = search_state();
         st.search_tab = SearchTab::Albums;
-        let lines = render(&mut st, 90, 14);
+        let lines = render(&mut st, 90, 16);
         let col = st.hit.main_album_col;
         assert!(!col.is_empty());
         // Starts at the left edge of the rows and covers the name column.
@@ -3272,7 +3241,7 @@ mod tests {
             r.playlists.clear();
         }
         st.search_tab = SearchTab::Playlists;
-        let lines = render(&mut st, 60, 12);
+        let lines = render(&mut st, 60, 14);
         assert!(
             lines
                 .iter()
@@ -3315,38 +3284,38 @@ mod tests {
     #[test]
     fn artist_page_stacks_a_portrait_band_over_tracks_then_cards() {
         let mut st = artist_state();
-        let lines = render(&mut st, 90, 24);
-        assert!(lines[0].starts_with("MUSE"));
+        let lines = render(&mut st, 90, 26);
+        assert!(lines[0].contains("MUSE"));
         // The photo occupies the left 12 cells of the six band rows (a
         // placeholder swatch here: nothing is decoded in the test).
         let w = super::super::table::art_w(ART_H) as usize;
-        for row in lines.iter().take(8).skip(2) {
+        for row in lines.iter().take(10).skip(4) {
             let block: String = row.chars().take(w).collect();
             assert!(
                 block.chars().all(|c| c == '▀' || c == '♫'),
                 "not a portrait row: {row:?}"
             );
         }
-        assert!(lines[2].contains("Muse"));
-        assert!(lines[3].contains("alt rock · space rock"));
+        assert!(lines[4].contains("Muse"));
+        assert!(lines[5].contains("alt rock · space rock"));
         // The catalogue is counted; the top tracks are not — the list below
         // numbers itself.
-        assert!(lines[4].contains("1 album"));
-        assert!(!lines[4].contains("top track"));
-        assert!(lines[6].contains("▶ play"));
+        assert!(lines[6].contains("1 album"));
+        assert!(!lines[6].contains("top track"));
+        assert!(lines[8].contains("▶ play"));
         assert!(!st.hit.header_play_btn.is_empty());
 
         // Body: the two sections, in order, with no tab strip anywhere. Both
         // headings keep a blank row under them.
-        assert!(lines[9].contains("Top Tracks"));
-        assert!(lines[10].trim().is_empty());
-        assert!(lines[11].contains("Title"));
-        assert!(lines[12].contains("Uprising"));
-        assert!(lines[14].contains("Albums"));
-        assert!(lines[15].trim().is_empty());
-        assert!(lines[16].contains("Black Holes"));
-        assert!(lines[17].contains("2006 · 12 tracks"));
-        assert!(lines[18].contains("▶ play"));
+        assert!(lines[11].contains("Top Tracks"));
+        assert!(lines[12].trim().is_empty());
+        assert!(lines[13].contains("Title"));
+        assert!(lines[14].contains("Uprising"));
+        assert!(lines[16].contains("Albums"));
+        assert!(lines[17].trim().is_empty());
+        assert!(lines[18].contains("Black Holes"));
+        assert!(lines[19].contains("2006 · 12 tracks"));
+        assert!(lines[20].contains("▶ play"));
         assert_eq!(st.hit.card_play.len(), 1);
     }
 
@@ -3362,7 +3331,7 @@ mod tests {
                 album_item("Two", "2002", None),
             ];
         }
-        render(&mut st, 90, 30);
+        render(&mut st, 90, 32);
         let rows: Vec<Option<usize>> = st.hit.main_lines.clone();
         // Heading, blank, column header, one track, blank, heading, blank,
         // then the cards: four lines each plus a blank.
@@ -3377,7 +3346,7 @@ mod tests {
     #[test]
     fn narrow_cards_drop_their_sleeve_before_their_name() {
         let mut st = artist_state();
-        let lines = render(&mut st, 30, 24);
+        let lines = render(&mut st, 30, 26);
         assert!(lines.iter().any(|l| l.contains("Black Holes")));
         assert!(
             !lines.iter().any(|l| l.contains('▀')),
@@ -3395,7 +3364,7 @@ mod tests {
 
         let mut st = artist_state();
         // Draw once to learn where the first card's name landed.
-        render(&mut st, 90, 24);
+        render(&mut st, 90, 26);
         let (rect, row) = st.hit.album_names[0];
         assert_eq!(row, 1, "the card is the row after the one top track");
         assert_eq!(rect.width, 11, "the link is \"Black Holes\" and no wider");
@@ -3404,8 +3373,8 @@ mod tests {
             y: rect.y,
         };
         st.mouse_pos = Some(name);
-        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 26)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
         let lit = |x: u16| {
@@ -3446,7 +3415,7 @@ mod tests {
                         .collect();
                 }
                 st.mouse_pos = Some(Position { x, y });
-                render(&mut st, 90, 24);
+                render(&mut st, 90, 26);
             }
         }
     }
