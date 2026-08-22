@@ -1,6 +1,6 @@
 [package]
 name = "spot"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 # ratatui 0.30 sets the real floor; the librespot crates need 1.85, as does
 # edition 2024 itself.
@@ -35,6 +35,13 @@ unicode-width = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 zune-jpeg = "0.5"
 zune-core = "0.5"
+
+# Only for the double-click relaunch in src/relaunch.rs.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = true

@@ -6,23 +6,32 @@ no Spotify desktop app required. Requires **Spotify Premium**.
 
 ## Download
 
-Grab `spot.exe` from the [latest release](https://github.com/ddmills/spot/releases/latest).
-It is one self-contained file — nothing to install, no runtime to add, and it writes only to
-your own `%APPDATA%` and `%LOCALAPPDATA%`. Delete the exe and those two folders and it is gone.
+Grab `spot.exe` from the [latest release](https://github.com/ddmills/spot/releases/latest)
+and double-click it. That is the whole install: one self-contained file, no runtime to add,
+and it writes only to your own `%APPDATA%` and `%LOCALAPPDATA%`. Delete the exe and those two
+folders and it is gone. Right-click it and *Pin to Start* if you want it somewhere findable.
 
 You need:
 
 - **Windows 10 or 11**
 - **Spotify Premium** — librespot can only stream for Premium accounts
-- **[Windows Terminal](https://aka.ms/terminal)**, or another terminal with 24-bit color. This
-  is a real requirement rather than a preference: the whole palette is truecolor and album art
-  is drawn as per-cell RGB half-blocks, so a 16-color console renders it as garbage. spot warns
-  you at startup if it can't tell that your terminal supports it.
+- **[Windows Terminal](https://aka.ms/terminal)**, or another terminal with 24-bit color —
+  preinstalled on Windows 11, a free Store install on Windows 10. This is a real requirement
+  rather than a preference: the whole palette is truecolor and album art is drawn as per-cell
+  RGB half-blocks, so a 16-color console renders it as garbage.
 
-Run it from a terminal — `.\spot.exe` — rather than double-clicking, so the window stays put.
+Double-clicking is enough because spot notices when it was started from Explorer rather than
+from a shell, and hands itself to Windows Terminal — the console Windows gives a
+double-clicked exe is otherwise whatever the machine's default happens to be. If Windows
+Terminal isn't installed, spot runs in that default console anyway and says at startup if it
+can't tell the terminal has the color it needs.
+
+Running it yourself still behaves exactly as it always did: `.\spot.exe` from a shell stays in
+that shell. Set `SPOT_NO_RELAUNCH=1` to make a double-click stay put too.
 
 The exe is not code-signed, so the first launch shows **"Windows protected your PC"**. Choose
-*More info* → *Run anyway*. (If that bothers you, build it yourself — see below.)
+*More info* → *Run anyway*; it is asked once per download. (If that bothers you, build it
+yourself — see below.)
 
 ### First run
 

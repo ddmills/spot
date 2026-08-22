@@ -3254,7 +3254,7 @@ dependencies = [
 
 [[package]]
 name = "spot"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3275,6 +3275,7 @@ dependencies = [
  "simplelog",
  "tokio",
  "unicode-width",
+ "windows-sys 0.61.2",
  "winresource",
  "zune-core",
  "zune-jpeg",

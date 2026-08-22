@@ -6,6 +6,8 @@ mod client;
 mod config;
 mod cover;
 mod event;
+#[cfg(windows)]
+mod relaunch;
 mod session;
 mod ui;
 mod viz;
@@ -34,6 +36,15 @@ const MIN_ROWS: u16 = 24;
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Before anything else touches the disk: a double-clicked spot hands
+    // itself to Windows Terminal and this process is done. Doing it first
+    // keeps the short-lived parent from truncating the log the child is about
+    // to write.
+    #[cfg(windows)]
+    if relaunch::relaunch_in_windows_terminal() {
+        return std::process::ExitCode::SUCCESS;
+    }
+
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -58,6 +69,13 @@ async fn run() -> Result<()> {
     // the OAuth flow can print instructions and block on the browser.
     // ASCII only: this prints before the TUI starts, possibly to a legacy
     // console codepage.
+    if config::load_auth().is_none() {
+        println!(
+            "first run: a browser window will open so you can sign in to Spotify.\n\
+             it happens twice - once for your library, once for playback. after\n\
+             that spot signs itself in.\n"
+        );
+    }
     println!("spot - authenticating with Spotify...");
     let token = tokio::task::spawn_blocking(auth::obtain_web_token)
         .await
@@ -157,7 +175,8 @@ fn warn_about_terminal() {
     if !truecolor {
         println!(
             "warning: this terminal does not advertise 24-bit color. spot's colors\n\
-             and album art need it - Windows Terminal is the safe choice."
+             and album art need it - Windows Terminal is the safe choice:\n\
+             https://aka.ms/terminal"
         );
         warned = true;
     }

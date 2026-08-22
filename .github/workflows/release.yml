@@ -71,8 +71,9 @@ jobs:
             Windows 10/11, and a truecolor terminal — [Windows Terminal](https://aka.ms/terminal)
             is the safe choice.
 
-            Download `spot.exe` and run it from a terminal. Nothing to install. The exe is
-            unsigned, so SmartScreen will ask: *More info* → *Run anyway*.
+            Download `spot.exe` and double-click it. Nothing to install; it opens itself in
+            Windows Terminal. The exe is unsigned, so SmartScreen will ask once:
+            *More info* → *Run anyway*.
 
             SHA256:
 
