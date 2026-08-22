@@ -1028,7 +1028,7 @@ mod tests {
             "{:?}",
             lines[17]
         );
-        assert!(lines[17].contains("● play"), "{:?}", lines[17]);
+        assert!(lines[17].contains("■ pause"), "{:?}", lines[17]);
         assert!(lines[17].trim_end().ends_with("▸▸ next"), "{:?}", lines[17]);
         assert!(lines[18].trim().is_empty() && lines[20].trim().is_empty());
         // Then one row heads the list: name on the left, shuffle opposite.
@@ -1465,9 +1465,9 @@ mod tests {
         assert_eq!(st.hit.gauge.width, inner_w - deck::TIME_W);
     }
 
-    /// A green dot that breathes while audio runs, a faded red square when it
-    /// does not — and the same width either way, so the word does not shift
-    /// under the cursor. It sits on the transport row, centred under the
+    /// A still `■ pause` in the accent while audio runs, a held-back `▶ play`
+    /// when it does not — and the same width either way, so the word does not
+    /// shift under the cursor. It sits on the transport row, centred under the
     /// progress bar.
     #[test]
     fn play_state_marker_reports_running_or_stopped() {
@@ -1475,7 +1475,7 @@ mod tests {
         let mut playing = playing_state();
         let lines = render(&mut playing, 80, 26);
         assert!(
-            lines[STATE_ROW].contains("● play"),
+            lines[STATE_ROW].contains("■ pause"),
             "{:?}",
             lines[STATE_ROW]
         );
@@ -1484,7 +1484,7 @@ mod tests {
         paused.playback.as_mut().unwrap().is_playing = false;
         let lines = render(&mut paused, 80, 26);
         assert!(
-            lines[STATE_ROW].contains("■ pause"),
+            lines[STATE_ROW].contains("▶ play"),
             "{:?}",
             lines[STATE_ROW]
         );
@@ -1495,8 +1495,8 @@ mod tests {
             st.playback.as_mut().unwrap().is_playing = is_playing;
             let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
             terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
-            // The pill leads with a space, so the marker is its second cell.
-            let (x, y) = (st.hit.play_btn.x + 1, st.hit.play_btn.y);
+            // The pill has no padding, so the glyph is its first cell.
+            let (x, y) = (st.hit.play_btn.x, st.hit.play_btn.y);
             let cell = terminal
                 .backend()
                 .buffer()
@@ -1506,14 +1506,21 @@ mod tests {
             (cell.symbol().to_string(), cell.fg)
         };
         let paused_fg = theme::stopped_dim().fg.unwrap();
-        assert_eq!(marker(false), ("■".to_string(), paused_fg));
-        // Red, and faded rather than a full signal lamp: a resting state.
+        assert_eq!(marker(false), ("▶".to_string(), paused_fg));
+        // The theme accent, held back rather than a colour of its own: a
+        // resting state that still belongs to the sleeve on screen.
         let Color::Rgb(r, g, b) = paused_fg else {
             panic!("{paused_fg:?} is not truecolor")
         };
-        assert!(r > g && r > b, "{paused_fg:?} is not red");
-        assert!(r < 0xCF, "{paused_fg:?} is not faded");
-        assert_eq!(marker(true).0, "●");
+        let Color::Rgb(ar, ag, ab) = theme::accent_color() else {
+            panic!("accent is not truecolor")
+        };
+        assert!(r <= ar && g <= ag && b <= ab, "{paused_fg:?} is not faded");
+        assert!(
+            (r, g, b) != (0, 0, 0) && (r, g, b) != (ar, ag, ab),
+            "{paused_fg:?} is not a held-back accent"
+        );
+        assert_eq!(marker(true).0, "■");
         assert_ne!(marker(true).1, paused_fg);
     }
 

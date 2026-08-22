@@ -6,7 +6,7 @@ use crate::cover::Cover;
 
 /// The chrome palette is truecolor rather than the ANSI names it used to be,
 /// so the app looks the same whatever the terminal's 16-colour scheme is —
-/// matching what [`BRIGHT`], [`GREEN`], [`STOPPED`] and [`FLAME`] already did.
+/// matching what [`BRIGHT`], [`GREEN`] and [`FLAME`] already did.
 ///
 /// The resting accent is a gold that sits between [`FLAME`]'s gold and orange
 /// stops, so the UI accent is a colour the visualizer is already painting
@@ -24,13 +24,9 @@ pub const WARN: Color = Color::Rgb(0xF0, 0xDC, 0x8A);
 /// carried by weight and brightness rather than a filled bar, so it never
 /// competes with the accent-colored "now playing" marker.
 pub const BRIGHT: Color = Color::Rgb(0xE8, 0xF0, 0xF2);
-/// The player header's state pair: a green that pulses while audio is running
-/// and a flat red when it is not. Red is the resting state rather than an
-/// error, so it is muted — a signal-lamp red, not a warning — and faded
-/// further still by [`stopped_dim`], the only thing that paints it.
+/// The green the header's status dot pulses in while audio is running.
 const GREEN_RGB: (u8, u8, u8) = (0x5F, 0xBF, 0x62);
 pub const GREEN: Color = Color::Rgb(GREEN_RGB.0, GREEN_RGB.1, GREEN_RGB.2);
-const STOPPED_RGB: (u8, u8, u8) = (0xCF, 0x4F, 0x44);
 
 /// Visualizer flame ramp, keyed on height alone so every bar shares the same
 /// green / yellow / red banding and the field reads as one LED meter. The
@@ -331,9 +327,9 @@ pub fn green() -> Style {
 }
 
 /// The accent in force right now at a fraction of full brightness, for the
-/// play pill's pulsing dot. Derived from [`accent_color`] rather than a fixed
-/// hue so the transport breathes in whatever colour the playing sleeve has
-/// put on the rest of the screen.
+/// header's pulsing dot and the stopped transport. Derived from
+/// [`accent_color`] rather than a fixed hue, so both move with whatever colour
+/// the playing sleeve has put on the rest of the screen.
 pub fn accent_at(k: f32) -> Style {
     match accent_color() {
         Color::Rgb(r, g, b) => Style::default().fg(scale(r, g, b, k)),
@@ -341,15 +337,16 @@ pub fn accent_at(k: f32) -> Style {
     }
 }
 
-/// How far [`stopped_dim`] pulls the paused red back.
+/// How far [`stopped_dim`] pulls the accent back.
 const PAUSED_FADE: f32 = 0.62;
 
-/// The paused marker's red, faded. The playing dot earns full brightness by
-/// pulsing; the paused square is a resting state and should sit back from the
-/// title beside it rather than read as an alert.
+/// The stopped transport's colour: the accent in force, held back. The
+/// running state takes the accent at full strength; stopped is a resting
+/// state and should sit back from the title beside it. Taking it from
+/// [`accent_color`] rather than a fixed red keeps the transport in whatever
+/// colour the playing sleeve has put on the rest of the screen.
 pub fn stopped_dim() -> Style {
-    let (r, g, b) = STOPPED_RGB;
-    Style::default().fg(scale(r, g, b, PAUSED_FADE))
+    accent_at(PAUSED_FADE)
 }
 
 /// Gradient pairs the cover-art placeholder picks from, keyed on the album

@@ -363,8 +363,8 @@ mod tests {
             lines[TITLE_ROW]
         );
         assert!(lines[META_ROW].contains("Artist Name · Album Name · 2020"));
-        assert!(lines[META_ROW].contains(" vol "));
-        assert!(lines[META_ROW].contains(" 56% "));
+        assert!(lines[META_ROW].contains("vol "));
+        assert!(lines[META_ROW].contains(" 56%"));
         assert!(lines[PROGRESS_ROW].contains("1:23 ━"));
         // No grab handle on the track — only the volume slider keeps one.
         assert!(
@@ -377,7 +377,7 @@ mod tests {
         // progress track rather than beside the queue's name, with the play
         // state centred between them.
         assert!(lines[TRANSPORT_ROW].contains("◂◂ previous"));
-        assert!(lines[TRANSPORT_ROW].contains("● play"));
+        assert!(lines[TRANSPORT_ROW].contains("■ pause"));
         assert!(lines[TRANSPORT_ROW].trim_end().ends_with("▸▸ next"));
         // The queue's name and length, with shuffle opposite.
         assert!(lines[CONTEXT_ROW].contains("My Mix · 24 tracks"));
@@ -529,7 +529,7 @@ mod tests {
         let mut paused = playing_state();
         paused.playback.as_mut().unwrap().is_playing = false;
         let lines = render(&mut paused, 100, BAR_H);
-        assert!(lines[TRANSPORT_ROW].contains("■ pause"));
+        assert!(lines[TRANSPORT_ROW].contains("▶ play"));
         assert_eq!(playing.hit.play_btn, paused.hit.play_btn);
         assert_eq!(playing.hit.prev_btn, paused.hit.prev_btn);
         assert_eq!(playing.hit.next_btn, paused.hit.next_btn);

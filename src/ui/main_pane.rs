@@ -527,7 +527,7 @@ const CARD_H: usize = CARD_ART_H as usize + 1;
 /// text-only rather than squeezing a name into a handful of cells.
 const MIN_CARD_TEXT_W: u16 = 24;
 /// The play control on a card, and on the header bands above it.
-const PLAY_PILL: &str = " ▶ play ";
+const PLAY_PILL: &str = "▶ play";
 
 /// One line of the artist page's scrolling body.
 ///
@@ -1190,7 +1190,7 @@ fn header_band(
         &mut x,
         play_area,
         mouse,
-        vec![Span::styled(" ▶ play ", accent)],
+        vec![Span::styled(PLAY_PILL, accent)],
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
     if list.sort.key != SortKey::Position {
@@ -1251,7 +1251,7 @@ fn tab_segments<T: Copy + PartialEq>(
             x,
             row,
             mouse,
-            vec![Span::styled(format!(" {} ", title(tab)), style)],
+            vec![Span::styled(title(tab), style)],
         );
         hits.push((rect, tab));
     }

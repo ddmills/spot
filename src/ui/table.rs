@@ -401,17 +401,18 @@ fn placeholder(seed: &str, cols: usize, rows: usize) -> Vec<[u8; 3]> {
         .collect()
 }
 
-/// Period of the "playing" dot's pulse.
+/// Period of the header status dot's pulse.
 const PULSE: Duration = Duration::from_millis(1800);
 
-/// Style for the playing dot at a given moment. It breathes so the header
-/// shows liveness at a glance even when the visualizer has nothing to say —
-/// a silent passage, or audio coming from another device. Brightness rides a
-/// cosine so the turn at each end is soft; a linear ramp reads as a blink.
+/// Style for the header's status dot at a given moment. It breathes so the
+/// header shows liveness at a glance even when the visualizer has nothing to
+/// say — a silent passage, or audio coming from another device. Brightness
+/// rides a cosine so the turn at each end is soft; a linear ramp reads as a
+/// blink.
 ///
 /// The player view already redraws at ~20 fps for the visualizer, so this
-/// costs no extra wakeups. Paused shows a flat red instead: nothing is
-/// happening, so nothing should move.
+/// costs no extra wakeups. The transport's own buttons sit still: they are
+/// controls to click, not indicators, and movement under the cursor is noise.
 pub(super) fn pulse_style(now: Instant) -> Style {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     let elapsed = now.saturating_duration_since(*ORIGIN.get_or_init(|| now));
@@ -425,31 +426,34 @@ fn pulse_at(phase: f32) -> Style {
     theme::accent_at(0.45 + 0.55 * t)
 }
 
-/// The play-state pill. The word is padded to a fixed width, and the whole
-/// run is padded on both sides, so it cannot shift under the cursor when it
-/// toggles and the hover pill sits off the text either side.
+/// The play-state pill. The word is padded out to a fixed width so the run
+/// cannot shift under the cursor when it toggles; the run itself carries no
+/// padding, so the hover pill covers the text and nothing else.
 ///
-/// The two states differ in glyph as well as colour: a round `●` that pulses
-/// in the theme accent while audio is running, a square `■` when it is not —
-/// the shape transports have used for stop since tape decks. Colour alone
-/// would be the whole signal otherwise, which is a poor one to lean on, and
-/// the accent moves with the playing sleeve.
+/// Glyph and word both name what a click does rather than the state it is in:
+/// `■ pause` while audio is running, `▶ play` when it is not — the same `▶`
+/// the album and artist pages put on their own play pills, and the square
+/// transports have used for stop since tape decks.
+///
+/// Both states take their colour from the accent in force — at full strength
+/// while running, held back when stopped — so the transport sits in whatever
+/// colour the playing sleeve has put on the rest of the screen. Neither state
+/// moves: the header's dot is where liveness is shown, and a button that
+/// breathes under the pointer is just something to flinch at.
 pub fn state_spans(is_playing: bool) -> Vec<Span<'static>> {
-    let (glyph, style, word) = if is_playing {
-        ("●", pulse_style(Instant::now()), "play")
+    let (glyph, word) = if is_playing {
+        ("■", "pause")
     } else {
-        ("■", theme::stopped_dim(), "pause")
+        ("▶", "play")
+    };
+    let style = if is_playing {
+        theme::accent()
+    } else {
+        theme::stopped_dim()
     };
     vec![
-        Span::styled(format!(" {glyph}"), style),
-        Span::styled(
-            format!(" {:<5} ", word),
-            if is_playing {
-                theme::accent()
-            } else {
-                theme::dim()
-            },
-        ),
+        Span::styled(glyph, style),
+        Span::styled(format!(" {:<5}", word), style),
     ]
 }
 
@@ -473,8 +477,8 @@ pub fn draw_volume(
     hit: &mut HitAreas,
 ) -> Rect {
     let dim = theme::dim();
-    let label = Span::styled(" vol ", dim);
-    let pct = Span::styled(format!(" {volume_percent:>3}% "), dim);
+    let label = Span::styled("vol ", dim);
+    let pct = Span::styled(format!(" {volume_percent:>3}%"), dim);
     let label_w = label.width() as u16;
     let seg_w = label_w + VOL_TRACK_W + pct.width() as u16;
     let hover =

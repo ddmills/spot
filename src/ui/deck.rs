@@ -46,14 +46,13 @@ pub const DECK_H: u16 = MASTHEAD_H + 5;
 pub(super) const TIME_W: u16 = 5 + 6;
 
 /// The transport's two buttons, in the order they are laid out.
-const PREV_LABEL: &str = " ◂◂ previous ";
-const NEXT_LABEL: &str = " ▸▸ next ";
+const PREV_LABEL: &str = "◂◂ previous";
+const NEXT_LABEL: &str = "▸▸ next";
 
 /// The liked control at the right end of the title row, in both states.
-/// Padded like
-/// every other pill on the deck so hovering it lights a run rather than a
-/// glyph, and of a fixed width so nothing under the cursor moves when the
-/// state flips.
+/// Unpadded, like every other control on the deck — the hover pill covers the
+/// text and nothing else — and of a fixed width so nothing under the cursor
+/// moves when the state flips.
 ///
 /// The same solid glyph either way — the word beside it is what says which
 /// state you are in, so the pair never comes down to telling one glyph from
@@ -65,9 +64,9 @@ const NEXT_LABEL: &str = " ▸▸ next ";
 fn like_label(liked: bool) -> String {
     let mark = super::table::LIKED_MARK;
     if liked {
-        format!(" {mark} liked ")
+        format!("{mark} liked")
     } else {
-        format!(" {mark} like  ")
+        format!("{mark} like ")
     }
 }
 
@@ -556,7 +555,7 @@ pub fn context_row(
         row,
         mouse,
         vec![vec![Span::styled(
-            format!(" shuffle {} ", if pb.shuffle { "on" } else { "off" }),
+            format!("shuffle {}", if pb.shuffle { "on" } else { "off" }),
             if pb.shuffle { accent } else { dim },
         )]],
     )[0];
@@ -695,7 +694,7 @@ mod tests {
             "{:?}",
             lines[1]
         );
-        assert!(lines[1].contains(" vol ") && lines[1].contains(" 56% "));
+        assert!(lines[1].contains("vol ") && lines[1].contains(" 56%"));
         assert_eq!(hit.volume_slider.y, 1);
         assert_eq!(hit.now_artist.y, 1);
         assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
@@ -842,7 +841,7 @@ mod tests {
         assert_eq!(hit.prev_btn.x, 0);
         assert_eq!(hit.next_btn.right(), 60);
         assert_eq!(hit.prev_btn.y, hit.next_btn.y);
-        assert!(lines[0].contains("● play"), "{:?}", lines[0]);
+        assert!(lines[0].contains("■ pause"), "{:?}", lines[0]);
         // Centred on the row: the same gap either side, to within the odd
         // cell an even-width pill cannot split.
         let (left, right) = (hit.play_btn.x, 60 - hit.play_btn.right());
@@ -861,7 +860,7 @@ mod tests {
     #[test]
     fn a_narrow_transport_keeps_previous_alone() {
         let pb = snapshot();
-        let (lines, hit, _) = render(20, 1, |f, a, h| transport(f, a, &pb, None, h));
+        let (lines, hit, _) = render(18, 1, |f, a, h| transport(f, a, &pb, None, h));
         assert!(lines[0].contains("◂◂ previous"), "{:?}", lines[0]);
         assert!(!lines[0].contains("next"), "{:?}", lines[0]);
         assert!(!lines[0].contains("playing"), "{:?}", lines[0]);
