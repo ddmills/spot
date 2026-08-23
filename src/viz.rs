@@ -697,7 +697,8 @@ mod tests {
     #[test]
     fn a_quiet_passage_drops_before_the_display_opens_back_up() {
         let loud = pink_noise(WINDOW);
-        let quiet: Vec<f32> = loud.iter().map(|s| s * 0.1).collect(); // -20 dB
+        // 20 dB down.
+        let quiet: Vec<f32> = loud.iter().map(|s| s * 0.1).collect();
 
         let mut viz = VizState::new();
         let t = feed(&mut viz, &loud, Instant::now(), 30);

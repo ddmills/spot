@@ -78,17 +78,18 @@ pub async fn build() -> Result<(
         }
     };
 
-    // The volume the last session left, before the session is built — the
-    // cache moves into it. Spirc used to restore this; now it is ours to do.
+    // The volume the last session left, read before the session is built —
+    // the cache moves into it.
     let saved_volume = cache
         .volume()
         .unwrap_or_else(|| client::pct_to_raw(client::DEFAULT_VOLUME_PCT));
 
-    let session_config = SessionConfig::default(); // keymaster client_id on desktop
+    // The default carries the keymaster client_id on desktop.
+    let session_config = SessionConfig::default();
     let session = Session::new(session_config, Some(cache));
 
-    // The same login Spirc used to make on spot's behalf. Without it the
-    // session has no connection for the player to fetch audio over.
+    // Without this login the session has no connection for the player to fetch
+    // audio over.
     session
         .connect(credentials, true)
         .await

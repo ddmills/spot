@@ -2,10 +2,10 @@
 //!
 //! spot is a TUI: it wants a truecolor terminal, and the console Explorer hands
 //! a double-clicked exe is whatever the machine's default terminal happens to
-//! be - on Windows 10 that is the legacy host, which renders the palette and
+//! be — on Windows 10 that is the legacy host, which renders the palette and
 //! the album art wrong. Rather than telling people to open a terminal and cd to
-//! their downloads folder, spot notices it was started from Explorer and starts
-//! itself again inside Windows Terminal.
+//! their downloads folder, spot notices an Explorer start and starts itself
+//! again inside Windows Terminal.
 
 use std::path::PathBuf;
 use std::process::Command;

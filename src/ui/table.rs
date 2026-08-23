@@ -91,11 +91,9 @@ pub fn draw_scrollbar(frame: &mut Frame, bar: Rect, len: usize, offset: usize) {
 /// Restyle a run as hovered: a dim "pill" behind it, with dim text brightened
 /// so it stays readable on top.
 ///
-/// The one hover mark on the screen. Links used to underline instead, which
-/// looked fine on a bare run and wrong everywhere else: a name padded out to
-/// its column width underlines the padding too, so hovering a card drew a rule
-/// clear across the pane. A background says the same thing and can only cover
-/// the cells the run actually occupies.
+/// The one hover mark on the screen. A background can only cover the cells the
+/// run actually occupies; an underline would also take the padding a name
+/// carries out to its column width, drawing a rule clear across the pane.
 pub fn hover_style(style: Style) -> Style {
     let mut style = style;
     if style.fg == Some(theme::DIM) {
@@ -415,14 +413,10 @@ fn placeholder(seed: &str, cols: usize, rows: usize) -> Vec<[u8; 3]> {
 /// breathes under the pointer is just something to flinch at.
 ///
 /// `None` on [`PlayState::Loading`], which is the pill's third face and the
-/// only one that is not a control. It used to have a `⋯ load` of its own,
-/// which meant the row carried a word that answered a question nobody asked:
-/// the corner of the header already says `LOADING`, in the same colour, in the
-/// place the eye goes for that. Two of them said it twice — and worse, the
-/// pill's copy outlived the corner's, because it was driven by a poll rather
-/// than by the audio. Nothing is the honest thing to draw: there is no state
-/// to report and nothing a click could do. The caller leaves `hit.play_btn`
-/// empty to match.
+/// only one that is not a control: the header corner already says `LOADING`,
+/// in the same colour, in the place the eye goes for that. There is no state
+/// left to report and nothing a click could do, so the caller leaves
+/// `hit.play_btn` empty to match.
 pub fn state_spans(play: PlayState) -> Option<Vec<Span<'static>>> {
     let is_playing = match play {
         PlayState::Playing => true,

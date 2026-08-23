@@ -460,7 +460,7 @@ impl RadioView {
 
 /// What is playing, when what is playing is a radio station.
 ///
-/// Deliberately not a [`PlaybackSnapshot`]: a broadcast has no duration to
+/// Deliberately not a [`Playback`]: a broadcast has no duration to
 /// scrub, no album to open and nothing to like, and filling those fields with
 /// zeroes would have the deck draw controls that lead nowhere.
 #[derive(Debug, Clone)]
@@ -601,8 +601,8 @@ pub struct TrackList {
     pub loading: bool,
     /// Matches `AppState.load_generation` while a fetch owns this view.
     pub generation: u64,
-    /// Key of this view in the client's track cache ("liked",
-    /// "playlist:<id>", …); used by Refresh to evict and re-fetch.
+    /// Key of this view in the client's track cache (`"liked"`,
+    /// `"playlist:<id>"`, …); Refresh reads it to evict and re-fetch.
     pub cache_key: Option<String>,
 }
 
@@ -711,10 +711,10 @@ impl ArtistTab {
 /// A browsable artist page: a header band, the artist's top tracks, and their
 /// records as cards under them.
 ///
-/// Hits and catalogue used to be tabs. They are one page now: they are the
-/// same answer to the same question, and a tab strip made you ask it twice to
-/// see all of it. The strip [`ArtistTab`] draws is a different axis — it cuts
-/// the catalogue into its groups, and never hides the top tracks.
+/// Hits and catalogue share one page: they are the same answer to the same
+/// question, and a tab strip between them makes you ask it twice to see all of
+/// it. The strip [`ArtistTab`] draws is a different axis — it cuts the
+/// catalogue into its groups, and never hides the top tracks.
 #[derive(Debug, Clone)]
 pub struct ArtistView {
     pub id: String,
@@ -723,8 +723,8 @@ pub struct ArtistView {
     /// CDN URL of the artist's photo, for the header band. `None` until the
     /// overview lands, and for artists Spotify has no image for.
     pub image_url: Option<String>,
-    /// Spotify's genre tags. Deprecated upstream — responses often omit them
-    /// now — so the band draws the line only when one arrives.
+    /// Spotify's genre tags. Deprecated upstream, and often absent from a
+    /// response, so the band draws the line only when one arrives.
     pub genres: Vec<String>,
     pub top: TrackList,
     /// The whole catalogue, every group together.
@@ -803,14 +803,14 @@ pub enum ArtistRow<'a> {
 
 /// What the main pane is currently showing.
 ///
-/// There is one pane now, so this is the whole screen's navigation model.
+/// There is one pane, so this is the whole screen's navigation model.
 /// [`MainView::Home`] is where it starts and where the back stack bottoms out.
 #[derive(Debug, Clone)]
 pub enum MainView {
     Home,
-    /// Everything the left rail used to hold: Liked Songs, then the
-    /// playlists. Carries no data — it renders [`AppState::playlists`], so a
-    /// snapshot of it on the back stack can never go stale.
+    /// The playlists page. Carries no data — it renders
+    /// [`AppState::playlists`], so a snapshot of it on the back stack can
+    /// never go stale.
     Playlists,
     Tracks(TrackList),
     Search(SearchResults),
@@ -896,11 +896,10 @@ pub struct Crumb {
 
 /// What page a view *is*, as against what is loaded into it.
 ///
-/// This is what keeps the trail a path rather than a log. The stack used to
-/// take whatever it was handed, so bouncing between an album and its artist
-/// grew it by two a round trip and `Esc` walked the loop back out. Navigating
-/// to a page already on the path now walks back to it, and that comparison is
-/// this type.
+/// This is what keeps the trail a path rather than a log. Navigating to a page
+/// already on the path walks back to it, and that comparison is this type. A
+/// stack that takes whatever it is handed grows by two a round trip between an
+/// album and its artist, leaving `Esc` to walk the loop back out.
 ///
 /// The identity has to be known at the moment of the *click*, before the
 /// client has fetched anything — and it is, because every command that opens a
@@ -992,8 +991,8 @@ pub struct HitAreas {
     /// so a double one can mean "play".
     pub home_rows: Vec<(Rect, usize)>,
     /// The player view's `← <page>` pill, which closes the player and leaves
-    /// the browse view it names on screen. Distinct from [`Self::back_btn`],
-    /// which pops the view stack.
+    /// the browse view it names on screen. Distinct from [`Self::crumbs`],
+    /// which pop the view stack.
     pub close_player: Rect,
     /// Main-pane list rows.
     pub main_list: Rect,
@@ -1011,10 +1010,9 @@ pub struct HitAreas {
     /// The artist page's album-group strip. It scrolls with the body it sits
     /// in, so it is recorded only where the line is on screen.
     pub artist_tabs: Vec<(Rect, ArtistTab)>,
-    /// The main pane's flat line model, in the same spirit as
-    /// [`Self::library_lines`]: for each content line of [`Self::main_list`],
-    /// the row it belongs to, or `None` for a heading, a column header, or a
-    /// spacer.
+    /// The main pane's flat line model: for each content line of
+    /// [`Self::main_list`], the row it belongs to, or `None` for a heading, a
+    /// column header, or a spacer.
     ///
     /// Empty on every view whose rows are one line each — there a row *is* a
     /// line, and its index is the scroll offset plus the line. Only the artist
@@ -1029,11 +1027,11 @@ pub struct HitAreas {
     /// The ▶ Play button in a view's header band; plays the whole context.
     pub header_play_btn: Rect,
     /// The trail on a page's section row, one entry per crumb, in the order
-    /// they are drawn. Replaces the single `← <page>` pill this used to be:
-    /// that pill sat after the section label, so its column moved with the
-    /// label's width and it drew the parent to the *right* of the child it
-    /// pointed away from. See [`crate::app::state::Crumb`]. Empty on
-    /// pages that do not draw one, and on panes too narrow to hold it.
+    /// they are drawn. A trail rather than a single `← <page>` pill: a pill
+    /// sitting after the section label takes its column from the label's width
+    /// and draws the parent to the *right* of the child it points away from.
+    /// See [`crate::app::state::Crumb`]. Empty on pages that do not draw one,
+    /// and on panes too narrow to hold it.
     ///
     /// Only the crumbs that lead somewhere are recorded: the head of a browse
     /// screen's trail is the page you are already on, and it gets no rect.
@@ -1088,9 +1086,9 @@ pub struct HitAreas {
     pub viz: Rect,
     /// The cover-art block, in whichever view drew it. Deliberately *not* a
     /// click target: the sleeve is the biggest, most inviting thing on the
-    /// screen and it used to open the album, which made it the one control
-    /// nothing labelled. The album's name on the row below does that job, and
-    /// says so. Recorded because the layout is worth being able to find.
+    /// screen, so an album opened from it would be the one control nothing
+    /// labels. The album's name on the row below does that job, and says so.
+    /// Recorded because the layout is worth being able to find.
     pub art: Rect,
 }
 
@@ -1413,8 +1411,8 @@ impl AppState {
     pub fn push_view(&mut self) {
         // Never the same page twice in a row. A page is pushed on the click
         // and its replacement only arrives when the client answers, so until
-        // it does every further click pushes the *unchanged* current view —
-        // four clicks on a Home row used to leave four copies of Home. The
+        // it does every further click pushes the *unchanged* current view, so
+        // four clicks on a Home row would leave four copies of Home. The
         // key-based check in `event::make_way` cannot catch that, because the
         // page it is looking for is not on screen yet.
         let key = view_key(&self.main);
@@ -1464,19 +1462,17 @@ impl AppState {
 
     /// The page's ancestors, oldest first, then the page itself.
     ///
-    /// This is what the section row draws. It exists because the old single
-    /// `← <page>` pill could only ever name one step: on `Home › Muse › Black
-    /// Holes` it said `← Muse` and left the rest of the path to be
-    /// remembered. The stack already held the whole chain — it was simply
-    /// never shown.
+    /// This is what the section row draws. The stack holds the whole chain, so
+    /// the row shows all of it: a single `← <page>` pill can only name one
+    /// step, leaving `Home › Muse › Black Holes` to say `← Muse` and the rest
+    /// of the path to be remembered.
     ///
     /// Home is not on it, at either end. The `♫ spot` mark sits at the head of
     /// the same row and *is* the way home, so a `HOME ›` in front of every
-    /// path was a second control saying what the first one already said —
-    /// and on Home itself a crumb naming the page the mark points at. The
-    /// depths of the crumbs that remain are unchanged, so what they pop back
-    /// to is unaffected: this drops a step from what is *drawn*, not from the
-    /// stack.
+    /// path would be a second control saying what the first one says — and on
+    /// Home itself a crumb naming the page the mark points at. This drops a
+    /// step from what is *drawn*, not from the stack: the depths of the
+    /// remaining crumbs are untouched, so they pop back to the same places.
     pub fn trail(&self) -> Vec<Crumb> {
         let mut out: Vec<Crumb> = self
             .view_stack
@@ -1513,9 +1509,9 @@ impl AppState {
     /// Restore the snapshot at `depth`, discarding everything above it.
     ///
     /// Clicking a crumb is a jump, not a run of single steps: going from an
-    /// album back to Home restores Home's own scroll and selection rather
-    /// than the ones the pages in between were left at. Returns false when
-    /// the depth is not on the stack.
+    /// album back to Home restores Home's own scroll and selection rather than
+    /// the ones the pages in between hold. Returns false when the depth is not
+    /// on the stack.
     pub fn pop_to(&mut self, depth: usize) -> bool {
         if depth >= self.view_stack.len() {
             return false;
@@ -1775,7 +1771,8 @@ mod tests {
             ascending: true,
         };
         st.main = MainView::Tracks(list);
-        st.main_index = 0; // "banana" in fetch order
+        // "banana", in fetch order.
+        st.main_index = 0;
         st.resort_main();
         // banana lands on display row 1 after the sort.
         assert_eq!(st.main_index, 1);
@@ -1791,7 +1788,8 @@ mod tests {
         };
         st.main = MainView::Tracks(list);
         st.resort_main();
-        st.main_index = 1; // "cherry"
+        // "cherry".
+        st.main_index = 1;
         if let MainView::Tracks(list) = &mut st.main {
             list.append(vec![track("Apple", 1000)]);
         }
@@ -1809,9 +1807,9 @@ mod tests {
     /// The trap this whole accessor exists for.
     ///
     /// While a station plays, the Spotify queue is still installed — kept on
-    /// purpose, so stopping the stream puts it straight back. Every deck
-    /// control used to read it directly, which meant `★` on the radio deck
-    /// would have liked whatever the user last heard on Spotify.
+    /// purpose, so stopping the stream puts it straight back. A deck control
+    /// that reads it directly makes `★` on the radio deck like whatever the
+    /// user last heard on Spotify.
     #[test]
     fn the_deck_ignores_the_kept_queue_while_a_station_plays() {
         let mut st = AppState::new();

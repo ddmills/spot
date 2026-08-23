@@ -16,15 +16,14 @@ use crate::app::state::{
 struct PlayMarks {
     /// URI of the playing track, if any.
     uri: Option<String>,
-    /// The playing queue's source key ("playlist:<id>", …), for marking the
+    /// The playing queue's source key (`"playlist:<id>"`, …), for marking the
     /// row of the playlist it came out of.
     context: Option<String>,
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    // The search input used to live here, as a bordered box that appeared only
-    // while you were typing and pushed the whole pane down three rows to make
-    // room. It is now a permanent row above this one; see `super::top_row`.
+    // The search input is a permanent row above this pane, not a box inside
+    // it; see `super::top_row`.
     let list_area = area;
 
     let loading = state.loading;
@@ -241,11 +240,11 @@ fn entry_rect(inner: Rect, offset: usize, start: usize, height: usize) -> Rect {
     .intersection(inner)
 }
 
-/// Everything the left rail used to hold: Liked Songs, then the playlists.
+/// The playlists, one row each.
 ///
-/// The rail spent two lines on each of them — a name over "56 tracks" —
-/// because it was 30 cells wide. At full width the count is a column, so the
-/// page holds twice as many rows and can afford to say who owns them.
+/// At full pane width the count is a column rather than a second line under
+/// the name, so the page holds twice as many rows and can afford to say who
+/// owns them.
 #[allow(clippy::too_many_arguments)]
 fn draw_playlists(
     frame: &mut Frame,
@@ -278,8 +277,7 @@ fn draw_playlists(
     }
     hit.main_list = rows_area;
 
-    // Playlists only. Liked Songs used to head this list because the rail had
-    // nowhere else to put it; it is a Home row of its own now, and it is not a
+    // Playlists only. Liked Songs is a Home row of its own: it is not a
     // playlist, so it does not belong under a heading that says it is.
     let items: Vec<ListItem> = playlists
         .iter()
@@ -676,7 +674,7 @@ fn draw_artist(
 /// Deliberately the same shape as an album's [`header_band`] — a portrait
 /// where the sleeve goes, the name at the top of the column beside it, the
 /// control at the bottom of that column — because they are the same kind of
-/// page and used to look like two different products.
+/// page and must not read as two different products.
 fn artist_band(
     frame: &mut Frame,
     inner: Rect,
@@ -1365,9 +1363,9 @@ fn tab_segments<T: Copy + PartialEq>(
     }
 }
 
-/// Reserved at the right of the pane: a blank column, then the scrollbar. The
-/// border used to carry the bar; with no border it needs columns of its own,
-/// kept outside the content rect so a click on it cannot resolve to a row.
+/// Reserved at the right of the pane: a blank column, then the scrollbar. With
+/// no border to hang the bar on it needs columns of its own, kept outside the
+/// content rect so a click on it cannot resolve to a row.
 ///
 /// Two rather than one because the last column of a track row is the
 /// right-aligned Time, and a duration flush against the scrollbar reads as one
@@ -1401,8 +1399,8 @@ pub(super) const MAX_CRUMBS: usize = 4;
 /// too would be a third answer to a question already answered twice.
 pub(super) const CRUMB_ELLIPSIS: &str = "…";
 
-/// One crumb's text: capped, and uppercased to sit in the row the section
-/// label used to own. `fit` pads to width, which a crumb must not do.
+/// One crumb's text: capped, and uppercased to sit in the section label's row.
+/// `fit` pads to width, which a crumb must not do.
 pub(super) fn crumb_text(label: &str, width: usize) -> String {
     super::table::fit(&label.to_uppercase(), width)
         .trim_end()
@@ -1499,8 +1497,8 @@ pub(super) fn fit_trail(trail: &[Crumb], loading: bool, avail: u16) -> (Vec<Crum
         }
         if start >= last {
             // Nothing left to shed but the root. A pane this narrow gets the
-            // page's own name and no path — a clipped root would name a
-            // destination the crumb no longer leads to.
+            // page's own name and no path — a clipped root names a destination
+            // the crumb does not lead to.
             return (trail[last..].to_vec(), false);
         }
         start += 1;
@@ -1636,11 +1634,8 @@ pub(super) fn page_header(st: &AppState) -> PageHeader {
 
 /// The pane's content area: everything but the column the scrollbar rides in.
 ///
-/// This is all that is left of the old `section_body`, and before that of
-/// `theme::pane_block` and the section label between them. The label named the
-/// page's kind (`ALBUM`) and carried a `← <name>` pill after it; the path that
-/// replaced it lived on the pane's own first row. Both are now in the header
-/// two rows above, drawn once for both views — see [`super::top_row`].
+/// The pane draws no label and no path of its own: both live in the header two
+/// rows above, drawn once for both views — see [`super::top_row`].
 fn body_area(area: Rect) -> Rect {
     Rect {
         width: area.width.saturating_sub(GUTTER),
@@ -1855,9 +1850,9 @@ fn track_row(
         RowMark::Playing => Span::styled("▶ ", accent_bold),
     };
     // Three weights, the way the player queue does it: the title at TEXT,
-    // everything supporting it at DIM, and the playing row in accent. The
-    // title used to be `Style::default()` — the raw terminal foreground, and
-    // the one unthemed colour on the page.
+    // everything supporting it at DIM, and the playing row in accent.
+    // `Style::default()` here would leak the raw terminal foreground, the one
+    // unthemed colour on the page.
     let name_style = if mark == RowMark::Playing {
         accent_bold
     } else {
@@ -2011,9 +2006,6 @@ struct PlaylistCols {
 }
 
 /// Leading marker column: `♫ ` on the playing context, blank otherwise.
-///
-/// It used to carry a mark on Liked Songs too, back when that was a row of
-/// this list rather than an entry on Home.
 const PL_MARK_W: usize = 2;
 
 impl PlaylistCols {
@@ -2542,8 +2534,8 @@ mod tests {
     }
 
     /// Rows the header takes above the pane. The path a page draws is on it,
-    /// so these tests draw it too — the pane no longer owns that row, but
-    /// [`fit_trail`] and [`draw_trail`] are still what puts a path on it.
+    /// so these tests draw it too: the row belongs to the header, but
+    /// [`fit_trail`] and [`draw_trail`] are what put a path on it.
     const HEAD: usize = super::super::HEAD_H as usize;
     /// The row within that band the path lands on.
     const PATH: usize = super::super::SEARCH_H as usize;
@@ -2590,11 +2582,10 @@ mod tests {
         st
     }
 
-    /// There is one album page, not two. It looked like two because the
-    /// header band only draws the art layout when the view has a sleeve, and
-    /// a track row used to open an album with `cover_url: None` — so albums
-    /// reached from a track list got the cramped text band instead. Every
-    /// route now supplies the sleeve, so every route renders the same page.
+    /// There is one album page, not two. The header band draws the art layout
+    /// only when the view has a sleeve, so a route that opens an album with
+    /// `cover_url: None` gets the cramped text band instead. Every route
+    /// supplies the sleeve, so every route renders the same page.
     #[test]
     fn an_album_opened_from_a_track_row_renders_the_same_page() {
         let sleeve = "https://i.scdn.co/image/abc";
@@ -2662,15 +2653,13 @@ mod tests {
     }
 
     /// Every page below Home is drilled into from somewhere, so every one of
-    /// them spells the path that got it there. The playlist page used to be
-    /// the exception, because it was opened from a rail that never went away.
+    /// them spells the path that got it there, the playlist page included.
     ///
-    /// The trail is anchored at the margin, which is the point of it: the
-    /// `← <name>` pill this replaced sat three cells after a section label
-    /// whose width was the page's kind, so the one control that means "go
-    /// back" landed in a different column on every page. It used to be
-    /// anchored after the mark for the same reason; the mark is a row above it
-    /// now and the path starts where every other line of content does.
+    /// The trail is anchored at the margin, which is the point of it: a `←
+    /// <name>` pill sitting after a section label whose width is the page's
+    /// kind lands the one control that means "go back" in a different column
+    /// on every page. The mark is a row above the path, so the path starts
+    /// where every other line of content does.
     ///
     /// Home contributes no crumb at either end — the mark above the path is
     /// already the way there.
@@ -2845,8 +2834,8 @@ mod tests {
     /// Nothing pushed means nothing to go back to — except on an album page,
     /// which can always go *up* to the artist its tracks credit. An `up` and
     /// a `back` are the same shape in a trail, which is half the reason for
-    /// drawing one: the old pill spelled both `← <name>` and could not say
-    /// which it meant.
+    /// drawing one: a single `← <name>` pill spells both and cannot say which
+    /// it means.
     #[test]
     fn an_album_page_with_no_history_offers_its_artist() {
         let mut st = album_state();
@@ -2989,10 +2978,10 @@ mod tests {
         }
     }
 
-    /// Every name on these pages used to be drawn with `Style::default()` —
-    /// the raw terminal foreground, and the one unthemed colour on the screen.
-    /// It is why the browse pages read harsher than the player even though
-    /// they share a palette. Nothing may paint text without choosing a colour.
+    /// Nothing may paint text without choosing a colour. `Style::default()`
+    /// leaves the raw terminal foreground, the one unthemed colour on the
+    /// screen, which makes the browse pages read harsher than the player even
+    /// though they share a palette.
     ///
     /// `Color::Reset` on a *background* is fine and expected: only the cover
     /// art and the hover pills set one.
@@ -3261,7 +3250,8 @@ mod tests {
     #[test]
     fn header_band_absent_on_short_panes() {
         let mut st = tracks_state(vec![track("A", "B")]);
-        let lines = render(&mut st, 80, 10); // body height 6 < 8
+        // Body height 6, under the band's minimum of 8.
+        let lines = render(&mut st, 80, 10);
         assert!(!lines.iter().any(|l| l.contains("▶ play")));
         assert!(st.hit.header_play_btn.is_empty());
     }
@@ -3288,10 +3278,9 @@ mod tests {
 
     /// The row names the page, not the page's kind.
     ///
-    /// It used to say `ALBUM` or `LIKED SONGS` — the kind — and hang a back
-    /// pill off the end of that. The kind is what the header band under it
-    /// already tells you, with a sleeve and a year or with an owner, so the
-    /// row spends itself on the path instead, which nothing else was saying.
+    /// The header band under it already tells you the kind, with a sleeve and
+    /// a year or with an owner, so the row spends itself on the path instead —
+    /// which nothing else says.
     #[test]
     fn the_trail_names_the_page_whatever_kind_it_is() {
         let mut st = tracks_state(vec![track("Alpha", "Ann")]);
@@ -3496,8 +3485,8 @@ mod tests {
     }
 
     /// An album row's *name* is a link, the way the Album column of a track
-    /// table is: one click opens it. Before this the only way in was a
-    /// double-click or Enter, which nothing on screen said.
+    /// table is: one click opens it. A double-click or Enter is a way in that
+    /// nothing on screen says.
     #[test]
     fn an_album_row_registers_its_name_as_a_click_target() {
         let mut st = search_state();
@@ -3738,10 +3727,9 @@ mod tests {
         );
     }
 
-    /// Hovering a link lights the run itself and nothing else. It used to
-    /// underline, and every link on these pages is a cell padded out to its
-    /// column width — so hovering an album card drew a rule from its name
-    /// clear across the pane.
+    /// Hovering a link lights the run itself and nothing else. Every link on
+    /// these pages is a cell padded out to its column width, so an underline
+    /// would draw a rule from an album card's name clear across the pane.
     #[test]
     fn hovering_a_link_lights_the_text_and_not_its_padding() {
         use ratatui::style::Color;

@@ -2,14 +2,10 @@
 //!
 //! Two things on screen report it: the status word pinned to the top-right of
 //! the header ([`super::top_row`]) and the transport's play/pause pill
-//! ([`super::deck`]). They used to work it out separately — the word off the
-//! audio tap, the pill off a snapshot flag and a `pending_play` that is only
-//! cleared when a three-second poll agrees — and they disagreed for as long as
-//! those two clocks were apart. The pill sat on `⋯ load` for half a minute
-//! under a corner already saying `STREAMING`, and a station still connecting
-//! offered `■ pause` under a corner saying `LOADING`.
-//!
-//! Both read this instead, so the two can only ever say the same thing.
+//! ([`super::deck`]). Both read this one answer, so the two can only ever say
+//! the same thing. Deriving it separately — the word off the audio tap, the
+//! pill off a snapshot flag and a three-second poll — lets them disagree for
+//! as long as those two clocks are apart.
 
 use std::time::Duration;
 
@@ -131,9 +127,9 @@ mod tests {
         assert_eq!(state_of(&st), PlayState::Loading);
     }
 
-    /// A station that has been asked for and has not connected yet. The
-    /// transport used to take `is_playing` at face value here and offer
-    /// `■ pause` over silence, under a corner already saying `LOADING`.
+    /// A station that has been asked for and has not connected yet. Taking
+    /// `is_playing` at face value here offers `■ pause` over silence, under a
+    /// corner already saying `LOADING`.
     #[test]
     fn a_station_still_connecting_is_loading_not_playing() {
         let st = radio();

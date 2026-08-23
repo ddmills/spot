@@ -309,11 +309,11 @@ fn window_title(
 /// Follow librespot's own player, which knows what the audio is doing the
 /// moment it changes.
 ///
-/// spot owns the queue, so this loop no longer decides *what* is playing —
-/// the client wrote that into the queue before it asked the player for
-/// anything. What the player still knows first is what the audio is *doing*:
-/// when it really started, paused, moved, or ran out, and what artwork the
-/// loaded metadata carries.
+/// spot owns the queue, so this loop does not decide *what* is playing — the
+/// client writes that into the queue before it asks the player for anything.
+/// What the player knows first is what the audio is *doing*: when it really
+/// started, paused, moved, or ran out, and what artwork the loaded metadata
+/// carries.
 async fn player_event_loop(
     mut events: PlayerEventChannel,
     state: Arc<RwLock<AppState>>,

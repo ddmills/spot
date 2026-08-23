@@ -140,13 +140,13 @@ pub fn parse(raw: &str, station: &str) -> Option<Announcement> {
 
     // The dash is tried *first*, and the order is load-bearing.
     //
-    // `by` used to win, which tore apart every song whose title happens to
-    // contain the word: SomaFM's `Craft Spells - Our Park By Night` came out as
-    // artist "Night", title "Craft Spells - Our Park". Five songs in the sampled
+    // Letting `by` win tears apart every song whose title happens to contain
+    // the word: SomaFM's `Craft Spells - Our Park By Night` comes out as artist
+    // "Night", title "Craft Spells - Our Park". Five songs in the sampled
     // corpus hit that.
     //
-    // Reading the dash first costs WALM nothing, which is the only broadcaster
-    // the `by` form was added for: its branding tail is stripped above, and
+    // Reading the dash first costs WALM nothing, and WALM is the only
+    // broadcaster the `by` form serves: its branding tail is stripped above, and
     // what is left — `77 Sunset Strip by Skip Martin` — has no dash by the time
     // the fallback is reached.
     let announced = match first_split(&text) {
@@ -742,9 +742,9 @@ mod tests {
             ),
             // -- ` by ` must not beat the dash ------------------------------
             //
-            // The defect this table exists for. "By" inside a title used to
-            // split the string on the wrong word: this row came out as artist
-            // "Night", title "Craft Spells - Our Park".
+            // The defect this table exists for. "By" inside a title splits the
+            // string on the wrong word unless the dash wins: this row comes out
+            // as artist "Night", title "Craft Spells - Our Park".
             (
                 "Craft Spells - Our Park By Night",
                 "SomaFM PopTron (128k MP3)",

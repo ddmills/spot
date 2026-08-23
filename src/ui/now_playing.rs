@@ -3,13 +3,11 @@
 //!
 //! It is [`super::deck`] with a sleeve on the left and a toast tucked into
 //! the blank row above the progress track — the same rows the full player
-//! draws, in the same order, from the same code. It used to say them very
-//! differently: inside a rounded frame, with the keybinding spelled out in
-//! every button (`▮▮ (space) pause`), a `│` between each pair, and the device
-//! name in the corner. That was eleven separate marks for four facts, and it
-//! made this the busiest thing on a screen it sits at the bottom of.
+//! draws, in the same order, from the same code.
 //!
-//! The keys still work; `?` is where they are written down.
+//! It sits at the bottom of the screen, so it stays quiet: no frame, no
+//! separators, and no keybinding spelled out in each button. `?` is where the
+//! keys are written down.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -133,8 +131,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     };
 
     // Rows 0-1: the title, then the metadata with the volume slider opposite.
-    // The play state used to hold the title's right edge; it now sits under
-    // the progress track, between previous and next.
     let like = liked.get(&track.uri).copied();
     deck::masthead(frame, text, track, pb.volume_percent, like, mouse, hit);
 
@@ -143,8 +139,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // it, not before.
     hit.now_playing = area;
 
-    // Row 2: whatever the app last had to say, opposite nothing. It used to
-    // share the transport's row; that row now has a button at each end.
+    // Row 2: whatever the app last had to say, opposite nothing. The
+    // transport's row has a button at each end and no room for it.
     if text.height < 3 {
         return;
     }
@@ -364,7 +360,7 @@ mod tests {
     fn renders_a_blank_row_a_sleeve_and_the_deck() {
         let mut state = playing_state();
         let lines = render(&mut state, 120, BAR_H);
-        // A blank row where the rule used to be, and no box-drawing left.
+        // A blank row at the top, and no box-drawing anywhere.
         assert!(lines[0].trim().is_empty(), "{:?}", lines[0]);
         assert!(
             !lines

@@ -87,8 +87,8 @@ const ART_GAP: u16 = 3;
 /// spans the pane whatever the cover is doing.
 const MIN_FIELD_W: u16 = 32;
 /// The art tier's progress band: a blank row, then the bar. Narrower than
-/// [`PROGRESS_H`] because the bar no longer has to separate itself from a
-/// field directly above it.
+/// [`PROGRESS_H`] because no field sits directly above the bar for it to
+/// separate itself from.
 const ART_PROGRESS_H: u16 = 2;
 
 /// Vertical budget for one pane. The masthead (`header`) is drawn in both
@@ -117,7 +117,7 @@ impl Rows {
     /// Rows kept for the queue before the visualizer is allowed to grow.
     const MIN_QUEUE: u16 = 3;
     /// Rows the queue must still get for a cover to be worth drawing. Higher
-    /// than [`MIN_QUEUE`]: a three-row queue under a twelve-row sleeve is a
+    /// than [`Self::MIN_QUEUE`]: a three-row queue under a twelve-row sleeve is a
     /// worse screen than no sleeve at all.
     const MIN_ART_QUEUE: u16 = 5;
 
@@ -475,8 +475,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
 ///
 /// The two share both a top and a bottom edge, which is what makes them read
 /// as one object rather than as a picture with a chart next to it. The
-/// metadata that used to sit in this column is now in the masthead above (see
-/// [`deck::masthead`]), so the field gets the sleeve's full height.
+/// metadata sits in the masthead above (see [`deck::masthead`]) rather than in
+/// this column, so the field gets the sleeve's full height.
 ///
 /// Returns the field's rect for the caller to paint, so the visualizer is
 /// drawn in one place whether or not there is a cover.
@@ -719,10 +719,10 @@ fn draw_queue(
             } else {
                 Span::raw(" ".repeat(PREFIX_W))
             };
-            // Three weights, so the playing row actually stands out: the
-            // title at TEXT, everything supporting it at DIM, and the playing
-            // row in accent. The title used to be `Style::default()` — the
-            // raw terminal foreground, the one unthemed colour in the view.
+            // Three weights, so the playing row stands out: the title at TEXT,
+            // everything supporting it at DIM, and the playing row in accent.
+            // `Style::default()` here would leak the raw terminal foreground,
+            // the one unthemed colour in the view.
             let name_style = if Some(i) == playing {
                 accent_bold
             } else {
@@ -1420,8 +1420,8 @@ mod tests {
         );
     }
 
-    /// Every control the bottom bar used to own now records the same hit rect
-    /// from the player view, so `event.rs` needs no idea which pane drew it.
+    /// Every control the bottom bar carries records the same hit rect from the
+    /// player view, so `event.rs` needs no idea which pane drew it.
     #[test]
     fn controls_record_hits_on_their_rows() {
         let mut st = playing_state();

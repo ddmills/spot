@@ -38,8 +38,8 @@ impl AudioTap {
     }
 
     /// Append interleaved stereo samples, downmixed to mono and scaled by
-    /// `gain` (used to undo the player's soft-volume attenuation, keeping
-    /// the visualizer volume-agnostic).
+    /// `gain`, which undoes the player's soft-volume attenuation and keeps the
+    /// visualizer volume-agnostic.
     pub fn push(&self, samples: &[f64], gain: f64) {
         let mut ring = self.ring.lock();
         for pair in samples.chunks(2) {

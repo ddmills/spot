@@ -1,20 +1,13 @@
 //! The header both views wear: the `♫ spot` mark and the search prompt on the
 //! top row, the path on the row two under it.
 //!
-//! The prompt used to sit under the path rather than beside the mark, on the
-//! reasoning that the top row should say where you are and a search box says
-//! where you are going. That put the control you reach for most on the row
-//! nothing else was on, at the margin, with no field around it — a stray dim
-//! sentence between the page's name and the page — while the top row carried
-//! the path, the count *and* the status, and had them fighting for its right
-//! edge.
-//!
-//! So: the prompt takes the identity row and a fill that says it is a box you
-//! can type in (see [`theme::FIELD`]), and the path takes the row under it,
-//! where it has the width to itself and shares an edge with the count alone.
-//! The status stays on the top row, because that is the row the player draws
-//! too, and the mark and the status are the two things that must not appear to
-//! move when `v` toggles between them.
+//! The prompt takes the identity row and a fill that says it is a box you can
+//! type in (see [`theme::FIELD`]), and the path takes the row under it, where
+//! it has the width to itself and shares an edge with the count alone. Putting
+//! the path, the count *and* the status on one row has them fighting for its
+//! right edge. The status stays on the top row, because that is the row the
+//! player draws too, and the mark and the status are the two things that must
+//! not appear to move when `v` toggles between them.
 //!
 //! The player gets no prompt at any height. The mark and the path are ways
 //! *out* of that view and belong on it; a search box is a way somewhere new,
@@ -25,18 +18,15 @@
 //! whether the head of the path is a control (see
 //! [`super::main_pane::draw_trail`]).
 //!
-//! Search used to be modal: it existed only while you were typing, and
-//! pressing `/` pushed the whole page down three rows to make room for a
-//! bordered box. That cost a layout jump on every search, and it left the
-//! feature invisible to anyone who had not read the keymap.
+//! Search is not modal: the row is here whatever the mode, and is the same two
+//! rows in both states, so `/` and `Esc` never move a line of the screen. A
+//! box that appears only while you type costs a layout jump on every search
+//! and leaves the feature invisible to anyone who has not read the keymap.
 //!
-//! The row is here whatever the mode, and is the same two rows in both
-//! states, so `/` and `Esc` never move a line of the screen.
-//!
-//! The mark went in beside it when the left rail came out: with nothing
-//! permanent on screen naming the app or leading anywhere, the row that was
-//! already pinned to the top left is where a home control belongs. The player
-//! draws the same mark in the same column — see [`super::table::brand`].
+//! The mark sits beside it because nothing else on screen names the app or
+//! leads anywhere, and the top left is where a home control belongs. The
+//! player draws the same mark in the same column — see
+//! [`super::table::brand`].
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -52,11 +42,9 @@ use crate::app::state::{AppState, InputMode, MainView};
 
 /// Shown when the box is empty, in place of the query.
 ///
-/// It names the two catalogues rather than the kinds of thing in them, because
-/// naming the sources is the new information: this box used to point at
-/// whichever one the page behind it came from, and now it asks both, every
-/// time, from every page. Which kinds came back is what the tab strip on the
-/// results page is for.
+/// It names the two catalogues rather than the kinds of thing in them: the box
+/// asks both, every time, from every page, and naming the sources is what says
+/// so. Which kinds came back is what the tab strip on the results page is for.
 const PLACEHOLDER: &str = "search Spotify and radio…";
 
 /// Cells between the mark and whatever shares its row. Wider than a word
@@ -102,7 +90,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, page: PageHeade
     }
     // The player has no prompt at any height, and a browse band with room for
     // only one row keeps the one that says where you are: orientation beats
-    // search when space is scarce, which is the trade the old layout made too.
+    // search when space is scarce.
     if state.show_player || area.height <= super::NAV_H {
         path_row(frame, Rect { height: 1, ..area }, state, page, true);
         return;
@@ -536,10 +524,10 @@ mod tests {
         assert!(lines[PROMPT_ROW].contains(PLACEHOLDER));
     }
 
-    /// The field reads as a box, so all of it must be clickable — and it now
-    /// *looks* the size it is, because the fill spans the same rect. A click
-    /// past the caret used to miss `hit.search_box`, fall into the "a click
-    /// elsewhere cancels the input" branch, and discard what you typed.
+    /// The field reads as a box, so all of it must be clickable, and the fill
+    /// spans the same rect so it looks the size it is. A click past the caret
+    /// that misses `hit.search_box` falls into the "a click elsewhere cancels
+    /// the input" branch and discards what you typed.
     #[test]
     fn the_whole_field_is_clickable_not_just_the_text() {
         let mut st = AppState::new();
@@ -564,7 +552,7 @@ mod tests {
 
     /// The fill is what says "box you can type in" with no border to say it,
     /// and it covers the rect the click does — including the cells past the
-    /// end of the text, which is the half that used to look inert.
+    /// end of the text, which look inert without it.
     #[test]
     fn the_field_is_filled_at_rest_and_lights_under_the_pointer() {
         let mut st = AppState::new();
@@ -783,9 +771,9 @@ mod tests {
     }
 
     /// Claims to be playing, but no audio has arrived: a station still
-    /// connecting and prefetching, or a track still being fetched. This is
-    /// the several-second window a radio station spends buffering, which the
-    /// row used to spend saying it was already playing.
+    /// connecting and prefetching, or a track still being fetched. This is the
+    /// several-second window a radio station spends buffering, and the row must
+    /// not spend it claiming to play.
     #[test]
     fn a_source_with_no_audio_yet_reads_as_loading() {
         let mut st = radio_state();

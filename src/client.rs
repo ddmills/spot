@@ -196,12 +196,11 @@ impl Client {
                 match toggled {
                     Some(true) => self.radio_player.resume(),
                     Some(false) => self.radio_player.pause(),
-                    // A live engine with no deck to pause. A station change
-                    // that failed after an earlier station was playing leaves
-                    // exactly this, and the arm used to do nothing at all in
-                    // it — the play key stopped working and the stream could
-                    // only be ended by killing spot. There is no station on
-                    // screen to pause, so the key means stop.
+                    // A live engine with no deck to pause, which is what a
+                    // station change that fails after an earlier station was
+                    // playing leaves behind. There is no station on screen to
+                    // pause, so the key means stop; doing nothing here strands
+                    // a stream that can only be ended by killing spot.
                     None => self.stop_radio(),
                 }
             }
@@ -604,8 +603,8 @@ impl Client {
             let shuffle = st.playback.as_ref().is_some_and(|pb| pb.shuffle);
             st.playback = Some(Playback::started(self.local_volume_pct(), shuffle));
             // Every deck checks radio before Spotify, so a station left set
-            // would keep drawing over the track that is starting. The engine
-            // itself was stopped by `yield_to_spotify` on the play path.
+            // keeps drawing over the track that is starting. `yield_to_spotify`
+            // stops the engine itself on the play path.
             st.radio = None;
             // The status word tells "playing" from "still fetching" by whether
             // samples are arriving, and the old track's are about to stop.
@@ -650,7 +649,7 @@ impl Client {
     }
 
     /// Hand the player the next track ahead of the gap, so track boundaries
-    /// are seamless — the job Spirc used to do with this same event.
+    /// are seamless.
     fn preload_next(&self) {
         let next = {
             let st = self.state.read();
@@ -690,8 +689,7 @@ impl Client {
     /// Apply a volume to the mixer, the state and the cache in one move.
     ///
     /// The mixer is the truth the audio path reads; the state is what the
-    /// slider draws; the cache is what the next session starts at — the
-    /// persistence Spirc used to provide.
+    /// slider draws; the cache is what the next session starts at.
     fn set_volume(&self, pct: u8) {
         let raw = pct_to_raw(pct);
         self.mixer.set_volume(raw);
@@ -862,10 +860,10 @@ impl Client {
     /// The connecting is done on a task of its own, and this returns as soon as
     /// the deck is drawn. Connecting takes seconds — a directory address to
     /// resolve, a stream to reach and prefetch, a codec to identify — and
-    /// awaiting it here held the command loop for all of them. Pause, stop and
-    /// the next station all arrive on that loop, so a station that connected
-    /// slowly was a player that answered nothing, and one that never connected
-    /// was a player that never answered again.
+    /// awaiting it here holds the command loop for all of them. Pause, stop
+    /// and the next station all arrive on that loop, so a slow station makes a
+    /// player that answers nothing, and a station that never connects makes a
+    /// player that never answers again.
     fn play_station(&mut self, station: state::Station) {
         self.player.pause();
         let volume = self.playback_volume();
@@ -909,8 +907,8 @@ impl Client {
             // catch it.
             player.pause();
             let outcome = radio.play(&url, volume).await;
-            // Whether this task still speaks for the deck. Clicks can overlap
-            // now that this runs off the command loop, and an older one must
+            // Whether this task still speaks for the deck. Clicks overlap
+            // because this runs off the command loop, and an older one must
             // not clear a newer one's station or stop its stream.
             let ours = state
                 .read()
@@ -922,8 +920,8 @@ impl Client {
                 if ours {
                     // An earlier station may still be streaming: this one
                     // never reached the audio thread, so nothing has replaced
-                    // it. Left alone it plays on under a deck that no longer
-                    // draws it, which is a stream with no control over it.
+                    // it. Left alone it plays on under a deck that does not
+                    // draw it, which is a stream with no control over it.
                     radio.stop();
                     let mut st = state.write();
                     st.radio = None;
@@ -951,14 +949,14 @@ impl Client {
     /// Silence both engines on the way out, then let the quit path know.
     ///
     /// The client is the only holder of the handles that can do this, so
-    /// without it nothing stopped playing when spot quit: the radio thread is
+    /// without it nothing stops playing when spot quits: the radio thread is
     /// detached and its stop command is only ever sent on user action, and
-    /// librespot's player would go on draining its buffer. Both survived until
-    /// the process died — which, if librespot's player thread was wedged, could
-    /// be a long time after the terminal came back.
+    /// librespot's player goes on draining its buffer. Both then survive until
+    /// the process dies — which, if librespot's player thread is wedged, can
+    /// be a long time after the terminal comes back.
     fn shutdown(&mut self) {
-        // Radio first: it is the one that kept playing, and it blocks until
-        // the output device is actually closed.
+        // Radio first: it is the one that outlives the process, and it blocks
+        // until the output device is actually closed.
         self.radio_player.shutdown();
         // Stop the audio, then close the connection underneath it.
         self.player.stop();
@@ -983,8 +981,8 @@ impl Client {
             // No station, or a station that has stopped saying anything.
             // Forget the probe, so the same title announced again after a gap
             // is looked up again — and drop the match with it, or the deck
-            // would go on naming a record the station is no longer claiming to
-            // be playing.
+            // goes on naming a record the station has stopped claiming to
+            // play.
             self.radio_probe = None;
             if let Some(r) = self.state.write().radio.as_mut() {
                 r.matched = state::RadioMatch::None;
@@ -1031,8 +1029,8 @@ impl Client {
                 let mut st = state.write();
                 let Some(r) = st.radio.as_mut() else { return };
                 // Two ways this answer can be stale and one check for both: the
-                // user changed station, or the station moved on while we were
-                // asking. A uuid alone would only catch the first.
+                // user changes station, or the station moves on while the
+                // lookup runs. A uuid alone only catches the first.
                 let current = r.now_title();
                 if r.station.uuid != uuid || current.as_deref() != Some(raw.as_str()) {
                     return;
@@ -1151,8 +1149,8 @@ impl Client {
     /// Pause Spotify if a station owns the device.
     ///
     /// The backstop under every "pause first" in this file. Those all fire
-    /// *before* the thing that would make sound, and a `load` the player was
-    /// still fetching can start after the pause that was meant to prevent it.
+    /// *before* the thing that would make sound, and a `load` the player is
+    /// still fetching can start after the pause meant to prevent it.
     /// This runs off `PlayerEvent::Playing` instead — librespot saying it has
     /// started, whatever asked — so the question is settled by what is
     /// actually making sound rather than by what we last asked for.
@@ -1184,7 +1182,7 @@ impl Client {
 
     /// The volume both engines share, as a percent.
     ///
-    /// Radio inherits whatever Spotify was at, so starting a station does not
+    /// Radio inherits whatever Spotify is at, so starting a station does not
     /// jump the level, and the one slider on the deck keeps meaning one thing.
     fn playback_volume(&self) -> u8 {
         let radio = self.state.read().radio.as_ref().map(|r| r.volume_percent);
@@ -1400,10 +1398,10 @@ impl Client {
 
     /// Fetch the sleeves of the artist page's open album group.
     ///
-    /// Every group but Appears On was fetched when the page loaded, so this is
-    /// a no-op for them — `spawn_page_art` drops the URLs it already holds.
-    /// Switching to Appears On is what finally asks for its sleeves, and
-    /// switching back into it later costs nothing.
+    /// The page load fetches every group but Appears On, so this is a no-op
+    /// for them — `spawn_page_art` drops the URLs it already holds. Switching
+    /// to Appears On is what asks for its sleeves, and switching back into it
+    /// later costs nothing.
     fn load_artist_art(&self) {
         let (urls, generation) = {
             let st = self.state.read();

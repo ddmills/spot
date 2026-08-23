@@ -110,9 +110,8 @@ pub fn sleeve(
 /// slider opposite it.
 ///
 /// The title gets the whole row, because it is what the view is about and a
-/// full-width row is what lets a long one be read. The play state used to
-/// share it; it now sits under the progress track, between previous and next
-/// — see [`transport`].
+/// full-width row is what lets a long one be read. The play state sits under
+/// the progress track instead, between previous and next — see [`transport`].
 ///
 /// Records `hit.volume_slider`, `hit.now_artist` and `hit.now_album`. It does
 /// *not* touch `hit.now_playing`: which region the wheel adjusts volume over
@@ -133,8 +132,7 @@ pub fn masthead(
     let dim = theme::dim();
 
     // Row 0: the track title, as large as a terminal allows, with the liked
-    // control opposite it. The state pill used to hold that end; it moved down to the
-    // transport, which left the one control the deck was missing a home.
+    // control opposite it.
     //
     // Drawn only once the saved state is known — a control that cannot say
     // which way it would go is worse than none at all. `right_row` drops it
@@ -171,8 +169,7 @@ pub fn masthead(
 
     // Row 1: artists · album · year, with the volume slider right-aligned.
     // It starts flush with the title above it, one block rather than two
-    // columns — the indent that used to hang it off the title's leading
-    // note outlived the note itself.
+    // columns.
     if area.height < MASTHEAD_H {
         return;
     }
@@ -391,10 +388,9 @@ pub fn radio_masthead(
 
 /// What a station says about itself when it is not announcing a track.
 ///
-/// Its genres, and nothing else. The country used to follow them here; it is on
-/// [`radio_station_row`] now, along with the station's name and its format, and
-/// a fact said twice on one deck is a fact you have to read twice to find out it
-/// was the same one.
+/// Its genres, and nothing else. The country belongs to [`radio_station_row`],
+/// along with the station's name and its format: a fact said twice on one deck
+/// is a fact you have to read twice to find out it is the same one.
 fn station_subtitle(radio: &RadioPlayback) -> String {
     radio.station.tags.clone()
 }
@@ -493,10 +489,8 @@ fn save_label(saved: bool) -> String {
 /// it broadcasts from, how it sounds, and whether you have kept it.
 ///
 /// Shuffle is not here, and neither is a queue name: there is one stream and no
-/// order to put it in. What there is instead is the one thing the deck could not
-/// act on before. This row used to say `internet radio` (or the station's name)
-/// with the format opposite it, inert on both counts, which spent a whole row
-/// restating what the masthead had already said.
+/// order to put it in. The row carries controls instead, rather than spending
+/// its width restating what the masthead already says.
 ///
 /// The name is white and the rest grey, so the row reads as one fact with its
 /// footnotes rather than as three of equal weight. The country is a link into
@@ -752,8 +746,8 @@ pub fn context_row(
     // rows this number describes.
     let count = format!(" · {} tracks", q.len());
     // The name is clipped rather than the count: the count is three or four
-    // cells and says how much of the queue there is, which a name cut in
-    // half no longer does.
+    // cells and still says how much of the queue there is, which a name cut in
+    // half does not.
     let name_w = text.width.saturating_sub(width(&count) as u16);
     let name = fit(q.name(), name_w as usize).trim_end().to_string();
 
@@ -1036,8 +1030,7 @@ mod tests {
 
     /// The radio deck's transport is the pill and nothing else, so a station
     /// still connecting leaves the row empty rather than offering `■ pause`
-    /// over silence — which is what it used to do, under a corner already
-    /// saying `LOADING`.
+    /// over silence, under a corner already saying `LOADING`.
     #[test]
     fn the_radio_pill_goes_away_while_a_station_connects() {
         let (lines, hit, _) = render(60, 1, |f, a, h| {
@@ -1048,11 +1041,11 @@ mod tests {
     }
 
     /// The `LIVE` bar is a readout, and the row it sits on is where the Spotify
-    /// deck draws a track you can seek by clicking. Starting a station over a
-    /// track used to leave the Spotify gauge's rect lying under it, so a click
-    /// on `LIVE` sent a `SeekTo` to Spirc — a transport command aimed at the
-    /// engine that was not playing, which is one of the ways Spotify ended up
-    /// making sound underneath a station.
+    /// deck draws a track you can seek by clicking. A station started over a
+    /// track must not leave the Spotify gauge's rect lying under it: a click on
+    /// `LIVE` would then send `SeekTo` to Spirc — a transport command aimed at
+    /// the engine that is not playing, which is one of the ways Spotify makes
+    /// sound underneath a station.
     #[test]
     fn the_live_bar_does_not_inherit_the_seek_rect() {
         let pb = transport_state();

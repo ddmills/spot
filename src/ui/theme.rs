@@ -4,38 +4,32 @@ use ratatui::style::{Color, Style};
 
 use crate::cover::Cover;
 
-/// The chrome palette is truecolor rather than the ANSI names it used to be,
-/// so the app looks the same whatever the terminal's 16-colour scheme is —
-/// matching what [`BRIGHT`], [`GREEN`] and [`FLAME`] already did.
+/// The chrome palette is truecolor, so the app looks the same whatever the
+/// terminal's 16-colour scheme is.
 ///
 /// The resting accent is a gold that sits between [`FLAME`]'s gold and orange
-/// stops, so the UI accent is a colour the visualizer is already painting
-/// rather than a fourth hue on the screen. The grey ramp is cooled slightly
-/// against it: a neutral grey next to this much warmth reads as blue-ish, and
-/// a warm grey would muddy into the accent.
+/// stops, so the UI accent is a colour the visualizer already paints rather
+/// than a fourth hue on the screen. The grey ramp is cooled slightly against
+/// it: a neutral grey next to this much warmth reads as blue-ish, and a warm
+/// grey would muddy into the accent.
 pub const ACCENT: Color = Color::Rgb(0xE8, 0xA0, 0x2E);
 pub const TEXT: Color = Color::Rgb(0xAA, 0xB2, 0xB6);
 pub const DIM: Color = Color::Rgb(0x58, 0x61, 0x66);
-/// Search box and toasts. A pale, desaturated yellow rather than the gold it
-/// used to be: against a gold [`ACCENT`] the two would be the same colour,
-/// and the search border would stop reading as a distinct state.
+/// Search box and toasts. A pale, desaturated yellow: against a gold
+/// [`ACCENT`] a gold border would stop reading as a distinct state.
 pub const WARN: Color = Color::Rgb(0xF0, 0xDC, 0x8A);
 /// Emphasis for the selected row and the playing track's own row. Selection is
 /// carried by weight and brightness rather than a filled bar, so it never
 /// competes with the accent-colored "now playing" marker.
 pub const BRIGHT: Color = Color::Rgb(0xE8, 0xF0, 0xF2);
 /// The search field's resting fill, and the only region of the app that is
-/// painted rather than left transparent to the terminal's own ground.
+/// painted rather than left transparent to the terminal's own ground. A fill
+/// says "field" without a border, which this UI declines everywhere else (see
+/// [`super::table::draw_scrollbar`]).
 ///
-/// The prompt used to be a bare run of dim text at the margin, which read as a
-/// stray sentence rather than as a box you could type in. A fill is what says
-/// "field" without a border — and this UI has already decided against borders
-/// everywhere else (see [`super::table::draw_scrollbar`]).
-///
-/// Sat between the terminal's ground and [`DIM`]: dark enough that the row does
-/// not read as a highlight or a selection, light enough that the field has an
-/// edge on a dark terminal. Assuming a dark terminal is a thing the palette
-/// already does — see the truecolor note above.
+/// Sits between the terminal's ground and [`DIM`]: dark enough that the row
+/// does not read as a highlight or a selection, light enough that the field
+/// has an edge on a dark terminal.
 pub const FIELD: Color = Color::Rgb(0x22, 0x27, 0x2B);
 /// The same field under the pointer. Brighter by about as much again, so the
 /// field lights the way every other control does without jumping to the flat
@@ -56,13 +50,16 @@ pub const GREEN: Color = Color::Rgb(GREEN_RGB.0, GREEN_RGB.1, GREEN_RGB.2);
 ///
 /// Brighter than a solid-block palette would need to be: bars are drawn with
 /// half-height `▄` cells, so only half the pixels of each cell are lit.
+///
+/// The stops run green, green, chartreuse, gold, orange, red from the resting
+/// bed to the tips.
 const FLAME: Stops = [
-    (0.00, (0x35, 0xA5, 0x50)), // green, the resting bed
-    (0.46, (0x6F, 0xDE, 0x45)), // green
-    (0.58, (0xD6, 0xE8, 0x33)), // chartreuse — the green/yellow crossover
-    (0.74, (0xFF, 0xC6, 0x2E)), // gold
-    (0.88, (0xFF, 0x8A, 0x22)), // orange
-    (1.00, (0xF5, 0x43, 0x28)), // red tips
+    (0.00, (0x35, 0xA5, 0x50)),
+    (0.46, (0x6F, 0xDE, 0x45)),
+    (0.58, (0xD6, 0xE8, 0x33)),
+    (0.74, (0xFF, 0xC6, 0x2E)),
+    (0.88, (0xFF, 0x8A, 0x22)),
+    (1.00, (0xF5, 0x43, 0x28)),
 ];
 
 /// A visualizer ramp: six colors at fixed positions up the field.
@@ -379,12 +376,12 @@ pub fn stopped_dim() -> Style {
 /// Muted and dark on purpose: the block is a stand-in for artwork, not a
 /// feature, and the `♫` drawn over it has to stay readable on every pair.
 pub const PLACEHOLDER: [([u8; 3], [u8; 3]); 6] = [
-    ([0x1E, 0x2A, 0x38], [0x33, 0x46, 0x52]), // slate
-    ([0x2B, 0x1F, 0x35], [0x46, 0x33, 0x52]), // plum
-    ([0x1C, 0x30, 0x2A], [0x2F, 0x4C, 0x40]), // moss
-    ([0x35, 0x26, 0x1C], [0x52, 0x3E, 0x2C]), // umber
-    ([0x22, 0x25, 0x3A], [0x39, 0x3D, 0x59]), // indigo
-    ([0x33, 0x1E, 0x26], [0x4F, 0x33, 0x3D]), // wine
+    ([0x1E, 0x2A, 0x38], [0x33, 0x46, 0x52]),
+    ([0x2B, 0x1F, 0x35], [0x46, 0x33, 0x52]),
+    ([0x1C, 0x30, 0x2A], [0x2F, 0x4C, 0x40]),
+    ([0x35, 0x26, 0x1C], [0x52, 0x3E, 0x2C]),
+    ([0x22, 0x25, 0x3A], [0x39, 0x3D, 0x59]),
+    ([0x33, 0x1E, 0x26], [0x4F, 0x33, 0x3D]),
 ];
 
 #[cfg(test)]

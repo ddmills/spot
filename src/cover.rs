@@ -1,9 +1,9 @@
 //! Album cover art: fetch, decode, and reduce to a small square of RGB the
 //! player can paint with half-block cells.
 //!
-//! The cover URL rides along with every playback poll (see
-//! [`crate::api::snapshot_from_context`]), so art costs no extra Web API call
-//! — only a GET against Spotify's CDN, which is outside the shared API quota.
+//! The cover URL rides along on the album object every full track carries (see
+//! [`pick_url`]), so art costs no extra Web API call — only a GET against
+//! Spotify's CDN, which is outside the shared API quota.
 //!
 //! Everything here treats the image as untrusted remote data: the host is
 //! checked against an allowlist, the body is capped before it is buffered, and
@@ -320,7 +320,7 @@ pub fn dominant(px: &[[u8; 3]]) -> Option<[u8; 3]> {
 /// [`dominant`]) first, then the strongest hue at least [`MIN_HUE_GAP`]
 /// buckets away from it. Both are raw bucket means rather than lifted colours
 /// — only the hues are wanted here, and the ramp assigns its own saturation
-/// and brightness (see [`crate::ui::theme::viz_color`]).
+/// and brightness.
 ///
 /// A sleeve with only one hue in it — an all-red cover, a duotone — gets that
 /// hue twice, and the ramp then travels in brightness alone: a red record

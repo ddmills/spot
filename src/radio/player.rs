@@ -55,8 +55,8 @@ const BUFFER_BYTES: usize = 512 * 1024;
 /// station takes visibly long to start.
 const PREFETCH_SECONDS: u64 = 5;
 
-/// Assumed bitrate, in kilobits, when the server does not report one. Only
-/// used to size the prefetch.
+/// Assumed bitrate, in kilobits, when the server does not report one. It sizes
+/// the prefetch and nothing else.
 const ASSUMED_KBPS: u64 = 128;
 
 /// Samples buffered before they are handed to the visualizer, as interleaved
@@ -73,10 +73,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// This is the timeout that matters. A `Read` on the stream blocks on a
 /// condvar that only a byte or the end of the download can release, so a server
 /// that accepts the connection and then goes quiet — which happens often
-/// enough in a directory of ten thousand stations — used to block whichever
-/// thread was reading, for ever. That thread is the decoder's, and a decoder
-/// thread that never returns is a radio that cannot be paused, stopped, or
-/// changed. Per-read rather than a total timeout: a broadcast never ends, so
+/// enough in a directory of ten thousand stations — blocks the reading thread
+/// for ever without it. That thread is the decoder's, and a decoder thread
+/// that never returns is a radio that cannot be paused, stopped, or changed.
+/// Per-read rather than a total timeout: a broadcast never ends, so
 /// `Client::timeout` would cut off a healthy station mid-song.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -219,8 +219,8 @@ impl RadioPlayer {
     /// The connect and the decoder are both built here, on the caller's task
     /// and on a blocking-pool thread, and only the finished source goes to the
     /// audio thread. Building the decoder reads the station's first frames, so
-    /// doing it on the audio thread — which is what spot used to do — put a
-    /// network read in the middle of the loop that answers pause and stop.
+    /// doing it on the audio thread would put a network read in the middle of
+    /// the loop that answers pause and stop.
     pub async fn play(&self, url: &str, volume_percent: u8) -> Result<()> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.title.lock() = None;
@@ -345,10 +345,10 @@ impl RadioPlayer {
     /// has happened.
     ///
     /// [`Self::stop`] is not enough on the way out: it queues a command and
-    /// returns, and spot's quit path used to reach the terminal restore — and
-    /// the end of `main` — while a station was still streaming. This blocks on
-    /// the thread's acknowledgement so quitting is audibly silent before the
-    /// UI goes away.
+    /// returns, which lets the quit path reach the terminal restore — and the
+    /// end of `main` — while a station still streams. This blocks on the
+    /// thread's acknowledgement so quitting is audibly silent before the UI
+    /// goes away.
     pub fn shutdown(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.live.store(false, Ordering::SeqCst);

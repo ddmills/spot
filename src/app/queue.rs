@@ -26,7 +26,7 @@ pub struct Queue {
     /// what it has and grows as the pages land — see [`Self::extend`].
     pub loading: bool,
     /// Identity of the source this queue was filled from — the client's
-    /// track-cache key ("liked", "playlist:<id>", …) — when it has one.
+    /// track-cache key (`"liked"`, `"playlist:<id>"`, …) — when it has one.
     /// A page fetch extends only a queue whose key it matches, and the
     /// playlist table marks the playing row by it. `None` for a queue with
     /// no re-fetchable source (search results, top tracks).

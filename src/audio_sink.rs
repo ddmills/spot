@@ -25,9 +25,9 @@ const FADE_STEPS: u32 = 4;
 const FADE_STEP: Duration = Duration::from_millis(3);
 
 /// Queued chunks to keep ahead of the device, matching librespot's own rodio
-/// backend. Chunks run 256-3000 samples, so this is roughly half a second —
-/// enough that a stalled decoder does not glitch, and no longer a latency
-/// problem now that pause drops the queue instead of playing it out.
+/// backend. Chunks run 256-3000 samples, so this is roughly half a second:
+/// enough that a stalled decoder does not glitch, and no latency cost, because
+/// pause drops the queue rather than playing it out.
 const QUEUE_HIGH_WATER: usize = 26;
 
 /// How long to wait for rodio to drain when the queue is full.
@@ -73,7 +73,7 @@ impl Sink for SpotSink {
     /// The ramp is only there to stop a cut mid-waveform clicking; `pause` is
     /// what actually silences the output, and `clear` throws away the queued
     /// audio so a resume picks up where the player says it should rather than
-    /// replaying what was buffered. `clear` drains at one chunk per rodio tick,
+    /// replaying the buffer. `clear` drains at one chunk per rodio tick,
     /// which takes a moment — but the sink is already paused, so none of it is
     /// audible.
     fn stop(&mut self) -> SinkResult<()> {
@@ -105,10 +105,9 @@ impl Sink for SpotSink {
         // librespot's player thread — the thread `Player::drop` joins. A sink
         // that has stopped draining (paused, or on a device that has been
         // suspended or unplugged) would otherwise park that thread forever,
-        // which parks the runtime teardown behind it, which is how spot ended
-        // up still holding the audio device after its window was gone. Two
-        // seconds of no drain is already an audible glitch; returning lets the
-        // player loop notice why.
+        // which parks the runtime teardown behind it, which leaves spot holding
+        // the audio device after its window is gone. Two seconds of no drain is
+        // already an audible glitch; returning lets the player loop notice why.
         //
         // The clock is only read once the queue is actually full, which it
         // usually is not: this runs once per decoded packet.

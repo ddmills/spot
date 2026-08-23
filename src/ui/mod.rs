@@ -72,9 +72,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             ])
             .split(frame.area());
 
-        // One column. The left nav used to take 30 cells of it — its playlists
-        // are a page of their own now, reached from Home, and the pane it was
-        // crowding gets the width back. See `main_pane::draw_playlists`.
+        // One column: the playlists are a page of their own, reached from Home,
+        // so no left rail takes width from the pane. See
+        // `main_pane::draw_playlists`.
         //
         // The page's own contribution to the header — its count, and whether
         // it is still loading — read off before the header is drawn, because
@@ -209,16 +209,16 @@ mod tests {
         let mut searching = browse_state();
         searching.input_mode = crate::app::state::InputMode::Search;
         let after = screen(&mut searching, 100, 34);
-        // The prompt row itself is expected to differ; nothing else may move —
-        // including the path, which is now a row of its own under it.
+        // The prompt row itself is expected to differ; nothing else may move,
+        // the path on the row under it included.
         for y in (0..34).filter(|&y| y != 0) {
             assert_eq!(before[y], after[y], "row {y} moved when search opened");
         }
     }
 
-    /// The pane starts at the screen's own margin now that the rail is gone,
-    /// and its label is simply the page's name — there is no second pane for
-    /// focus to be anywhere else.
+    /// With no rail beside it the pane starts at the screen's own margin, and
+    /// its label is simply the page's name — there is no second pane for focus
+    /// to be anywhere else.
     #[test]
     fn the_pane_spans_the_screen_under_its_label() {
         use crate::ui::theme;
@@ -489,9 +489,9 @@ mod tests {
     }
 
     /// The search row is one box that asks both catalogues, so it says the
-    /// same thing on every page. It used to retarget — Spotify here, the
-    /// station directory there — which made the prompt something you had to
-    /// read before you could trust the key.
+    /// same thing on every page. A prompt that retargets — Spotify here, the
+    /// station directory there — is something you have to read before you can
+    /// trust the key.
     #[test]
     fn the_search_row_says_the_same_thing_on_every_page() {
         use crate::app::state::{RadioScope, RadioView};
@@ -596,8 +596,8 @@ mod tests {
     ///
     /// Ignored by default — it needs a network. Run it with
     /// `cargo test ui::tests::live_radio -- --ignored --nocapture`; it prints
-    /// the page, so a column that no longer fits real station names shows up
-    /// rather than passing an assertion about invented ones.
+    /// the page, so a column too narrow for real station names shows up rather
+    /// than passing an assertion about invented ones.
     #[tokio::test]
     #[ignore]
     async fn live_radio_chart_renders() {

@@ -438,10 +438,9 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
             st.show_help = !st.show_help;
         }
         // An overlay first if one is up; otherwise Esc is the back key the
-        // header's ← is, whichever page draws one. It used to be the album
-        // page's alone, because that was the only page with a ← on it; every
-        // page below Home has one now, so Esc means the same thing on all of
-        // them. On Home there is nothing behind it and Esc does nothing.
+        // header's ← is, whichever page draws one. Every page below Home draws
+        // one, so Esc means the same thing on all of them. On Home there is
+        // nothing behind it and Esc does nothing.
         KeyCode::Esc => {
             let mut st = state.write();
             if st.show_help {
@@ -492,8 +491,7 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
         }
         KeyCode::Char('g') => set_selection(&mut state.write(), 0),
         KeyCode::Char('G') => set_selection(&mut state.write(), usize::MAX),
-        // `Tab`, `1` and `2` used to move focus between the nav and the main
-        // pane. There is one pane now, so there is nothing to move it to.
+        // There is one pane, so no key moves focus between panes.
         KeyCode::Char('H') => go_home(&mut state.write()),
         KeyCode::Char('v') => open_player(&mut state.write(), tx),
 
@@ -683,17 +681,15 @@ fn target_key(cmd: &AppCommand) -> Option<ViewKey> {
 /// send its command, because the page is already on screen or has just been
 /// restored from the stack.
 ///
-/// This is what keeps the path a path. A page you can reach from two
-/// directions used to stack a fresh copy each way round, so bouncing between
-/// an album and its artist grew the history by two a trip and `Esc` had to
-/// walk the whole loop back out. Revisiting now shortens the path instead.
+/// This is what keeps the path a path. Stacking a fresh copy for a page you
+/// can reach from two directions grows the history by two a trip — bouncing
+/// between an album and its artist leaves `Esc` to walk the whole loop back
+/// out. Revisiting shortens the path instead.
 ///
-/// It also subsumes the guard that used to sit in `open_album_of_selection` —
-/// "an album page still shows an Album column, which names the album you are
-/// already on" — and extends it to every command and every entry point.
-/// Pressing `B` on an artist page's own top track was the same bug: the
-/// track's first credited artist *is* the page, so each press stacked a copy
-/// and navigated nowhere.
+/// One guard covers every command and every entry point, because the same case
+/// arrives many ways: an album page shows an Album column naming the album you
+/// are already on, and an artist page's top track credits the artist whose
+/// page it is, so `B` there resolves to the page on screen.
 fn make_way(st: &mut AppState, target: Option<ViewKey>, tx: &UnboundedSender<AppCommand>) -> bool {
     let Some(target) = target else {
         st.push_view();
@@ -1181,9 +1177,9 @@ fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let cmd = match &st.main {
         MainView::Tracks(list) if !list.display.is_empty() => Some(play_list(list, 0)),
         MainView::Tracks(_) => None,
-        // The page's top tracks, played as the list they are. This is where
-        // Spotify radio used to start; spot owns the queue now, and the top
-        // tracks are the page's own answer to "play this artist".
+        // The page's top tracks, played as the list they are: spot owns the
+        // queue, and the top tracks are the page's own answer to "play this
+        // artist".
         MainView::Artist(v) if !v.top.display.is_empty() => Some(AppCommand::Play {
             tracks: display_tracks(&v.top),
             start: 0,
@@ -1290,10 +1286,10 @@ fn open_album_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) 
         return radio_deck_fallback(st, tx, open_deck_album);
     };
     // An album page still shows an Album column, which names the album you are
-    // already on, so this is one of the places re-opening a page you are
-    // standing on used to stack a duplicate. `navigate` now catches that
-    // wherever it happens — including the Album column of a *different* page
-    // that leads back to one already on the path.
+    // already on, so this is one of the places a re-open resolves to the page
+    // on screen. `navigate` catches that wherever it happens — including the
+    // Album column of a *different* page that leads back to one already on the
+    // path.
     navigate(st, cmd, tx);
 }
 
@@ -1454,9 +1450,8 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
         _ => None,
     };
     // On an artist page this resolves to the page's *own* artist — the first
-    // name credited on a top track is the artist whose page it is — so `B`
-    // there used to stack a copy per press and go nowhere. `navigate` sees
-    // the target is the page on screen and does nothing.
+    // name credited on a top track is the artist whose page it is — so
+    // `navigate` sees the target is the page on screen and does nothing.
     match cmd {
         Some(cmd) => navigate(st, cmd, tx),
         // See `open_album_of_selection`: the deck is the fallback, under a
@@ -1659,7 +1654,8 @@ mod tests {
     fn activating_a_row_sends_the_display_order() {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
-        st.main_index = 1; // Hysteria
+        // "Hysteria".
+        st.main_index = 1;
 
         activate_selection(&mut st, &tx);
 
@@ -1878,7 +1874,7 @@ mod tests {
 
     /// Both halves of the artist page name albums on screen, so both must
     /// open them: the Album cell of a top track (row 0 here) and the card
-    /// under it (row 1). The cell used to hover like a link and do nothing.
+    /// under it (row 1). Both hover like links, so both must act like one.
     #[test]
     fn the_artist_page_opens_albums_from_tracks_and_cards() {
         // Either route arrives with the sleeve, so both land on the same
@@ -1910,9 +1906,9 @@ mod tests {
     }
 
     /// The name is the link and the ▶ play is the button; the rest of a card
-    /// is just a row. The whole card used to open its album, which made a
-    /// five-line region behave like one word — and left no way to select a
-    /// card without leaving the page.
+    /// is just a row. A whole card that opens its album makes a five-line
+    /// region behave like one word, and leaves no way to select a card without
+    /// leaving the page.
     #[test]
     fn only_a_card_name_opens_its_album() {
         let (tx, mut rx) = channel();
@@ -1978,13 +1974,13 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// The artist page's `B` used to re-open the artist page.
+    /// The artist page's `B` must not re-open the artist page.
     ///
     /// It resolves the artist off the selected *top track*, and the first name
-    /// credited on a top track is the artist whose page it is — so every press
-    /// stacked a copy of the page and navigated nowhere. Five presses, five
-    /// crumbs, five Backspaces to undo. Same via a single click on the Artist
-    /// column, which has no double-click gate.
+    /// credited on a top track is the artist whose page it is — so an
+    /// unguarded press stacks a copy of the page and navigates nowhere. Five
+    /// presses, five crumbs, five Backspaces to undo. Same via a single click
+    /// on the Artist column, which has no double-click gate.
     #[test]
     fn the_artist_page_does_not_reopen_itself() {
         let (tx, mut rx) = channel();
@@ -2001,9 +1997,9 @@ mod tests {
     /// Revisiting a page walks *back* to it rather than stacking a second
     /// copy, so bouncing between an album and its artist cannot grow the path.
     ///
-    /// It used to grow by two a round trip: the only guard checked the album
-    /// you were standing on, and on the artist page you are standing on an
-    /// artist. Nine trips filled the twenty-frame stack and evicted Home.
+    /// A guard that checks only the album you are standing on lets the path
+    /// grow by two a round trip, because on the artist page you are standing
+    /// on an artist. Nine trips fill the twenty-frame stack and evict Home.
     #[test]
     fn revisiting_a_page_walks_back_to_it() {
         let (tx, mut rx) = channel();
@@ -2058,8 +2054,8 @@ mod tests {
     }
 
     /// The target is only installed when the client answers, so until it does
-    /// every further click pushes the *unchanged* current view. Four clicks on
-    /// a Home row used to leave four copies of Home behind them.
+    /// every further click pushes the *unchanged* current view, so four clicks
+    /// on a Home row must not leave four copies of Home behind them.
     #[test]
     fn mashing_a_row_leaves_one_frame() {
         let (tx, mut rx) = channel();
@@ -2076,8 +2072,8 @@ mod tests {
     }
 
     /// Search is one slot: a new query takes the old one's place wherever it
-    /// sat, rather than stacking beside it. Ten refinements used to leave ten
-    /// frames, each holding a whole cloned `SearchResults`.
+    /// sat, rather than stacking beside it. Otherwise ten refinements leave
+    /// ten frames, each holding a whole cloned `SearchResults`.
     #[test]
     fn a_new_search_replaces_the_old_one() {
         let (tx, mut rx) = channel();
@@ -2107,12 +2103,13 @@ mod tests {
     fn a_search_from_deeper_in_replaces_the_one_on_the_path() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        st.push_view(); // home
+        // Home, then the search, then a page above it.
+        st.push_view();
         st.main = MainView::Search(crate::app::state::SearchResults {
             query: "muse".into(),
             ..Default::default()
         });
-        st.push_view(); // the search
+        st.push_view();
         st.main = MainView::Playlists;
 
         navigate(&mut st, AppCommand::Search("pixies".into()), &tx);
@@ -2122,13 +2119,14 @@ mod tests {
     }
 
     /// Overflow drops the frame above the root, never the root. Home is the
-    /// bottom of this stack and the thing back exists to reach; losing it left
-    /// an album page with nothing behind it, which sent `Esc` oscillating
-    /// between that album and its artist forever.
+    /// bottom of this stack and the thing back exists to reach; losing it
+    /// leaves an album page with nothing behind it, which sends `Esc`
+    /// oscillating between that album and its artist forever.
     #[test]
     fn overflowing_the_stack_keeps_home_at_the_bottom() {
         let mut st = AppState::new();
-        st.push_view(); // home
+        // Home at the bottom, then more pages than the stack holds.
+        st.push_view();
         for i in 0..40 {
             let mut list = TrackList::new(format!("page {i}"), "", None);
             list.cache_key = Some(state::playlist_key(&i.to_string()));
@@ -2170,9 +2168,8 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AppCommand::OpenAlbum { id, .. }) if id == "a2"));
     }
 
-    /// Esc goes back from any page that draws a `←`, which is every page
-    /// below Home. It used to be the album page's key alone, because that was
-    /// the only page with a `←` on it.
+    /// Esc goes back from any page that draws a `←`, which is every page below
+    /// Home.
     #[test]
     fn esc_goes_back_from_any_page_below_home() {
         let esc = KeyEvent::from(KeyCode::Esc);
@@ -2929,16 +2926,17 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AppCommand::VolumeRel(5))));
     }
 
-    /// The one search box asks both catalogues, from wherever it is pressed.
-    /// It used to point at whichever one the page behind it came from, which
-    /// meant the same keystroke did two different things depending on where
-    /// you were standing.
+    /// The one search box asks both catalogues, from wherever it is pressed. A
+    /// prompt that points at whichever one the page behind it came from makes
+    /// the same keystroke do two different things depending on where you are
+    /// standing.
     #[test]
     fn the_prompt_searches_both_catalogues_from_every_page() {
         let (tx, mut rx) = channel();
         let state = Arc::new(RwLock::new(AppState::new()));
 
-        // A radio page: the one that used to be the exception.
+        // A radio page, where the page's own catalogue is the station
+        // directory.
         {
             let mut st = state.write();
             st.main = radio_page(RadioScope::Popular, vec![]);
@@ -2960,10 +2958,8 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "jazz"));
     }
 
-    /// The search row is drawn at the top of the player too, so `/` has to
-    /// reach it from there. It used to be inert in this view, along with the
-    /// keys that act on the invisible panes underneath — but the prompt is on
-    /// screen, and a control you can see and cannot use is worse than none.
+    /// The player draws no prompt (see [`crate::ui::top_row`]), so `/` is
+    /// inert there: nothing on screen would show what you were typing.
     #[test]
     fn slash_is_inert_in_the_player() {
         let (tx, _rx) = channel();
@@ -3075,8 +3071,9 @@ mod tests {
     }
 
     /// The bug the deck-subject accessor exists to stop. While a station
-    /// plays, `playback` still names the last Spotify track — so `★` used to
-    /// like a record that stopped playing when the stream started.
+    /// plays, `playback` still names the last Spotify track, so reading it
+    /// directly makes `★` like a record that stopped playing when the stream
+    /// started.
     #[test]
     fn the_decks_control_likes_the_matched_track_not_the_kept_snapshot() {
         let (tx, mut rx) = channel();
