@@ -27,7 +27,8 @@ use super::main_pane;
 use super::play_state;
 use super::table::{apply_selection, art_w, draw_scrollbar, fit};
 use super::theme;
-use crate::app::state::{AppState, HitAreas, PlaybackSnapshot, TrackList, format_duration};
+use crate::app::queue::Queue;
+use crate::app::state::{AppState, HitAreas, Track, format_duration};
 use crate::cover::Cover;
 use crate::viz::VizState;
 
@@ -369,18 +370,29 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
-    let Some(pb) = playback.as_ref() else {
+    // What is playing is the queue's current track; the transport state says
+    // whether it is. Both have to be there for the deck to have a subject.
+    let track = playback
+        .as_ref()
+        .and(queue.as_ref())
+        .and_then(|q| q.current());
+    let (Some(pb), Some(track)) = (playback.as_ref(), track) else {
         deck::no_playback_hint(frame, header_area);
-        draw_queue(frame, queue_area, None, queue.as_ref(), 0, queue_list, hit);
+        draw_queue(frame, queue_area, queue.as_ref(), 0, queue_list, hit);
         return;
     };
 
     if rows.header > 0 {
-        let like = pb
-            .track_uri
-            .as_ref()
-            .and_then(|uri| liked.get(uri).copied());
-        deck::masthead(frame, header_area, pb, like, mouse, hit);
+        let like = liked.get(&track.uri).copied();
+        deck::masthead(
+            frame,
+            header_area,
+            track,
+            pb.volume_percent,
+            like,
+            mouse,
+            hit,
+        );
 
         // Only the two written rows are the volume wheel's target: a wheel on
         // the blank one below is a scroll. (The bottom bar claims its whole
@@ -394,7 +406,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // The field: beside the cover when there is one, its own band when there
     // is not.
     let field = if rows.art > 0 {
-        draw_block(frame, art_area, pb, state_cover, hit)
+        draw_block(frame, art_area, track, state_cover, hit)
     } else {
         // The stacked field spans the pane; centre the odd cell its stride
         // cannot fill rather than banking it on one side.
@@ -422,7 +434,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             height: 1,
             ..progress_area
         };
-        deck::progress(frame, bar, pb, hit);
+        deck::progress(frame, bar, pb, track.duration_ms, hit);
     }
     if rows.transport > 0 {
         deck::transport(
@@ -443,7 +455,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 height: 1,
                 ..list_head_area
             },
-            pb,
+            pb.shuffle,
             queue.as_ref(),
             mouse,
             hit,
@@ -452,7 +464,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     draw_queue(
         frame,
         queue_area,
-        Some(pb),
         queue.as_ref(),
         *queue_index,
         queue_list,
@@ -472,11 +483,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
 fn draw_block(
     frame: &mut Frame,
     area: Rect,
-    pb: &PlaybackSnapshot,
+    track: &Track,
     cover: Option<&Cover>,
     hit: &mut HitAreas,
 ) -> Rect {
-    let art = deck::sleeve(frame, area, pb, cover, hit);
+    let art = deck::sleeve(frame, area, track, cover, hit);
     Rect {
         x: art.right() + ART_GAP,
         width: area.width.saturating_sub(art.width + ART_GAP),
@@ -655,12 +666,10 @@ impl QueueCols {
 /// duration flush against the bar reads as one mark rather than two.
 const QUEUE_GUTTER: u16 = 2;
 
-#[allow(clippy::too_many_arguments)]
 fn draw_queue(
     frame: &mut Frame,
     area: Rect,
-    playback: Option<&crate::app::state::PlaybackSnapshot>,
-    queue: Option<&TrackList>,
+    queue: Option<&Queue>,
     queue_index: usize,
     queue_list: &mut ratatui::widgets::ListState,
     hit: &mut crate::app::state::HitAreas,
@@ -668,14 +677,14 @@ fn draw_queue(
     if area.height == 0 {
         return;
     }
-    let Some(q) = queue else {
+    let Some(q) = queue.filter(|q| !q.is_empty()) else {
         let row = Rect {
             y: area.y + area.height / 2,
             height: 1,
             ..area
         };
         frame.render_widget(
-            Paragraph::new("no queue — play a playlist or album to fill this")
+            Paragraph::new("no queue — play something to fill this")
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(theme::dim()),
             row,
@@ -691,21 +700,20 @@ fn draw_queue(
         ..area
     };
     hit.player_queue = rows_area;
-    super::clamp_offset(queue_list, q.display.len(), rows_area.height as usize);
+    super::clamp_offset(queue_list, q.len(), rows_area.height as usize);
 
-    // The playing marker resolves by URI each frame, like the main pane.
-    let playing_uri = playback.and_then(|p| p.track_uri.as_deref());
-    let playing =
-        playing_uri.and_then(|uri| q.display.iter().position(|&ti| q.tracks[ti].uri == uri));
+    // The playing marker is the queue's own index — spot owns the play
+    // order, so no URI has to be matched, and a track that appears twice
+    // marks only the row that is actually on.
+    let playing = Some(q.index());
 
-    let cols = QueueCols::new(rows_area.width as usize, q.display.len());
+    let cols = QueueCols::new(rows_area.width as usize, q.len());
     let accent_bold = theme::accent().add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = q
-        .display
+        .rows()
         .iter()
         .enumerate()
-        .map(|(i, &ti)| {
-            let t = &q.tracks[ti];
+        .map(|(i, t)| {
             let prefix = if Some(i) == playing {
                 Span::styled("▶ ", accent_bold)
             } else {
@@ -783,9 +791,7 @@ mod tests {
 
     use super::super::table::VOL_TRACK_W;
     use super::*;
-    use crate::app::state::{
-        CrumbTarget, MainView, PlaybackSnapshot, RepeatMode, Track, TrackListKind,
-    };
+    use crate::app::state::{CrumbTarget, MainView, Playback, TrackList};
 
     fn track(name: &str, artists: &str) -> Track {
         Track {
@@ -802,44 +808,36 @@ mod tests {
         }
     }
 
+    /// Rewrite the playing row, keeping the queue's shape.
+    fn edit_playing(st: &mut AppState, f: impl FnOnce(&mut Track)) {
+        let q = st.queue.as_ref().unwrap();
+        let mut tracks = q.rows().to_vec();
+        let i = q.index();
+        f(&mut tracks[i]);
+        let name = q.name().to_string();
+        st.queue = Some(Queue::new(tracks, i, name));
+    }
+
     fn playing_state() -> AppState {
         let mut st = AppState::new();
         st.show_player = true;
-        st.playback = Some(PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 10_000,
-            duration_ms: 83_000,
-            track_uri: Some("spotify:track:Beta".into()),
-            context_uri: Some("spotify:playlist:p1".into()),
-            artist_id: None,
-            album_id: None,
-            track_name: "Beta".into(),
-            artists: "Bob".into(),
-            album: "Album Name".into(),
-            release_year: "2020".into(),
-            cover_url: None,
-            shuffle: false,
-            repeat: RepeatMode::Off,
-            volume_percent: 50,
-            device_name: "dev".into(),
-            is_local_device: true,
-            fetched_at: std::time::Instant::now(),
-        });
-        let mut q = TrackList::new(
+        // "Beta" is on: the queue is at row 1, and the deck reads that row.
+        let mut q = Queue::new(
+            vec![
+                track("Alpha", "Ann"),
+                track("Beta", "Bob"),
+                track("Gamma", "Cyd"),
+            ],
+            1,
             "My Mix",
-            "by me",
-            Some("spotify:playlist:p1".to_string()),
-            Some(3),
         );
-        q.kind = TrackListKind::Playlist;
-        q.append(vec![
-            track("Alpha", "Ann"),
-            track("Beta", "Bob"),
-            track("Gamma", "Cyd"),
-        ]);
+        q.source_key = Some("playlist:p1".into());
         st.queue = Some(q);
+        let mut pb = Playback::started(50, false);
+        pb.anchor(10_000);
+        st.playback = Some(pb);
         // Samples arriving, which is what "playing" means to the header and
-        // the transport alike: a snapshot claiming to play with a silent tap
+        // the transport alike: a transport claiming to play with a silent tap
         // is a track still loading. See [`super::super::play_state`].
         st.audio_tap.push(&[0.0; 2048], 1.0);
         st
@@ -867,7 +865,7 @@ mod tests {
             name: name.into(),
             image_url: None,
             genres: vec![],
-            top: TrackList::new(name, "", None, None),
+            top: TrackList::new(name, "", None),
             albums: vec![],
             display: Vec::new(),
             tab: crate::app::state::ArtistTab::Albums,
@@ -904,7 +902,7 @@ mod tests {
         st.push_view();
         st.main = MainView::Artist(artist("Muse"));
         st.push_view();
-        st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+        st.main = MainView::Tracks(TrackList::new("Black Holes", "", None));
 
         let lines = render_raw(&mut st, 80, 26);
         assert!(
@@ -944,7 +942,7 @@ mod tests {
         st.push_view();
         st.main = MainView::Artist(artist("Muse"));
         st.push_view();
-        st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+        st.main = MainView::Tracks(TrackList::new("Black Holes", "", None));
         let lines = render_raw(&mut st, 30, 26);
         assert!(lines[0].starts_with(" ♫ spot"), "{:?}", lines[0]);
         assert!(!lines[0].contains('›'), "{:?}", lines[0]);
@@ -962,7 +960,7 @@ mod tests {
         let short = |h: u16| {
             let mut st = playing_state();
             st.push_view();
-            st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+            st.main = MainView::Tracks(TrackList::new("Black Holes", "", None));
             let lines = render_raw(&mut st, 80, h);
             (st, lines)
         };
@@ -1110,8 +1108,9 @@ mod tests {
     #[test]
     fn the_masthead_spans_the_pane_above_the_cover() {
         let mut st = playing_state();
-        st.playback.as_mut().unwrap().track_name =
-            "A Title Long Enough To Have Been Clipped By The Old Column".into();
+        edit_playing(&mut st, |t| {
+            t.name = "A Title Long Enough To Have Been Clipped By The Old Column".into()
+        });
         let lines = render(&mut st, 80, 26);
         assert!(
             lines[0].contains("Been Clipped By The Old Column"),
@@ -1363,7 +1362,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("no queue — play a playlist or album"))
+                .any(|l| l.contains("no queue — play something"))
         );
         assert!(st.hit.player_queue.is_empty());
     }
@@ -1388,9 +1387,7 @@ mod tests {
     #[test]
     fn list_header_names_the_queue() {
         let mut st = playing_state();
-        let mut q = TrackList::new("Search results", "", None, None);
-        q.append(vec![track("Alpha", "Ann")]);
-        st.queue = Some(q);
+        st.queue = Some(Queue::new(vec![track("Alpha", "Ann")], 0, "Search results"));
         let lines = render(&mut st, 80, 26);
         assert!(
             lines[19].contains("Search results · 1 tracks"),
@@ -1529,12 +1526,20 @@ mod tests {
         assert_ne!(marker(true).1, paused_fg);
     }
 
-    /// The number is the row's position on screen. `display` is a permutation
-    /// of `tracks`, so `Track::track_number` would drift out of step with it.
+    /// The number is the row's position on screen — the play order itself —
+    /// so `Track::track_number` never figures into it.
     #[test]
-    fn queue_numbers_follow_display_order() {
+    fn queue_numbers_follow_play_order() {
         let mut st = playing_state();
-        st.queue.as_mut().unwrap().display.reverse();
+        st.queue = Some(Queue::new(
+            vec![
+                track("Gamma", "Cyd"),
+                track("Beta", "Bob"),
+                track("Alpha", "Ann"),
+            ],
+            1,
+            "My Mix",
+        ));
         let lines = render(&mut st, 80, 26);
         assert!(lines[21].contains(" 1   Gamma"), "{:?}", lines[21]);
         assert!(lines[23].contains(" 3   Alpha"), "{:?}", lines[23]);
@@ -1723,7 +1728,8 @@ mod tests {
         let swatch = |album_id: Option<&str>| {
             let mut st = playing_state();
             st.cover = None;
-            st.playback.as_mut().unwrap().album_id = album_id.map(Into::into);
+            let id = album_id.map(str::to_string);
+            edit_playing(&mut st, |t| t.album_id = id);
             let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
             terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
             let buffer = terminal.backend().buffer().clone();
@@ -1803,9 +1809,10 @@ mod tests {
         assert!(st.hit.now_album.is_empty(), "linked without an album id");
 
         let mut st = playing_state();
-        let pb = st.playback.as_mut().unwrap();
-        pb.artist_id = Some("art1".into());
-        pb.album_id = Some("alb1".into());
+        edit_playing(&mut st, |t| {
+            t.artist_id = Some("art1".into());
+            t.album_id = Some("alb1".into());
+        });
         render(&mut st, 100, 26);
         // Both sit on the one metadata row, the album after the separator.
         assert_eq!(st.hit.now_artist.y, BRAND_H + 1);
@@ -1826,9 +1833,10 @@ mod tests {
     #[test]
     fn the_album_line_keeps_a_name_that_repeats_the_track() {
         let mut st = playing_state();
-        let pb = st.playback.as_mut().unwrap();
-        pb.album = "Beta".into();
-        pb.album_id = Some("alb1".into());
+        edit_playing(&mut st, |t| {
+            t.album = "Beta".into();
+            t.album_id = Some("alb1".into());
+        });
         let lines = render(&mut st, 80, 26);
         assert!(lines[1].contains("Bob · Beta · 2020"), "{:?}", lines[1]);
         assert!(!st.hit.now_album.is_empty(), "the album lost its link");

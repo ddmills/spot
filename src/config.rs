@@ -4,8 +4,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const DEVICE_NAME: &str = "spot";
-
 pub fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .context("could not determine config directory")?

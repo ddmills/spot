@@ -24,7 +24,6 @@ use anyhow::{Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, EventStream};
 use crossterm::terminal::SetTitle;
 use futures::StreamExt;
-use librespot_metadata::audio::{AudioItem, UniqueFields};
 use librespot_playback::player::{PlayerEvent, PlayerEventChannel};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -32,7 +31,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::api::Api;
 use crate::app::command::AppCommand;
-use crate::app::state::{self, AppState, LocalPlayback};
+use crate::app::state::AppState;
 use crate::client::Client;
 
 /// Below this the browse pane starts shedding columns and art; the UI still
@@ -104,17 +103,10 @@ async fn run() -> Result<()> {
         .await
         .context("auth task panicked")??;
 
-    println!(
-        "starting playback engine (Connect device \"{}\")...",
-        config::DEVICE_NAME
-    );
-    let (session, spirc, spirc_task, audio_tap, mixer, player_events) = session::build().await?;
-    let _spirc_join = tokio::spawn(spirc_task);
+    println!("starting playback engine...");
+    let (session, player, audio_tap, mixer, player_events) = session::build().await?;
 
-    let api = Api::new(
-        auth::to_rspotify_token(&token),
-        session.device_id().to_string(),
-    );
+    let api = Api::new(auth::to_rspotify_token(&token));
     tokio::spawn(token_refresh_loop(api.clone(), token.expires_at));
 
     let state = Arc::new(RwLock::new(AppState::new()));
@@ -126,25 +118,27 @@ async fn run() -> Result<()> {
         st.radio_favorites = config::load_radio();
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    // Playback truth for our own device, ahead of the Web API poll by a
-    // second or more: librespot says when it really started and stopped.
-    let local = Arc::new(LocalPlayback::default());
     tokio::spawn(player_event_loop(
         player_events,
         Arc::clone(&state),
-        Arc::clone(&local),
         tx.clone(),
     ));
     // The radio player writes into the same tap librespot's sink does, so the
     // visualizer follows whichever engine is playing. The client is also the
     // only holder of the handles that can stop either engine, so quitting has
     // to ask it and wait for the answer — see the shutdown block below.
-    let (client, shutdown_done) =
-        Client::new(api, spirc, mixer, local, Arc::clone(&state), rx, audio_tap);
+    let (client, shutdown_done) = Client::new(
+        api,
+        session,
+        player,
+        mixer,
+        Arc::clone(&state),
+        rx,
+        audio_tap,
+    );
     tokio::spawn(client.run());
 
     let _ = tx.send(AppCommand::LoadPlaylists);
-    let _ = tx.send(AppCommand::RefreshPlayback);
 
     let terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -204,7 +198,14 @@ async fn run_tui(
         if st.should_quit {
             break;
         }
-        let title = window_title(st.playback.as_ref(), st.radio.as_ref());
+        // The playing Spotify track is the queue's current row — but only
+        // once something has actually played (see `AppState::playback`).
+        let playing = st
+            .playback
+            .as_ref()
+            .and(st.queue.as_ref())
+            .and_then(|q| q.current());
+        let title = window_title(playing, st.radio.as_ref());
         if title != last_title {
             let _ = crossterm::execute!(std::io::stdout(), SetTitle(&title));
             last_title = title;
@@ -272,14 +273,14 @@ fn warn_about_terminal() {
 /// the OSC title sequence, so they are stripped, and the whole thing is
 /// capped to a title-bar-friendly width.
 fn window_title(
-    playback: Option<&app::state::PlaybackSnapshot>,
+    playing: Option<&app::state::Track>,
     radio: Option<&app::state::RadioPlayback>,
 ) -> String {
     const MAX_WIDTH: usize = 80;
     // Radio wins, for the same reason the deck draws it first: while a station
-    // is on, the Spotify snapshot is kept but paused, and naming it in the
+    // is on, the Spotify queue is kept but paused, and naming it in the
     // taskbar would point at the wrong sound.
-    let full = match (radio, playback) {
+    let full = match (radio, playing) {
         // Spotify's spelling of the record where there is one, so the title
         // bar and the deck say the same thing; the station's own words where
         // there is not.
@@ -288,7 +289,7 @@ fn window_title(
             (None, Some(title)) => format!("♫ {title} — {}", r.station.name),
             (None, None) => format!("♫ {}", r.station.name),
         },
-        (None, Some(pb)) => format!("♫ {} — {}", pb.track_name, pb.artists),
+        (None, Some(t)) => format!("♫ {} — {}", t.name, t.artists),
         (None, None) => return "spot".to_string(),
     };
     let mut out = String::new();
@@ -308,167 +309,76 @@ fn window_title(
 /// Follow librespot's own player, which knows what the audio is doing the
 /// moment it changes.
 ///
-/// Everything else about playback comes from `/me/player`, polled every three
-/// seconds and lagging Spotify's backend besides. That is fine for what is
-/// playing and useless for whether it is playing: a pause has to show on the
-/// keypress, not a second later, and a snapshot that arrives mid-flight would
-/// otherwise flip the pill back.
-///
-/// It also knows *what* is playing, which is the other half of the same
-/// problem: two tracks of one album run into each other with no command in
-/// between, so nothing arms the four-hundred-millisecond re-poll and the deck
-/// keeps the finished record's title and sleeve until the next three-second
-/// tick. `TrackChanged` carries the whole item — name, artists, album, length
-/// and artwork — and arrives as the audio does. See
-/// [`AppState::track_changed`].
-///
-/// Only our own device is followed. When something else is playing, librespot
-/// is idle and has nothing to say about it.
+/// spot owns the queue, so this loop no longer decides *what* is playing —
+/// the client wrote that into the queue before it asked the player for
+/// anything. What the player still knows first is what the audio is *doing*:
+/// when it really started, paused, moved, or ran out, and what artwork the
+/// loaded metadata carries.
 async fn player_event_loop(
     mut events: PlayerEventChannel,
     state: Arc<RwLock<AppState>>,
-    local: Arc<LocalPlayback>,
     tx: UnboundedSender<AppCommand>,
 ) {
-    /// Re-anchor progress on a snapshot, but only if it describes our device.
-    fn anchor(pb: &mut state::PlaybackSnapshot, position_ms: u32) {
-        pb.progress_ms = u64::from(position_ms).min(pb.duration_ms);
-        pb.fetched_at = Instant::now();
-    }
-
-    /// The track an event is about, as the URI spot spells track ids in.
-    ///
-    /// `None` for the events that are about the player rather than a track —
-    /// a volume change, say, which applies whatever is on.
-    fn subject(event: &PlayerEvent) -> Option<String> {
-        use PlayerEvent::*;
-        match event {
-            Stopped { track_id, .. }
-            | Loading { track_id, .. }
-            | Preloading { track_id }
-            | Playing { track_id, .. }
-            | Paused { track_id, .. }
-            | TimeToPreloadNextTrack { track_id, .. }
-            | EndOfTrack { track_id, .. }
-            | Unavailable { track_id, .. }
-            | PositionCorrection { track_id, .. }
-            | PositionChanged { track_id, .. }
-            | Seeked { track_id, .. } => track_id.to_uri().ok(),
-            _ => None,
-        }
-    }
-
-    /// The deck's view of a librespot `AudioItem`.
-    ///
-    /// Episodes and local files go through `UniqueFields` variants that carry
-    /// no artist list or album, so those read blank rather than being made up.
-    fn now_playing(item: &AudioItem) -> state::NowPlaying {
-        let (artists, album, artist_id) = match &item.unique_fields {
-            UniqueFields::Track { artists, album, .. } => (
-                artists
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                album.clone(),
-                // The first credited artist, matching what the poll puts here
-                // and what the deck's artist link opens. A bare id, not a URI:
-                // the click site builds `spotify:artist:{id}` from it.
-                artists.first().and_then(|a| a.id.to_id().ok()),
-            ),
-            _ => (String::new(), String::new(), None),
+    /// Re-anchor progress on the transport state, if there is one yet.
+    fn anchor(state: &RwLock<AppState>, position_ms: u32, playing: Option<bool>) {
+        let mut st = state.write();
+        let Some(pb) = st.playback.as_mut() else {
+            return;
         };
-        let covers: Vec<(&str, u32)> = item
-            .covers
-            .iter()
-            .map(|c| (c.url.as_str(), c.width.max(0).min(c.height.max(0)) as u32))
-            .collect();
-        state::NowPlaying {
-            track_uri: item.uri.clone(),
-            track_name: item.name.clone(),
-            artists,
-            album,
-            artist_id,
-            duration_ms: u64::from(item.duration_ms),
-            cover_url: cover::pick_sized(&covers),
+        if let Some(playing) = playing {
+            pb.is_playing = playing;
         }
+        pb.anchor(u64::from(position_ms));
     }
 
     while let Some(event) = events.recv().await {
-        // librespot is the authority on what is playing, and this is it saying
-        // so — including when it is not what was asked for, which is what
-        // shuffle does to a play that named a track.
-        if let PlayerEvent::TrackChanged { audio_item } = &event {
-            let now = now_playing(audio_item);
-            let art = now.cover_url.clone();
-            state.write().track_changed(now);
-            // The client owns the fetch and its cache; it skips the work when
-            // the sleeve is already up, which two tracks of one album is.
-            let _ = tx.send(AppCommand::LoadPlayingCover { cover_url: art });
-            continue;
-        }
-
-        // The only place spot hears librespot start making sound regardless of
-        // who asked it to — our own play, a `load` that arrived over the dealer
-        // after we had paused, or another Connect client resuming our device.
-        // The client decides what to do about it; this loop only reports it,
-        // because it cannot see the radio engine. See
-        // [`AppCommand::YieldToRadio`].
-        //
-        // Above the filter below, not under it: that one drops events about a
-        // track being left, and a station playing over one is exactly a case
-        // where the deck has moved on and the audio has not.
-        if matches!(event, PlayerEvent::Playing { .. }) {
-            let _ = tx.send(AppCommand::YieldToRadio);
-        }
-
-        // Across a switch, events about the track being left are still in
-        // flight — starting with the `Paused` our own pause caused, carrying
-        // that track's position. Applying those would undo the deck the click
-        // just painted. Only those are dropped: anything else is news, and an
-        // earlier version of this dropped everything that was not the track we
-        // had asked for, which left the deck describing our guess while
-        // something else played.
-        {
-            let st = state.read();
-            if let (Some(pending), Some(about)) = (&st.pending_play, subject(&event)) {
-                let leaving = pending.prev_uri.as_deref() == Some(about.as_str());
-                let expected = pending.expect_uri.as_deref() == Some(about.as_str());
-                if leaving && !expected {
-                    continue;
-                }
-            }
-        }
-
-        let playing = match &event {
-            PlayerEvent::Playing { .. } => Some(true),
-            PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } => Some(false),
-            _ => None,
-        };
-        if let Some(playing) = playing {
-            local.set_playing(playing);
-        }
-
-        let mut st = state.write();
-        let Some(pb) = st.playback.as_mut().filter(|pb| pb.is_local_device) else {
-            continue;
-        };
         match event {
+            // The metadata librespot loaded for the playing track, artwork
+            // included. The queue's own row may have arrived without a cover
+            // URL (an album's track list does not repeat the album object per
+            // row), so this is what fills the sleeve for those. The client
+            // owns the fetch and its cache; it skips the work when the same
+            // sleeve is already up, which two tracks of one album is.
+            PlayerEvent::TrackChanged { audio_item } => {
+                let covers: Vec<(&str, u32)> = audio_item
+                    .covers
+                    .iter()
+                    .map(|c| (c.url.as_str(), c.width.max(0).min(c.height.max(0)) as u32))
+                    .collect();
+                let _ = tx.send(AppCommand::LoadPlayingCover {
+                    cover_url: cover::pick_sized(&covers),
+                });
+            }
+            // The track ran out. The client owns both the queue and the
+            // player, so it is the one that advances and loads — one owner,
+            // no race.
+            PlayerEvent::EndOfTrack { .. } => {
+                let _ = tx.send(AppCommand::TrackEnded);
+            }
+            PlayerEvent::TimeToPreloadNextTrack { .. } => {
+                let _ = tx.send(AppCommand::PreloadNext);
+            }
             PlayerEvent::Playing { position_ms, .. } => {
-                pb.is_playing = true;
-                anchor(pb, position_ms);
+                // The only place spot hears librespot start making sound for
+                // any reason — including a load that landed after a station
+                // took the output device. The client decides what to do about
+                // it; this loop only reports it, because it cannot see the
+                // radio engine. See [`AppCommand::YieldToRadio`].
+                let _ = tx.send(AppCommand::YieldToRadio);
+                anchor(&state, position_ms, Some(true));
             }
             PlayerEvent::Paused { position_ms, .. } => {
-                pb.is_playing = false;
-                anchor(pb, position_ms);
+                anchor(&state, position_ms, Some(false));
             }
-            PlayerEvent::Stopped { .. } => pb.is_playing = false,
+            PlayerEvent::Stopped { .. } => {
+                if let Some(pb) = state.write().playback.as_mut() {
+                    pb.is_playing = false;
+                }
+            }
             PlayerEvent::Seeked { position_ms, .. }
-            | PlayerEvent::PositionCorrection { position_ms, .. } => anchor(pb, position_ms),
-            // Covers our own volume keys and a change sent from another
-            // Connect client, which Spirc applies to the mixer the same way.
-            PlayerEvent::VolumeChanged { volume } => {
-                pb.volume_percent = client::raw_to_pct(volume);
+            | PlayerEvent::PositionChanged { position_ms, .. }
+            | PlayerEvent::PositionCorrection { position_ms, .. } => {
+                anchor(&state, position_ms, None);
             }
             _ => {}
         }

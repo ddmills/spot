@@ -1,4 +1,20 @@
-use crate::app::state::{RadioScope, Station};
+use crate::app::state::{RadioScope, Station, Track};
+
+/// A playable source whose rows are not in hand yet — a playlist played from
+/// its row, an album played from its card. The client fetches the pages and
+/// fills the queue as they land; see `Client::play_fetched`.
+#[derive(Debug, Clone)]
+pub enum FetchSource {
+    Playlist {
+        id: String,
+    },
+    /// Name and year ride along because the album-tracks endpoint does not
+    /// return them per track.
+    Album {
+        id: String,
+        year: String,
+    },
+}
 
 /// Commands sent from the UI/event layer to the client task.
 #[derive(Debug, Clone)]
@@ -10,24 +26,40 @@ pub enum AppCommand {
     SeekRel(i64),
     /// Seek to an absolute position in milliseconds (progress-bar click).
     SeekTo(u64),
-    /// Volume delta in Web-API percent (may be negative).
+    /// Volume delta in percent (may be negative).
     VolumeRel(i8),
-    /// Set absolute volume in Web-API percent (volume-slider click).
+    /// Set absolute volume in percent (volume-slider click).
     SetVolume(u8),
     ToggleShuffle,
 
-    /// Start playback of a context (playlist/album/artist), optionally at a
-    /// specific track offset within it.
-    PlayContext {
-        context_uri: String,
-        offset_uri: Option<String>,
+    /// Install a new queue and start playing `tracks[start]`. The tracks are
+    /// the caller's display order — what you see is the play order.
+    ///
+    /// `key` is the source's track-cache key when the list is a re-fetchable
+    /// context in its natural order; with `loading` true, pages still landing
+    /// in the view extend the queue as they arrive.
+    Play {
+        tracks: Vec<Track>,
+        start: usize,
+        name: String,
+        key: Option<String>,
+        loading: bool,
     },
-    /// Start playback of a flat list of track URIs, starting at `offset`.
-    PlayTracks {
-        uris: Vec<String>,
-        offset: usize,
+    /// Play a source whose rows are not loaded yet, from the top: fetch its
+    /// pages and grow the queue as they land.
+    PlayFetched {
+        source: FetchSource,
+        name: String,
     },
-    AddToQueue(String),
+    /// Enter on a queue row: play that row of the queue as it stands.
+    JumpTo(usize),
+    /// `a`: put a track directly after the playing one.
+    QueueInsertNext(Track),
+    /// librespot reached the end of the playing track: advance and load.
+    TrackEnded,
+    /// librespot wants the next track fetched ahead of the gap.
+    PreloadNext,
+
     /// `L`, the liked column, and the deck's control: save or unsave one track.
     SetLiked {
         uri: String,
@@ -39,9 +71,6 @@ pub enum AppCommand {
     LoadPlaylistTracks {
         playlist_id: String,
     },
-    RefreshPlayback,
-    /// (Re)load the player view's queue from the playing context.
-    LoadQueue,
     /// Open a browsable album view. Metadata rides along because the
     /// album-tracks endpoint doesn't return it.
     OpenAlbum {
@@ -64,11 +93,10 @@ pub enum AppCommand {
     },
     /// Install the sleeve for the track that has just started playing.
     ///
-    /// The playing slot's twin of [`Self::LoadViewCover`]. Sent from the
-    /// librespot event loop, which learns of a track change the moment it
-    /// happens and carries the artwork with it — where the `/me/player` poll
-    /// that would otherwise drive this is up to three seconds behind, and does
-    /// not run at all between two tracks of one album.
+    /// Sent from the librespot event loop on `TrackChanged`, which carries
+    /// the artwork with the metadata — it is what fills the sleeve for rows
+    /// that arrived without a cover URL of their own (an album's track list
+    /// does not repeat the album object per row).
     LoadPlayingCover {
         cover_url: Option<String>,
     },
@@ -112,14 +140,9 @@ pub enum AppCommand {
     /// the device.
     ///
     /// Sent from the player event loop on every `Playing`, because that loop
-    /// hears librespot start *whoever* asked it to — our own play, a `load`
-    /// arriving late over the dealer, or a phone resuming our Connect device —
-    /// and it is the only signal that covers all three. The client answers it,
-    /// because only the client knows whether the radio engine is streaming.
-    ///
-    /// A no-op in the ordinary case, which is why it is not listed in
-    /// `command_touches_playback`: nothing here changes what is playing unless
-    /// two things already are.
+    /// hears librespot start for *any* reason — including a load that landed
+    /// after a station took the device. The client answers it, because only
+    /// the client knows whether the radio engine is streaming.
     YieldToRadio,
 
     /// Quit: silence both engines and end the client loop.

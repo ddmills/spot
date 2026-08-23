@@ -1,19 +1,14 @@
-use std::time::Instant;
-
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::http::Query;
 use rspotify::model::{
-    AlbumId, ArtistId, CurrentPlaybackContext, FullTrack, Id, LibraryId, Offset, PlayContextId,
-    PlayableId, PlayableItem, PlaylistId, RepeatState, SearchResult, SearchType, SimplifiedAlbum,
-    SimplifiedPlaylist, TrackId,
+    AlbumId, ArtistId, FullTrack, Id, LibraryId, PlayableItem, PlaylistId, SearchResult,
+    SearchType, SimplifiedAlbum, SimplifiedPlaylist, TrackId,
 };
 use rspotify::{AuthCodeSpotify, Token};
 use serde::Deserialize;
 
-use crate::app::state::{
-    AlbumItem, ArtistItem, PlaybackSnapshot, Playlist, RepeatMode, SearchResults, Track,
-};
+use crate::app::state::{AlbumItem, ArtistItem, Playlist, SearchResults, Track};
 
 pub const PAGE_LIMIT: u32 = 50;
 /// Pages of an artist's catalogue to walk before giving up on the rest.
@@ -59,32 +54,18 @@ struct RawArtist {
 #[derive(Clone)]
 pub struct Api {
     client: AuthCodeSpotify,
-    /// librespot's device id — every playback command targets our own device.
-    device_id: String,
 }
 
 impl Api {
-    pub fn new(token: Token, device_id: String) -> Self {
+    pub fn new(token: Token) -> Self {
         Self {
             client: AuthCodeSpotify::from_token(token),
-            device_id,
         }
     }
 
     /// Swap in a refreshed token (rspotify shares it via Arc<Mutex<..>>).
     pub async fn update_token(&self, token: Token) {
         *self.client.get_token().lock().await.unwrap() = Some(token);
-    }
-
-    pub async fn playback(&self) -> Result<Option<PlaybackSnapshot>> {
-        let ctx = self
-            .client
-            .current_playback(None, None::<&[_]>)
-            .await
-            .context("failed to fetch playback state")?;
-        Ok(ctx
-            .as_ref()
-            .and_then(|c| snapshot_from_context(c, &self.device_id)))
     }
 
     /// The signed-in user's Spotify id.
@@ -222,29 +203,6 @@ impl Api {
             .client
             .search(query, kind, None, None, Some(30), None)
             .await?)
-    }
-
-    pub async fn play_context(&self, context_uri: &str, offset_uri: Option<&str>) -> Result<()> {
-        let id = context_id_from_uri(context_uri)?;
-        let offset = offset_uri.map(|u| Offset::Uri(u.to_string()));
-        self.client
-            .start_context_playback(id, Some(&self.device_id), offset, None)
-            .await
-            .context("failed to start playback")?;
-        Ok(())
-    }
-
-    pub async fn play_uris(&self, uris: &[String], offset: usize) -> Result<()> {
-        let ids: Vec<PlayableId> = uris
-            .iter()
-            .filter_map(|u| TrackId::from_uri(u).ok().map(PlayableId::Track))
-            .collect();
-        let offset_uri = uris.get(offset).cloned().map(Offset::Uri);
-        self.client
-            .start_uris_playback(ids, Some(&self.device_id), offset_uri, None)
-            .await
-            .context("failed to start playback")?;
-        Ok(())
     }
 
     /// One page of an album's tracks: (tracks, has_more, source total).
@@ -395,27 +353,6 @@ impl Api {
         })?;
         Ok(())
     }
-
-    pub async fn add_to_queue(&self, uri: &str) -> Result<()> {
-        let id = TrackId::from_uri(uri)?;
-        self.client
-            .add_item_to_queue(PlayableId::Track(id), Some(&self.device_id))
-            .await
-            .context("failed to queue track")?;
-        Ok(())
-    }
-}
-
-fn context_id_from_uri(uri: &str) -> Result<PlayContextId<'_>> {
-    if uri.starts_with("spotify:playlist:") {
-        Ok(PlayContextId::Playlist(PlaylistId::from_uri(uri)?))
-    } else if uri.starts_with("spotify:album:") {
-        Ok(PlayContextId::Album(AlbumId::from_uri(uri)?))
-    } else if uri.starts_with("spotify:artist:") {
-        Ok(PlayContextId::Artist(ArtistId::from_uri(uri)?))
-    } else {
-        Err(anyhow!("unsupported context uri: {uri}"))
-    }
 }
 
 fn artists_line(artists: &[rspotify::model::SimplifiedArtist]) -> String {
@@ -476,7 +413,6 @@ fn track_from_simplified(
 fn playlist_from_simplified(p: &SimplifiedPlaylist) -> Playlist {
     Playlist {
         id: p.id.id().to_string(),
-        uri: p.id.uri(),
         name: p.name.clone(),
         track_count: p.items.total,
         owner: p
@@ -535,80 +471,5 @@ fn album_from_raw(a: &RawAlbum) -> Option<AlbumItem> {
             .unwrap_or_default(),
         track_count: a.total_tracks.unwrap_or(0),
         cover_url: crate::cover::pick_url(&a.images),
-    })
-}
-
-fn snapshot_from_context(
-    ctx: &CurrentPlaybackContext,
-    device_id: &str,
-) -> Option<PlaybackSnapshot> {
-    // Wide, but every field comes from the same `match` on the item kind, and
-    // splitting it would mean matching twice.
-    let (
-        track_uri,
-        track_name,
-        artists,
-        album,
-        release_year,
-        cover_url,
-        duration_ms,
-        artist_id,
-        album_id,
-    ) = match ctx.item.as_ref()? {
-        PlayableItem::Track(t) => (
-            t.id.as_ref().map(|id| id.uri()),
-            t.name.clone(),
-            artists_line(&t.artists),
-            t.album.name.clone(),
-            release_year(t.album.release_date.as_deref()),
-            crate::cover::pick_url(&t.album.images),
-            t.duration.num_milliseconds().max(0) as u64,
-            t.artists
-                .first()
-                .and_then(|a| a.id.as_ref())
-                .map(|id| id.id().to_string()),
-            t.album.id.as_ref().map(|id| id.id().to_string()),
-        ),
-        PlayableItem::Episode(e) => (
-            None,
-            e.name.clone(),
-            e.show.name.clone(),
-            "podcast".to_string(),
-            release_year(Some(e.release_date.as_str())),
-            // Episodes carry their own art; Spotify falls back to the show's
-            // server-side when they don't.
-            crate::cover::pick_url(&e.images),
-            e.duration.num_milliseconds().max(0) as u64,
-            None,
-            None,
-        ),
-        PlayableItem::Unknown(_) => return None,
-    };
-    Some(PlaybackSnapshot {
-        is_playing: ctx.is_playing,
-        context_uri: ctx.context.as_ref().map(|c| c.uri.clone()),
-        artist_id,
-        album_id,
-        progress_ms: ctx
-            .progress
-            .map(|d| d.num_milliseconds().max(0) as u64)
-            .unwrap_or(0),
-        duration_ms,
-        track_uri,
-        track_name,
-        artists,
-        album,
-        release_year,
-        cover_url,
-        shuffle: ctx.shuffle_state,
-        repeat: match ctx.repeat_state {
-            RepeatState::Off => RepeatMode::Off,
-            RepeatState::Context => RepeatMode::Context,
-            RepeatState::Track => RepeatMode::Track,
-        },
-        volume_percent: ctx.device.volume_percent.unwrap_or(0).min(100) as u8,
-        device_name: ctx.device.name.clone(),
-        is_local_device: ctx.device.id.as_deref() == Some(device_id),
-        fetched_at: Instant::now(),
     })
 }

@@ -96,7 +96,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
 
-    let Some(pb) = playback else {
+    // What is playing is the queue's current track; the transport state says
+    // whether it is. Both have to be there for the deck to have a subject.
+    let track = playback
+        .as_ref()
+        .and(queue.as_ref())
+        .and_then(|q| q.current());
+    let (Some(pb), Some(track)) = (playback.as_ref(), track) else {
         deck::no_playback_hint(frame, body);
         return;
     };
@@ -113,7 +119,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 height: ART_H,
                 ..body
             },
-            pb,
+            track,
             cover,
             hit,
         );
@@ -129,11 +135,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Rows 0-1: the title, then the metadata with the volume slider opposite.
     // The play state used to hold the title's right edge; it now sits under
     // the progress track, between previous and next.
-    let like = pb
-        .track_uri
-        .as_ref()
-        .and_then(|uri| liked.get(uri).copied());
-    deck::masthead(frame, text, pb, like, mouse, hit);
+    let like = liked.get(&track.uri).copied();
+    deck::masthead(frame, text, track, pb.volume_percent, like, mouse, hit);
 
     // The whole bar is the wheel target, sleeve included, which is wider than
     // the two rows `masthead` claims for the player's benefit. Assigned after
@@ -163,6 +166,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ..text
         },
         pb,
+        track.duration_ms,
         hit,
     );
 
@@ -194,7 +198,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             height: 1,
             ..text
         },
-        pb,
+        pb.shuffle,
         queue.as_ref(),
         mouse,
         hit,
@@ -285,7 +289,8 @@ mod tests {
 
     use super::super::table::VOL_TRACK_W;
     use super::*;
-    use crate::app::state::{PlaybackSnapshot, RepeatMode, Track, TrackList};
+    use crate::app::queue::Queue;
+    use crate::app::state::{Playback, Track};
 
     /// Bar height under test: the rule, the deck, and the trailing blank —
     /// what `super::super::BAR_H` gives it on the browse screen.
@@ -302,49 +307,41 @@ mod tests {
 
     fn playing_state() -> AppState {
         let mut state = AppState::new();
-        state.playback = Some(PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 83_000,
-            // Off the second boundary: progress interpolates in real time, so
-            // a remaining value of exactly 142_000 ms would flip from 2:22 to
-            // 2:21 within 1 ms of the snapshot.
-            duration_ms: 225_500,
-            track_uri: Some("spotify:track:x".into()),
-            context_uri: None,
-            artist_id: Some("art1".into()),
-            album_id: Some("alb1".into()),
-            track_name: "Song Title".into(),
+        // The playing track leads a 24-row queue: what the deck describes is
+        // the queue's current row, so the row has to carry the facts.
+        let mut tracks = vec![Track {
+            uri: "spotify:track:x".into(),
+            name: "Song Title".into(),
             artists: "Artist Name".into(),
             album: "Album Name".into(),
             release_year: "2020".into(),
+            // Off the second boundary: progress interpolates in real time, so
+            // a remaining value of exactly 142_000 ms would flip from 2:22 to
+            // 2:21 within 1 ms of the anchor.
+            duration_ms: 225_500,
+            track_number: 1,
+            album_id: Some("alb1".into()),
+            artist_id: Some("art1".into()),
             cover_url: None,
-            shuffle: false,
-            repeat: RepeatMode::Context,
-            volume_percent: 56,
-            device_name: "MyPC".into(),
-            is_local_device: true,
-            fetched_at: Instant::now(),
-        });
-        let mut q = TrackList::new("My Mix", "by me", None, None);
-        q.append(
-            (0..24)
-                .map(|i| Track {
-                    uri: format!("spotify:track:t{i}"),
-                    name: format!("Track {i}"),
-                    artists: "Someone".into(),
-                    album: "Album Name".into(),
-                    release_year: "2020".into(),
-                    duration_ms: 60_000,
-                    track_number: i + 1,
-                    album_id: None,
-                    artist_id: None,
-                    cover_url: None,
-                })
-                .collect(),
-        );
-        state.queue = Some(q);
+        }];
+        tracks.extend((1..24).map(|i| Track {
+            uri: format!("spotify:track:t{i}"),
+            name: format!("Track {i}"),
+            artists: "Someone".into(),
+            album: "Album Name".into(),
+            release_year: "2020".into(),
+            duration_ms: 60_000,
+            track_number: i + 1,
+            album_id: None,
+            artist_id: None,
+            cover_url: None,
+        }));
+        state.queue = Some(Queue::new(tracks, 0, "My Mix"));
+        let mut pb = Playback::started(56, false);
+        pb.anchor(83_000);
+        state.playback = Some(pb);
         // Samples arriving, which is what "playing" means to the header and
-        // the transport alike: a snapshot claiming to play with a silent tap
+        // the transport alike: a transport claiming to play with a silent tap
         // is a track still loading. See [`super::super::play_state`].
         state.audio_tap.push(&[0.0; 2048], 1.0);
         state
@@ -519,24 +516,16 @@ mod tests {
         }
 
         // Without ids there is nothing to open, so no rects are recorded.
+        // A one-track queue whose row carries none: the deck reads the
+        // playing row, so the row is where the ids have to be missing.
         let mut state = playing_state();
-        let pb = state.playback.as_mut().unwrap();
-        pb.artist_id = None;
-        pb.album_id = None;
+        let mut track = state.queue.as_ref().unwrap().current().unwrap().clone();
+        track.artist_id = None;
+        track.album_id = None;
+        state.queue = Some(Queue::new(vec![track], 0, "My Mix"));
         render(&mut state, 100, BAR_H);
         assert!(state.hit.now_artist.is_empty());
         assert!(state.hit.now_album.is_empty());
-    }
-
-    /// Nothing has loaded the playing context yet: shuffle still draws, and
-    /// there is no name to click.
-    #[test]
-    fn the_context_row_survives_a_missing_queue() {
-        let mut state = playing_state();
-        state.queue = None;
-        let lines = render(&mut state, 100, BAR_H);
-        assert!(lines[CONTEXT_ROW].contains("shuffle off"));
-        assert!(state.hit.queue_name.is_empty());
     }
 
     /// The state pill is padded to a fixed width, so nothing under the cursor

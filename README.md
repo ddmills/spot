@@ -46,16 +46,18 @@ and can't be changed.
 
 ## How it works
 
-- **librespot** provides the playback engine: the app logs in with your Spotify account and
-  registers itself as a Spotify Connect device named `spot` (it also shows up in the device
-  picker of your phone/web player).
-- Transport controls (play/pause/seek/volume/shuffle) go directly to the local player
-  for instant response; browsing, search, and starting playback use the Spotify Web API.
+- **librespot** provides the audio engine: the app logs in with your Spotify account and
+  streams tracks directly. spot owns the queue, the shuffle and the transport itself — it
+  is not a Spotify Connect device, so it does not appear in the device picker of your
+  phone/web player and cannot be remote-controlled from there. The list on the player
+  screen *is* the play order, because spot wrote it.
+- Transport controls (play/pause/seek/volume/shuffle) act on the local player
+  for instant response; browsing and search use the Spotify Web API.
 - Album art is drawn as half-block pixels, so a truecolor terminal is required — as the
   spectrum analyzer already needed. It appears in three places: full size in the player
   view (`v`), as a thumbnail in the bottom bar, and beside the header of an album page.
-  Art comes from Spotify's image CDN; for the playing track the URL rides along with the
-  playback poll, so it costs no extra API call, and that sleeve's dominant color becomes
+  Art comes from Spotify's image CDN; for the playing track the URL arrives with the
+  track's own metadata, so it costs no extra API call, and that sleeve's dominant color becomes
   the UI accent while it plays. Records with no colour to speak of fall back to the
   built-in gold. Browsing an album fetches its own sleeve without disturbing the accent —
   the record you are looking at and the one you are hearing are not always the same.
@@ -65,8 +67,6 @@ and can't be changed.
   streaming session uses the keymaster ID. The Web API refresh token is stored in
   `%APPDATA%\spot\auth.json`; session credentials are cached by librespot in
   `%LOCALAPPDATA%\spot\creds` after the first login, so both flows are one-time.
-- Because the Web API client ID's quota is shared with all ncspot/spotify-player users,
-  polling backs off automatically when Spotify returns 429.
 
 ## Where it keeps things
 
@@ -196,7 +196,7 @@ is a worse answer than a row that says why it won't play.
 | `Esc` | back to the previous view · closes an overlay |
 | `Enter` | drill into the selected row, or play it |
 | `x` | play without opening (a playlist row, or the current view) |
-| `a` | add selected track to queue |
+| `a` | play the selected track next |
 | `L` | like / unlike the track — the selected row, or the playing one in the player view; on a station row, save it |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction |
@@ -205,11 +205,12 @@ is a worse answer than a row that says why it won't play.
 | `?` | help overlay |
 | `q`, `Ctrl-c` | quit |
 
-Sorting reorders the visible list only; the playing-context order (and the
-`→` next-up marker) follow Spotify's own order, so the marker hides while a
-sort is active. Playlists longer than 500 tracks load fully, streaming in
-page by page; reopening a playlist is instant until it changes on Spotify's
-side (or you press `R`).
+Sorting reorders the visible list only. Playing a sorted list plays it in the
+order you see — the queue is what is on screen, and the player view (`v`)
+lists exactly the order that will play. Playlists longer than 500 tracks load
+fully, streaming in page by page; a play started while pages are still
+arriving grows as they land. Reopening a playlist is instant until it changes
+on Spotify's side (or you press `R`).
 
 ## License
 

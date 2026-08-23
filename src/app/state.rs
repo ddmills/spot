@@ -1,197 +1,55 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
+use crate::app::queue::Queue;
 use crate::audio_tap::AudioTap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepeatMode {
-    Off,
-    Context,
-    Track,
-}
-
-/// Snapshot of playback state from the Web API, plus the moment it was
-/// fetched so the UI can interpolate progress between polls.
+/// Transport state of spot's own player. Everything about *what* is playing
+/// lives on the queue's current [`Track`]; this is only whether it is
+/// playing, where it is, and the two toggles the deck draws.
+///
+/// spot drives librespot's player directly, so every field here is local
+/// truth written on the keypress or on a player event — there is no remote
+/// snapshot to reconcile against.
 #[derive(Debug, Clone)]
-pub struct PlaybackSnapshot {
+pub struct Playback {
     pub is_playing: bool,
+    /// Progress at `anchored_at`; the screen interpolates from there.
     pub progress_ms: u64,
-    pub duration_ms: u64,
-    /// URI of the playing item; `None` for podcast episodes.
-    pub track_uri: Option<String>,
-    /// URI of the playing context (playlist/album/artist), when any.
-    pub context_uri: Option<String>,
-    /// First credited artist's id, for click-through to the artist page.
-    pub artist_id: Option<String>,
-    /// Album id, for click-through to the album page.
-    pub album_id: Option<String>,
-    pub track_name: String,
-    pub artists: String,
-    pub album: String,
-    /// Four-digit release year, or empty when the API did not report one.
-    pub release_year: String,
-    /// CDN URL of the item's cover art, ~300px. It comes back with every
-    /// playback poll, so art costs no extra API call.
-    pub cover_url: Option<String>,
-    pub shuffle: bool,
-    /// Reported by the API but not surfaced: the client pins playback to
-    /// repeat-all on activation, so there is no repeat control to drive.
-    /// Kept because it is what the device actually reports.
-    #[allow(dead_code)]
-    pub repeat: RepeatMode,
+    pub anchored_at: Instant,
     pub volume_percent: u8,
-    /// Reported by the API but no longer surfaced: the bottom bar used to
-    /// print it as `▣ spot` in its corner, which said the same thing on every
-    /// frame of every session. Kept because it is what the device reports and
-    /// a device picker would want it.
-    #[allow(dead_code)]
-    pub device_name: String,
-    /// Whether the reported device is spot's own Connect device.
-    ///
-    /// When it is, playback state has a local source that beats the Web API:
-    /// librespot's player events for play/pause and the soft mixer for volume,
-    /// both immediate where `/me/player` lags by a second or more. When it is
-    /// not — playback is on a phone, say — the API is all there is.
-    pub is_local_device: bool,
-    pub fetched_at: Instant,
+    pub shuffle: bool,
 }
 
-impl PlaybackSnapshot {
-    /// The snapshot to draw the instant a play is asked for, before Spotify has
-    /// said anything about it.
-    ///
-    /// spot starts playback through the Web API and hears back only from the
-    /// `/me/player` poll, and neither is quick. Without this the deck wore the
-    /// previous record — title, sleeve, progress and all — for the whole round
-    /// trip, while the old track was still coming out of the speakers.
-    ///
-    /// `track` is the row that was clicked, when the click named one. Playing a
-    /// whole context from the top names no track and gets a blank item, which
-    /// the deck draws as a title-less sleeve rather than as "nothing playing".
-    ///
-    /// `is_playing` is deliberately false: nothing is coming out yet, and a
-    /// true here would set [`Self::interpolated_progress_ms`] running ahead of
-    /// audio that has not started, so the elapsed time would count up and then
-    /// jump back. The status word does not read it — see
-    /// [`PendingPlay`] and `ui::top_row::status_spans`.
-    ///
-    /// Everything the item does not decide — volume, shuffle, the device name —
-    /// carries over from `prev`, because none of it is changing.
-    pub fn pending(track: Option<&Track>, cover_url: Option<String>, prev: Option<&Self>) -> Self {
+impl Playback {
+    /// A playback that has just started a track from the top.
+    pub fn started(volume_percent: u8, shuffle: bool) -> Self {
         Self {
-            is_playing: false,
+            is_playing: true,
             progress_ms: 0,
-            duration_ms: track.map(|t| t.duration_ms).unwrap_or(0),
-            track_uri: track.map(|t| t.uri.clone()),
-            // Unknown until the poll answers, and guessing it would have the
-            // player view re-fetch a queue we may not be switching to.
-            context_uri: prev.and_then(|p| p.context_uri.clone()),
-            artist_id: track.and_then(|t| t.artist_id.clone()),
-            album_id: track.and_then(|t| t.album_id.clone()),
-            track_name: track.map(|t| t.name.clone()).unwrap_or_default(),
-            artists: track.map(|t| t.artists.clone()).unwrap_or_default(),
-            album: track.map(|t| t.album.clone()).unwrap_or_default(),
-            release_year: track.map(|t| t.release_year.clone()).unwrap_or_default(),
-            cover_url,
-            shuffle: prev.is_some_and(|p| p.shuffle),
-            repeat: prev.map(|p| p.repeat).unwrap_or(RepeatMode::Context),
-            volume_percent: prev.map(|p| p.volume_percent).unwrap_or(50),
-            device_name: prev.map(|p| p.device_name.clone()).unwrap_or_default(),
-            // It is our own device we just asked to play, whatever the last
-            // poll happened to be describing.
-            is_local_device: true,
-            fetched_at: Instant::now(),
+            anchored_at: Instant::now(),
+            volume_percent,
+            shuffle,
         }
     }
 
-    /// Progress advanced locally while playing, clamped to track length.
-    pub fn interpolated_progress_ms(&self) -> u64 {
+    /// Re-anchor progress at `position_ms`, now.
+    pub fn anchor(&mut self, position_ms: u64) {
+        self.progress_ms = position_ms;
+        self.anchored_at = Instant::now();
+    }
+
+    /// Progress advanced locally while playing, clamped to `duration_ms` —
+    /// the playing track's length, which the queue knows and this does not.
+    pub fn interpolated_progress_ms(&self, duration_ms: u64) -> u64 {
         if !self.is_playing {
-            return self.progress_ms;
+            return self.progress_ms.min(duration_ms);
         }
-        let elapsed = self.fetched_at.elapsed().as_millis() as u64;
-        (self.progress_ms + elapsed).min(self.duration_ms)
-    }
-}
-
-/// How long a play may stay unheard before the API's answer is taken anyway.
-///
-/// The wait exists to keep a poll that has not caught up from putting the
-/// previous record back, and every ordinary switch ends it in well under a
-/// second. Past this it is no longer a lagging poll but a play that failed, or
-/// that Spotify quietly redirected somewhere else, and holding a bar on a track
-/// that is not playing is worse than showing whatever is.
-const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-
-/// A play spot has asked Spotify for and has not heard yet.
-///
-/// While one is set, [`AppState::playback`] is a snapshot *we* wrote from the
-/// row that was clicked rather than one the API has confirmed — see
-/// [`PlaybackSnapshot::pending`]. It is what lets the deck repaint on the click
-/// instead of a round trip later, and what stops the poll arriving mid-switch
-/// from undoing it.
-#[derive(Debug, Clone)]
-pub struct PendingPlay {
-    /// The track we expect to hear, when the click named one. `None` for
-    /// playing a whole context from the top, where Spotify picks the track.
-    pub expect_uri: Option<String>,
-    /// What was playing when we asked, so a poll that still names it reads as
-    /// Spotify's backend not having caught up rather than as an answer.
-    pub prev_uri: Option<String>,
-    pub since: Instant,
-}
-
-/// What librespot says is playing, the moment it starts playing it.
-///
-/// Lifted out of the `AudioItem` on `PlayerEvent::TrackChanged` — see
-/// `main::player_event_loop`. Spelled in plain types rather than librespot's so
-/// the rule that consumes it, [`AppState::track_changed`], can be tested
-/// without a session.
-///
-/// It is missing two things `/me/player` has: the album's id, and the release
-/// year. The metadata librespot loads carries the album's *name* only. That is
-/// why the poll is still wanted after this — see [`AppState::track_changed`].
-#[derive(Debug, Clone)]
-pub struct NowPlaying {
-    pub track_uri: String,
-    pub track_name: String,
-    pub artists: String,
-    pub album: String,
-    pub artist_id: Option<String>,
-    pub duration_ms: u64,
-    pub cover_url: Option<String>,
-}
-
-/// What librespot's own player says about play/pause, shared between the task
-/// draining its event channel and the client's Web API poll.
-///
-/// The poll replaces the whole snapshot, so without this the local truth is
-/// overwritten by a `/me/player` response that Spotify's backend has not
-/// caught up on yet — which is what made the play/pause pill flip back a
-/// moment after being pressed.
-#[derive(Debug, Default)]
-pub struct LocalPlayback {
-    /// False until the first player event. Before that there is no local
-    /// truth to prefer and the API's answer has to stand.
-    seen: AtomicBool,
-    playing: AtomicBool,
-}
-
-impl LocalPlayback {
-    pub fn set_playing(&self, playing: bool) {
-        self.playing.store(playing, Ordering::Relaxed);
-        self.seen.store(true, Ordering::Relaxed);
-    }
-
-    /// The local play/pause state, or `None` before any player event.
-    pub fn playing(&self) -> Option<bool> {
-        self.seen
-            .load(Ordering::Relaxed)
-            .then(|| self.playing.load(Ordering::Relaxed))
+        let elapsed = self.anchored_at.elapsed().as_millis() as u64;
+        (self.progress_ms + elapsed).min(duration_ms)
     }
 }
 
@@ -222,7 +80,6 @@ pub struct Track {
 #[derive(Debug, Clone)]
 pub struct Playlist {
     pub id: String,
-    pub uri: String,
     pub name: String,
     pub track_count: u32,
     pub owner: String,
@@ -628,77 +485,28 @@ pub struct RadioPlayback {
     pub matched: RadioMatch,
 }
 
-/// The record a deck control acts on, whichever engine is playing.
-///
-/// The two engines describe what they are playing in different shapes — a
-/// [`PlaybackSnapshot`] is a poll of Spotify's player, a [`Track`] is a
-/// catalogue row — and every deck control needs the same four facts out of
-/// either. Borrowing rather than copying them keeps this free to build on the
-/// click path, where it is built and dropped inside one match arm.
-#[derive(Debug, Clone, Copy)]
-pub enum DeckTrack<'a> {
-    Spotify(&'a PlaybackSnapshot),
-    Radio(&'a Track),
-}
-
-impl DeckTrack<'_> {
-    /// `None` for a Spotify item with no track id — an episode, or a play
-    /// still in flight that named nothing.
-    pub fn uri(&self) -> Option<&str> {
-        match self {
-            Self::Spotify(pb) => pb.track_uri.as_deref(),
-            Self::Radio(t) => Some(&t.uri),
-        }
-    }
-
-    pub fn artists(&self) -> &str {
-        match self {
-            Self::Spotify(pb) => &pb.artists,
-            Self::Radio(t) => &t.artists,
-        }
-    }
-
-    pub fn artist_id(&self) -> Option<&str> {
-        match self {
-            Self::Spotify(pb) => pb.artist_id.as_deref(),
-            Self::Radio(t) => t.artist_id.as_deref(),
-        }
-    }
-
+impl Track {
     /// The `OpenAlbum` this record's album name leads to, when it has one.
+    /// One resolution for every control that opens a record's album — the
+    /// deck's link, `b`, the Album column — so they cannot drift.
     pub fn open_album(&self) -> Option<crate::app::command::AppCommand> {
-        let (id, name, artists, year, cover_url) = match self {
-            Self::Spotify(pb) => (
-                pb.album_id.as_ref()?,
-                &pb.album,
-                &pb.artists,
-                &pb.release_year,
-                pb.cover_url.clone(),
-            ),
-            Self::Radio(t) => (
-                t.album_id.as_ref()?,
-                &t.album,
-                &t.artists,
-                &t.release_year,
-                t.cover_url.clone(),
-            ),
-        };
+        let id = self.album_id.as_ref()?;
         Some(crate::app::command::AppCommand::OpenAlbum {
             id: id.clone(),
-            name: name.clone(),
-            artists: artists.clone(),
-            year: year.clone(),
-            cover_url,
+            name: self.album.clone(),
+            artists: self.artists.clone(),
+            year: self.release_year.clone(),
+            cover_url: self.cover_url.clone(),
         })
     }
 
     /// The `OpenArtist` this record's artist name leads to, when it has one.
     pub fn open_artist(&self) -> Option<crate::app::command::AppCommand> {
-        let id = self.artist_id()?;
+        let id = self.artist_id.as_deref()?;
         Some(crate::app::command::AppCommand::OpenArtist {
             id: id.to_string(),
             uri: format!("spotify:artist:{id}"),
-            name: first_artist(self.artists()),
+            name: first_artist(&self.artists),
         })
     }
 }
@@ -787,9 +595,6 @@ pub struct TrackList {
     /// arrival; identity while unsorted.
     pub display: Vec<usize>,
     pub sort: TrackSort,
-    /// Set when the list is a playable context (playlist/album) so Enter can
-    /// play with an offset inside it.
-    pub context_uri: Option<String>,
     /// Expected total from the source's metadata; None = unknown.
     pub total: Option<u32>,
     /// More pages are still arriving for this view.
@@ -802,12 +607,7 @@ pub struct TrackList {
 }
 
 impl TrackList {
-    pub fn new(
-        name: impl Into<String>,
-        subtitle: impl Into<String>,
-        context_uri: Option<String>,
-        total: Option<u32>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, subtitle: impl Into<String>, total: Option<u32>) -> Self {
         Self {
             kind: TrackListKind::Playlist,
             header: ViewHeader {
@@ -818,7 +618,6 @@ impl TrackList {
             tracks: Vec::new(),
             display: Vec::new(),
             sort: TrackSort::default(),
-            context_uri,
             total,
             loading: false,
             generation: 0,
@@ -1340,10 +1139,10 @@ impl HitAreas {
 }
 
 pub struct AppState {
-    pub playback: Option<PlaybackSnapshot>,
-    /// A play asked for and not heard yet, while one is outstanding. See
-    /// [`PendingPlay`]; resolved by [`Self::resolve_pending`].
-    pub pending_play: Option<PendingPlay>,
+    /// Transport state, once something has been played this session. What is
+    /// playing is [`Self::queue`]'s current track; this is only whether and
+    /// where. `None` until the first play, which is when the deck appears.
+    pub playback: Option<Playback>,
     pub playlists: Vec<Playlist>,
     /// Saved ("liked") state by track URI. Absent = not checked yet, so
     /// unknown renders blank rather than as not-liked.
@@ -1389,14 +1188,15 @@ pub struct AppState {
     /// Player view (current track + visualizer + queue) replaces the
     /// library/main panes while set.
     pub show_player: bool,
-    /// Tracks of the playing context, shown in the player view. Loaded by
-    /// the client for playlist/album contexts; snapshotted by the event
-    /// layer when playback starts from an ad-hoc URI list.
-    pub queue: Option<TrackList>,
+    /// The play order spot owns, installed by every play. The player screen
+    /// lists it, and its current track is what the deck describes.
+    pub queue: Option<Queue>,
     pub queue_index: usize,
     pub queue_list: ListState,
-    /// Generation guard for queue fetches, independent of `load_generation`
-    /// so queue loads never cancel main-view fetches (and vice versa).
+    /// Bumped by [`Self::set_queue`] and stamped onto the installed queue, so
+    /// a background fill can tell the queue it was started for from one that
+    /// has replaced it. Independent of `load_generation`: queue fills never
+    /// cancel main-view fetches (and vice versa).
     pub queue_generation: u64,
     /// Last click in the queue list, for double-click detection.
     pub last_queue_click: Option<(usize, Instant)>,
@@ -1455,7 +1255,6 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             playback: None,
-            pending_play: None,
             radio: None,
             radio_favorites: Vec::new(),
             playlists: Vec::new(),
@@ -1560,13 +1359,19 @@ impl AppState {
 
     /// Number of rows in the player view's queue list.
     pub fn queue_len(&self) -> usize {
-        self.queue.as_ref().map_or(0, |q| q.display.len())
+        self.queue.as_ref().map_or(0, |q| q.len())
     }
 
-    /// Install a queue list, resetting its selection and scroll.
-    pub fn set_queue(&mut self, list: Option<TrackList>) {
-        self.queue = list;
-        self.queue_index = 0;
+    /// Install a queue, resetting the player list's selection and scroll and
+    /// stamping the queue with a fresh generation — see
+    /// [`Self::queue_generation`].
+    pub fn set_queue(&mut self, queue: Option<Queue>) {
+        self.queue_generation += 1;
+        self.queue = queue.map(|mut q| {
+            q.generation = self.queue_generation;
+            q
+        });
+        self.queue_index = self.queue.as_ref().map_or(0, |q| q.index());
         *self.queue_list.offset_mut() = 0;
     }
 
@@ -1574,139 +1379,24 @@ impl AppState {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
-    /// Paint the play that is about to be asked for, before anyone has been
-    /// asked for it.
-    ///
-    /// `track` is the row the click named, and `cover_url` its sleeve — see
-    /// [`PlaybackSnapshot::pending`] for what gets drawn when neither is known.
-    ///
-    /// The station goes here rather than in the client because every deck
-    /// checks radio before Spotify (`now_playing`, `player`, `top_row`), so a
-    /// station left set would keep drawing over the track that is starting. The
-    /// tap is cleared for the same reason the radio player clears it before
-    /// connecting: the status word tells "playing" from "still fetching" by
-    /// whether samples are arriving, and the old track's are about to stop.
-    ///
-    /// [`Self::cover`] is deliberately left alone. The client resolves the
-    /// sleeve a moment later through `fetch_cover`, which serves a decoded
-    /// cover from its cache instantly and clears the slot only on a miss — so
-    /// art we already have does not flash to a placeholder and back.
-    pub fn begin_pending_play(&mut self, track: Option<&Track>, cover_url: Option<String>) {
-        let prev_uri = self.playback.as_ref().and_then(|pb| pb.track_uri.clone());
-        self.radio = None;
-        self.audio_tap.clear();
-        self.playback = Some(PlaybackSnapshot::pending(
-            track,
-            cover_url,
-            self.playback.as_ref(),
-        ));
-        self.pending_play = Some(PendingPlay {
-            expect_uri: track.map(|t| t.uri.clone()),
-            prev_uri,
-            since: Instant::now(),
-        });
-    }
-
-    /// Take librespot's word for what is playing.
-    ///
-    /// `/me/player` is polled every three seconds and lags Spotify's backend
-    /// besides, so it was leaving the deck describing the previous record for a
-    /// second or more after the speakers had moved on — most visibly when a
-    /// track ends and the next one starts on its own, where nothing else was
-    /// going to correct it. librespot knows at once, and this is that.
-    ///
-    /// The wait is (re)armed rather than cleared, because the poll behind this
-    /// is still catching up and would otherwise put the old record straight
-    /// back. It stays armed until a poll agrees, which is also when the two
-    /// fields librespot does not carry — the album's id, so its name is a link,
-    /// and the release year — get filled in. Both are dropped here rather than
-    /// left standing: they belong to the record that just ended, and a stale
-    /// album id is a link to the wrong page.
-    ///
-    /// Play/pause is deliberately untouched. This fires from librespot's
-    /// `start_playback`, which also runs for a load that is not going to play
-    /// yet; `Playing` and `Paused` are what say which it was.
-    pub fn track_changed(&mut self, now: NowPlaying) {
-        let prev_uri = self.playback.as_ref().and_then(|pb| pb.track_uri.clone());
-        let same_track = prev_uri.as_deref() == Some(now.track_uri.as_str());
-        let pb = self
-            .playback
-            .get_or_insert_with(|| PlaybackSnapshot::pending(None, None, None));
-
-        pb.track_uri = Some(now.track_uri.clone());
-        pb.track_name = now.track_name;
-        pb.artists = now.artists;
-        pb.album = now.album;
-        pb.artist_id = now.artist_id;
-        pb.duration_ms = now.duration_ms;
-        pb.cover_url = now.cover_url;
-        // librespot is playing it, so it is ours, whatever the last poll was
-        // describing.
-        pb.is_local_device = true;
-        if !same_track {
-            pb.album_id = None;
-            pb.release_year = String::new();
-            pb.progress_ms = 0;
-            pb.fetched_at = Instant::now();
-        }
-
-        self.pending_play = Some(PendingPlay {
-            expect_uri: Some(now.track_uri),
-            // What the events still in flight are about — our own pause across
-            // a switch, most of all. Held from the existing wait when there is
-            // one: this may be librespot answering the very play that opened
-            // it, and the track being left is the one that was playing before
-            // *that*, not the one we optimistically painted.
-            prev_uri: self
-                .pending_play
-                .as_ref()
-                .and_then(|p| p.prev_uri.clone())
-                .or(prev_uri),
-            since: Instant::now(),
-        });
-    }
-
-    /// Whether a polled snapshot may be installed, ending the wait when it may.
-    ///
-    /// With nothing outstanding every answer is the answer. With a play
-    /// outstanding, one that still names the track we just left is Spotify's
-    /// backend not having caught up rather than a report — taking it would put
-    /// the previous record back on the deck for a poll or two, which is the
-    /// whole thing [`PendingPlay`] exists to prevent.
-    ///
-    /// Past [`PENDING_TIMEOUT`] anything is accepted: see the note there.
-    pub fn resolve_pending(&mut self, incoming: Option<&PlaybackSnapshot>) -> bool {
-        let Some(pending) = &self.pending_play else {
-            return true;
-        };
-        let uri = incoming.and_then(|pb| pb.track_uri.as_deref());
-        let arrived = match &pending.expect_uri {
-            Some(want) => uri == Some(want.as_str()),
-            // Nothing was named — a context played from the top, where Spotify
-            // chooses. Any track that is not the one we left is the new one.
-            None => incoming.is_some() && uri != pending.prev_uri.as_deref(),
-        };
-        if arrived || pending.since.elapsed() > PENDING_TIMEOUT {
-            self.pending_play = None;
-            return true;
-        }
-        false
-    }
-
     /// The record the deck is currently about.
     ///
     /// Radio first, and radio *exclusively* while a station is playing. The
-    /// kept Spotify snapshot behind it is not making any sound (see
+    /// kept Spotify queue behind it is not making any sound (see
     /// [`Self::radio`]), so a deck control that fell through to it would like,
     /// or open, a record the user last heard half an hour ago. That is why a
     /// station with no match answers `None` here rather than deferring: the
     /// honest answer is that the deck is about something Spotify has no page
     /// for, and every caller renders that better than it renders a lie.
-    pub fn deck_track(&self) -> Option<DeckTrack<'_>> {
+    ///
+    /// Off radio it is the queue's current track — spot owns the play order,
+    /// so what the queue points at *is* what is playing.
+    pub fn deck_track(&self) -> Option<&Track> {
         if let Some(r) = &self.radio {
-            return r.matched_track().map(DeckTrack::Radio);
+            return r.matched_track();
         }
-        self.playback.as_ref().map(DeckTrack::Spotify)
+        self.playback.as_ref()?;
+        self.queue.as_ref().and_then(|q| q.current())
     }
 
     /// Reset main-pane selection and scroll to the top (new content).
@@ -1911,7 +1601,7 @@ mod tests {
             name: "artist".into(),
             image_url: None,
             genres: Vec::new(),
-            top: TrackList::new("artist", "top tracks", None, None),
+            top: TrackList::new("artist", "top tracks", None),
             albums,
             display: Vec::new(),
             tab: ArtistTab::Albums,
@@ -1995,7 +1685,7 @@ mod tests {
     }
 
     fn list_of(names: &[&str]) -> TrackList {
-        let mut list = TrackList::new("L", "", None, None);
+        let mut list = TrackList::new("L", "", None);
         list.append(names.iter().map(|n| track(n, 1000)).collect());
         list
     }
@@ -2109,36 +1799,27 @@ mod tests {
         // Apple sorts first; cherry moves from row 1 to row 2.
         assert_eq!(st.main_index, 2);
     }
-    /// A snapshot as `/me/player` would report it, naming `uri`.
-    fn polled(uri: &str) -> PlaybackSnapshot {
-        let mut pb = PlaybackSnapshot::pending(Some(&track(uri, 1000)), None, None);
-        pb.is_playing = true;
-        pb
-    }
 
-    /// A state mid-switch: `from` was playing, `to` has been asked for.
-    fn switching(from: Option<&str>, to: Option<&str>) -> AppState {
-        let mut st = AppState::new();
-        if let Some(from) = from {
-            st.playback = Some(polled(from));
-        }
-        let want = to.map(|t| track(t, 1000));
-        st.begin_pending_play(want.as_ref(), None);
-        st
+    /// A playing queue of one named track, for the deck-subject tests.
+    fn playing(uri: &str) -> (Option<Playback>, Option<Queue>) {
+        let q = Queue::new(vec![track(uri, 1000)], 0, "Q");
+        (Some(Playback::started(50, false)), Some(q))
     }
 
     /// The trap this whole accessor exists for.
     ///
-    /// While a station plays, `playback` still holds the last Spotify track —
-    /// kept on purpose, so stopping the stream puts it straight back. Every
-    /// deck control used to read it directly, which meant `★` on the radio deck
+    /// While a station plays, the Spotify queue is still installed — kept on
+    /// purpose, so stopping the stream puts it straight back. Every deck
+    /// control used to read it directly, which meant `★` on the radio deck
     /// would have liked whatever the user last heard on Spotify.
     #[test]
-    fn the_deck_ignores_the_kept_snapshot_while_a_station_plays() {
+    fn the_deck_ignores_the_kept_queue_while_a_station_plays() {
         let mut st = AppState::new();
-        st.playback = Some(polled("kept"));
+        let (pb, q) = playing("kept");
+        st.playback = pb;
+        st.queue = q;
         assert_eq!(
-            st.deck_track().and_then(|t| t.uri().map(str::to_string)),
+            st.deck_track().map(|t| t.uri.clone()),
             Some("spotify:track:kept".to_string())
         );
 
@@ -2157,7 +1838,7 @@ mod tests {
             r.matched = RadioMatch::Matched(Box::new(found));
         }
         let deck = st.deck_track().expect("a matched station has a record");
-        assert_eq!(deck.uri(), Some("spotify:track:announced"));
+        assert_eq!(deck.uri, "spotify:track:announced");
         assert!(matches!(
             deck.open_album(),
             Some(crate::app::command::AppCommand::OpenAlbum { ref id, .. }) if id == "alb1"
@@ -2171,7 +1852,7 @@ mod tests {
         // waiting behind it.
         st.radio = None;
         assert_eq!(
-            st.deck_track().and_then(|t| t.uri().map(str::to_string)),
+            st.deck_track().map(|t| t.uri.clone()),
             Some("spotify:track:kept".to_string())
         );
     }
@@ -2181,11 +1862,23 @@ mod tests {
     #[test]
     fn an_unmatched_announcement_gives_the_deck_nothing_to_act_on() {
         let mut st = AppState::new();
-        st.playback = Some(polled("kept"));
+        let (pb, q) = playing("kept");
+        st.playback = pb;
+        st.queue = q;
         let mut radio = RadioPlayback::new(a_station(), 40, Default::default());
         radio.matched = RadioMatch::Unmatched;
         st.radio = Some(radio);
         assert!(st.deck_track().is_none());
+    }
+
+    /// Before anything has played there is no deck, however a queue got there.
+    #[test]
+    fn the_deck_is_empty_until_something_has_played() {
+        let mut st = AppState::new();
+        assert!(st.deck_track().is_none());
+        let (_, q) = playing("staged");
+        st.queue = q;
+        assert!(st.deck_track().is_none(), "a queue alone is not playback");
     }
 
     #[test]
@@ -2195,242 +1888,19 @@ mod tests {
         assert_eq!(first_artist(""), "");
     }
 
+    /// Progress runs off the anchor while playing, stands still while paused,
+    /// and never runs past the track.
     #[test]
-    fn beginning_a_play_paints_the_clicked_track_at_once() {
-        let mut st = AppState::new();
-        st.playback = Some(polled("old"));
-        st.radio = Some(RadioPlayback {
-            station: Station {
-                uuid: "s".into(),
-                name: "A Station".into(),
-                url: "http://stream/s".into(),
-                homepage: String::new(),
-                tags: String::new(),
-                country: String::new(),
-                countrycode: String::new(),
-                language: String::new(),
-                codec: "MP3".into(),
-                bitrate: 128,
-                votes: 0,
-                hls: false,
-            },
-            is_playing: true,
-            started_at: Instant::now(),
-            title: Default::default(),
-            volume_percent: 40,
-            matched: Default::default(),
-        });
-        let want = track("new", 240_500);
+    fn progress_interpolates_only_while_playing() {
+        let mut pb = Playback::started(50, false);
+        pb.is_playing = false;
+        pb.anchor(5_000);
+        pb.anchored_at = Instant::now() - std::time::Duration::from_secs(10);
+        assert_eq!(pb.interpolated_progress_ms(60_000), 5_000);
 
-        st.begin_pending_play(Some(&want), Some("https://i.scdn.co/image/x".into()));
-
-        let pb = st
-            .playback
-            .as_ref()
-            .expect("the deck has something to draw");
-        assert_eq!(pb.track_name, "new");
-        assert_eq!(pb.track_uri.as_deref(), Some("spotify:track:new"));
-        assert_eq!(pb.duration_ms, 240_500);
-        assert_eq!(pb.cover_url.as_deref(), Some("https://i.scdn.co/image/x"));
-        // Nothing is coming out yet, so the elapsed time must sit at zero
-        // rather than run ahead of the audio.
-        assert_eq!(pb.interpolated_progress_ms(), 0);
-        // The station is gone from the moment of the click: every deck checks
-        // radio before Spotify, so one left behind would draw over the track.
-        assert!(st.radio.is_none());
-        assert_eq!(
-            st.pending_play
-                .as_ref()
-                .and_then(|p| p.expect_uri.as_deref()),
-            Some("spotify:track:new")
-        );
-        assert_eq!(
-            st.pending_play.as_ref().and_then(|p| p.prev_uri.as_deref()),
-            Some("spotify:track:old")
-        );
-    }
-
-    #[test]
-    fn a_poll_still_naming_the_old_track_is_refused() {
-        let mut st = switching(Some("old"), Some("new"));
-        assert!(!st.resolve_pending(Some(&polled("old"))));
-        assert!(st.pending_play.is_some(), "the wait goes on");
-        assert_eq!(
-            st.playback.as_ref().map(|pb| pb.track_name.as_str()),
-            Some("new"),
-            "the deck keeps what we painted"
-        );
-    }
-
-    #[test]
-    fn the_expected_track_ends_the_wait() {
-        let mut st = switching(Some("old"), Some("new"));
-        assert!(st.resolve_pending(Some(&polled("new"))));
-        assert!(st.pending_play.is_none());
-    }
-
-    #[test]
-    fn a_poll_naming_neither_is_refused_while_one_is_expected() {
-        // A third track is not the one asked for, whoever started it.
-        let mut st = switching(Some("old"), Some("new"));
-        assert!(!st.resolve_pending(Some(&polled("other"))));
-    }
-
-    #[test]
-    fn with_no_track_expected_anything_new_ends_the_wait() {
-        // Playing a context from the top: Spotify picks, so any track that is
-        // not the one we left is the answer.
-        let mut st = switching(Some("old"), None);
-        assert!(!st.resolve_pending(Some(&polled("old"))));
-        assert!(st.resolve_pending(Some(&polled("whichever"))));
-        assert!(st.pending_play.is_none());
-    }
-
-    #[test]
-    fn an_empty_poll_does_not_end_a_wait() {
-        // `/me/player` reporting nothing is not Spotify saying the play landed.
-        let mut st = switching(Some("old"), None);
-        assert!(!st.resolve_pending(None));
-        assert!(st.pending_play.is_some());
-    }
-
-    #[test]
-    fn a_play_that_never_lands_is_given_up_on() {
-        let mut st = switching(Some("old"), Some("new"));
-        let pending = st.pending_play.as_mut().unwrap();
-        pending.since = Instant::now()
-            .checked_sub(PENDING_TIMEOUT + std::time::Duration::from_secs(1))
-            .expect("the process has been up long enough to subtract from");
-        // Whatever it says, past the timeout it is better than a bar stuck on
-        // a track that never started.
-        assert!(st.resolve_pending(Some(&polled("old"))));
-        assert!(st.pending_play.is_none());
-    }
-
-    fn now(uri: &str) -> NowPlaying {
-        NowPlaying {
-            track_uri: format!("spotify:track:{uri}"),
-            track_name: uri.into(),
-            artists: "artist".into(),
-            album: "album".into(),
-            artist_id: Some("r1".into()),
-            duration_ms: 1000,
-            cover_url: Some("https://i.scdn.co/image/new".into()),
-        }
-    }
-
-    /// The lag nothing else covered: two tracks of one album run into each
-    /// other with no command in between, so no re-poll is armed and the deck
-    /// used to keep the finished record until the next three-second tick.
-    #[test]
-    fn librespot_starting_a_track_updates_the_deck_at_once() {
-        let mut st = AppState::new();
-        st.playback = Some(polled("old"));
-
-        st.track_changed(now("new"));
-
-        let pb = st.playback.as_ref().unwrap();
-        assert_eq!(pb.track_name, "new");
-        assert_eq!(pb.track_uri.as_deref(), Some("spotify:track:new"));
-        assert_eq!(pb.cover_url.as_deref(), Some("https://i.scdn.co/image/new"));
-        assert_eq!(pb.progress_ms, 0);
-        assert!(pb.is_local_device);
-    }
-
-    /// librespot carries the album's name but not its id, and the year not at
-    /// all. Left standing they would belong to the record that just ended — and
-    /// a stale album id is a link to the wrong page.
-    #[test]
-    fn a_new_track_drops_what_only_the_poll_knows() {
-        let mut st = AppState::new();
-        let mut prev = polled("old");
-        prev.album_id = Some("a1".into());
-        prev.release_year = "2006".into();
-        st.playback = Some(prev);
-
-        st.track_changed(now("new"));
-
-        let pb = st.playback.as_ref().unwrap();
-        assert!(pb.album_id.is_none());
-        assert!(pb.release_year.is_empty());
-    }
-
-    /// The same track starting again — a replay — keeps them: they are still
-    /// about this record, and dropping them would put out the album link for
-    /// no reason.
-    #[test]
-    fn restarting_the_same_track_keeps_what_the_poll_filled_in() {
-        let mut st = AppState::new();
-        let mut prev = polled("same");
-        prev.album_id = Some("a1".into());
-        prev.release_year = "2006".into();
-        st.playback = Some(prev);
-
-        st.track_changed(now("same"));
-
-        let pb = st.playback.as_ref().unwrap();
-        assert_eq!(pb.album_id.as_deref(), Some("a1"));
-        assert_eq!(pb.release_year, "2006");
-    }
-
-    /// The poll is still behind after librespot has spoken, so the wait is
-    /// re-armed rather than dropped — otherwise the next `/me/player`, still
-    /// describing the finished record, would put it straight back.
-    #[test]
-    fn a_track_change_arms_the_wait_against_the_lagging_poll() {
-        let mut st = AppState::new();
-        st.playback = Some(polled("old"));
-
-        st.track_changed(now("new"));
-
-        assert!(!st.resolve_pending(Some(&polled("old"))));
-        assert_eq!(
-            st.playback.as_ref().map(|pb| pb.track_name.as_str()),
-            Some("new")
-        );
-        assert!(st.resolve_pending(Some(&polled("new"))));
-    }
-
-    /// Spotify need not play what was asked for — shuffle picks its own track
-    /// out of a context. librespot is the authority on what is actually
-    /// playing, so its answer replaces the guess rather than being refused by
-    /// it.
-    #[test]
-    fn librespot_overrides_a_guess_that_turned_out_wrong() {
-        let mut st = switching(Some("old"), Some("asked"));
-        assert_eq!(
-            st.playback.as_ref().map(|pb| pb.track_name.as_str()),
-            Some("asked")
-        );
-
-        st.track_changed(now("actual"));
-
-        assert_eq!(
-            st.playback.as_ref().map(|pb| pb.track_name.as_str()),
-            Some("actual")
-        );
-        // And the wait now guards the track that is really playing, so the
-        // poll confirming it lands instead of being held off until the timeout.
-        assert!(st.resolve_pending(Some(&polled("actual"))));
-    }
-
-    /// The track being left is what the stale-event filter needs to know, and
-    /// it is the one that was playing before the click — not the guess the
-    /// click painted over it.
-    #[test]
-    fn a_track_change_mid_switch_keeps_the_track_being_left() {
-        let mut st = switching(Some("old"), Some("asked"));
-        st.track_changed(now("actual"));
-        assert_eq!(
-            st.pending_play.as_ref().and_then(|p| p.prev_uri.as_deref()),
-            Some("spotify:track:old")
-        );
-    }
-
-    #[test]
-    fn with_nothing_outstanding_every_poll_is_the_answer() {
-        let mut st = AppState::new();
-        assert!(st.resolve_pending(Some(&polled("anything"))));
-        assert!(st.resolve_pending(None));
+        pb.is_playing = true;
+        let got = pb.interpolated_progress_ms(60_000);
+        assert!((14_900..=15_500).contains(&got), "{got}");
+        assert_eq!(pb.interpolated_progress_ms(7_000), 7_000, "clamped");
     }
 }

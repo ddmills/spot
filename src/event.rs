@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use ratatui::layout::{Position, Rect};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::command::AppCommand;
+use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
     self as state, AppState, ArtistRow, BackTarget, CrumbTarget, HomeItem, InputMode, MainView,
     RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SortKey, Station, Track, TrackList,
@@ -342,11 +342,14 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         let ratio = (pos.x - track.x) as f64 / track.width.saturating_sub(1).max(1) as f64;
         let _ = tx.send(AppCommand::SetVolume((ratio * 100.0).round() as u8));
     } else if st.hit.gauge.contains(pos)
-        && let Some(pb) = &st.playback
+        && st.playback.is_some()
+        && let Some(track) = st.queue.as_ref().and_then(|q| q.current())
     {
         let ratio =
             (pos.x - st.hit.gauge.x) as f64 / st.hit.gauge.width.saturating_sub(1).max(1) as f64;
-        let _ = tx.send(AppCommand::SeekTo((ratio * pb.duration_ms as f64) as u64));
+        let _ = tx.send(AppCommand::SeekTo(
+            (ratio * track.duration_ms as f64) as u64,
+        ));
     }
 }
 
@@ -533,21 +536,10 @@ fn go_home(st: &mut AppState) {
     st.main_to_top();
 }
 
-/// `v`: open the player view, loading the queue when it is missing or
-/// belongs to a different context than what is playing.
-fn open_player(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+/// `v`: open the player view. The queue is always present and always
+/// correct — spot wrote it on the play — so there is nothing to fetch.
+fn open_player(st: &mut AppState, _tx: &UnboundedSender<AppCommand>) {
     st.show_player = true;
-    let stale = match st.playback.as_ref().and_then(|p| p.context_uri.as_deref()) {
-        Some(ctx) => st
-            .queue
-            .as_ref()
-            .is_none_or(|q| q.context_uri.as_deref() != Some(ctx)),
-        // Ad-hoc playback: whatever snapshot exists is the queue.
-        None => false,
-    };
-    if stale {
-        let _ = tx.send(AppCommand::LoadQueue);
-    }
 }
 
 /// Keys captured while the player view is shown. Returns false for keys
@@ -639,35 +631,12 @@ fn queue_snap(st: &mut AppState) {
     }
 }
 
-/// Enter / double-click in the queue: play the selected row, through the
-/// context when the queue has one, else as the ad-hoc URI list it is.
+/// Enter / double-click in the queue: play the selected row. The queue is
+/// the play order, so this is one instant command with no API behind it.
 fn play_from_queue(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    let Some(q) = &st.queue else { return };
-    let Some(&ti) = q.display.get(st.queue_index) else {
-        return;
-    };
-    let track = q.tracks[ti].clone();
-    let cover = pending_cover(&track, q.header.cover_url.as_ref());
-    let cmd = if let Some(ctx) = &q.context_uri {
-        AppCommand::PlayContext {
-            context_uri: ctx.clone(),
-            offset_uri: Some(track.uri.clone()),
-        }
-    } else {
-        AppCommand::PlayTracks {
-            uris: q.display.iter().map(|&i| q.tracks[i].uri.clone()).collect(),
-            offset: st.queue_index,
-        }
-    };
-    send_play(st, tx, cmd, Some(&track), cover);
-}
-
-/// Playback started from an ad-hoc URI list has no context the client could
-/// re-fetch, so snapshot the played tracks (display order) as the queue.
-fn install_adhoc_queue(st: &mut AppState, name: String, tracks: Vec<Track>) {
-    let mut q = TrackList::new(name, "", None, None);
-    q.append(tracks);
-    st.set_queue(Some(q));
+    if st.queue_index < st.queue_len() {
+        let _ = tx.send(AppCommand::JumpTo(st.queue_index));
+    }
 }
 
 /// Backspace: pop the view stack. A restored track view that was still
@@ -1057,71 +1026,40 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     }
 
     let index = st.main_index;
-    // Playing an ad-hoc list also snapshots it for the player view's queue
-    // (there is no context to re-fetch it from).
-    let mut adhoc: Option<(String, Vec<Track>)> = None;
-    // The row a play names, so the deck can wear it before Spotify confirms
-    // it — cloned out here because the match below holds `st` borrowed.
-    let mut expect: Option<(Track, Option<String>)> = None;
     let cmd = match &st.main {
         // Handled above; the match must still be total.
         MainView::Home | MainView::Playlists | MainView::Radio(_) => None,
+        // Every play carries its tracks: what you see is the play order the
+        // queue is built from. The list's cache key rides along only in its
+        // natural order — a sorted view is a snapshot of what was on screen,
+        // and later pages must not append to it out of order.
         MainView::Tracks(list) => {
-            let Some(&ti) = list.display.get(index) else {
+            if list.display.get(index).is_none() {
                 return;
-            };
-            let track = &list.tracks[ti];
-            expect = Some((
-                track.clone(),
-                pending_cover(track, list.header.cover_url.as_ref()),
-            ));
-            Some(if let Some(ctx) = &list.context_uri {
-                AppCommand::PlayContext {
-                    context_uri: ctx.clone(),
-                    offset_uri: Some(track.uri.clone()),
-                }
-            } else {
-                // Play what the user sees: URIs in display order.
-                adhoc = Some((list.header.name.clone(), display_tracks(list)));
-                AppCommand::PlayTracks {
-                    uris: list
-                        .display
-                        .iter()
-                        .map(|&i| list.tracks[i].uri.clone())
-                        .collect(),
-                    offset: index,
-                }
-            })
+            }
+            Some(play_list(list, index))
         }
         MainView::Artist(v) => match v.row(index) {
-            // Ad-hoc top-tracks queue: artist contexts ignore offsets, so play
-            // the visible list directly.
-            Some(ArtistRow::Track(t)) => {
-                adhoc = Some((v.name.clone(), display_tracks(&v.top)));
-                expect = Some((t.clone(), pending_cover(t, v.top.header.cover_url.as_ref())));
-                Some(AppCommand::PlayTracks {
-                    uris: v
-                        .top
-                        .display
-                        .iter()
-                        .map(|&i| v.top.tracks[i].uri.clone())
-                        .collect(),
-                    offset: index,
-                })
-            }
+            // The visible top-tracks list, played directly.
+            Some(ArtistRow::Track(_)) => Some(AppCommand::Play {
+                tracks: display_tracks(&v.top),
+                start: index,
+                name: v.name.clone(),
+                key: None,
+                loading: false,
+            }),
             // A card's row opens its album; its own ▶ play is what starts the
             // record without leaving the page.
             Some(ArtistRow::Album(a)) => Some(open_album_item(a)),
             None => None,
         },
         MainView::Search(results) => match st.search_tab {
-            SearchTab::Tracks => results.tracks.get(index).map(|t| {
-                adhoc = Some(("Search results".to_string(), results.tracks.clone()));
-                expect = Some((t.clone(), t.cover_url.clone()));
-                AppCommand::PlayTracks {
-                    uris: results.tracks.iter().map(|t| t.uri.clone()).collect(),
-                    offset: index,
-                }
+            SearchTab::Tracks => results.tracks.get(index).map(|_| AppCommand::Play {
+                tracks: results.tracks.clone(),
+                start: index,
+                name: "Search results".to_string(),
+                key: None,
+                loading: false,
             }),
             SearchTab::Albums => results.albums.get(index).map(open_album_item),
             SearchTab::Artists => results.artists.get(index).map(|a| AppCommand::OpenArtist {
@@ -1132,18 +1070,15 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             SearchTab::Playlists => results
                 .playlists
                 .get(index)
-                .map(|p| AppCommand::PlayContext {
-                    context_uri: p.uri.clone(),
-                    offset_uri: None,
+                .map(|p| AppCommand::PlayFetched {
+                    source: FetchSource::Playlist { id: p.id.clone() },
+                    name: p.name.clone(),
                 }),
             // Resolved above, before this match takes its borrow.
             SearchTab::Stations => None,
         },
     };
     let Some(cmd) = cmd else { return };
-    if let Some((name, tracks)) = adhoc {
-        install_adhoc_queue(st, name, tracks);
-    }
     // Drill-ins replace the view; keep a way back. Everything else here is
     // playback and leaves the path alone.
     if matches!(
@@ -1152,46 +1087,22 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     ) {
         navigate(st, cmd, tx);
     } else {
-        let (track, cover) = match &expect {
-            Some((t, c)) => (Some(t), c.clone()),
-            None => (None, None),
-        };
-        send_play(st, tx, cmd, track, cover);
+        let _ = tx.send(cmd);
     }
 }
 
-/// Send a play command, and paint what it is going to play now rather than a
-/// round trip later.
-///
-/// Every Spotify play goes through here. Playback is started over the Web API
-/// and heard back from a three-second `/me/player` poll, so without this the
-/// deck kept the previous record's title, sleeve and progress — over the
-/// previous record's audio — for as long as the two took. See
-/// [`AppState::begin_pending_play`], which does the painting, and
-/// [`AppState::resolve_pending`], which keeps a poll that has not caught up
-/// from undoing it.
-///
-/// `expect` is the row the click named, when it named one; `x` and the header's
-/// ▶ play a whole context from the top and let Spotify choose, so they pass
-/// `None` and get a blank item until the poll fills it in.
-fn send_play(
-    st: &mut AppState,
-    tx: &UnboundedSender<AppCommand>,
-    cmd: AppCommand,
-    expect: Option<&Track>,
-    cover_url: Option<String>,
-) {
-    st.begin_pending_play(expect, cover_url);
-    let _ = tx.send(cmd);
-}
-
-/// The sleeve to draw for a track while its play is in flight.
-///
-/// [`Track::cover_url`] is `None` for rows read off an album's own track list —
-/// that endpoint does not repeat the album object per row — and on that page
-/// the header is holding the very sleeve those rows want.
-fn pending_cover(track: &Track, header_cover: Option<&String>) -> Option<String> {
-    track.cover_url.clone().or_else(|| header_cover.cloned())
+/// The `Play` a track list's row `start` sends: the display order as the
+/// play order, with the source key attached only when the rows are in fetch
+/// order — the one order later pages can honestly extend.
+fn play_list(list: &TrackList, start: usize) -> AppCommand {
+    let natural = list.sort.key == SortKey::Position;
+    AppCommand::Play {
+        tracks: display_tracks(list),
+        start,
+        name: list.header.name.clone(),
+        key: list.cache_key.clone().filter(|_| natural),
+        loading: natural && list.loading,
+    }
 }
 
 /// The tracks of a list in display order, cloned.
@@ -1267,59 +1178,46 @@ fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCom
 }
 
 fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    let mut adhoc: Option<(String, Vec<Track>)> = None;
     let cmd = match &st.main {
-        MainView::Tracks(list) => {
-            if let Some(ctx) = &list.context_uri {
-                Some(AppCommand::PlayContext {
-                    context_uri: ctx.clone(),
-                    offset_uri: None,
-                })
-            } else if list.display.is_empty() {
-                None
-            } else {
-                adhoc = Some((list.header.name.clone(), display_tracks(list)));
-                Some(AppCommand::PlayTracks {
-                    uris: list
-                        .display
-                        .iter()
-                        .map(|&i| list.tracks[i].uri.clone())
-                        .collect(),
-                    offset: 0,
-                })
-            }
-        }
-        MainView::Artist(v) => Some(AppCommand::PlayContext {
-            context_uri: v.uri.clone(),
-            offset_uri: None,
+        MainView::Tracks(list) if !list.display.is_empty() => Some(play_list(list, 0)),
+        MainView::Tracks(_) => None,
+        // The page's top tracks, played as the list they are. This is where
+        // Spotify radio used to start; spot owns the queue now, and the top
+        // tracks are the page's own answer to "play this artist".
+        MainView::Artist(v) if !v.top.display.is_empty() => Some(AppCommand::Play {
+            tracks: display_tracks(&v.top),
+            start: 0,
+            name: v.name.clone(),
+            key: None,
+            loading: false,
         }),
         _ => None,
     };
     if let Some(cmd) = cmd {
-        if let Some((name, tracks)) = adhoc {
-            install_adhoc_queue(st, name, tracks);
-        }
-        // No expected track: this plays the whole thing from the top, and with
-        // shuffle on Spotify picks which. The deck goes title-less and says
-        // LOADING until the poll names it.
-        send_play(st, tx, cmd, None, None);
+        let _ = tx.send(cmd);
     }
 }
 
 /// `x`: play without opening — the selected playlist on a page that lists
-/// playlists, or the current view's context anywhere else.
+/// playlists, or the current view's list anywhere else.
 fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    // Every branch below needs a context URI, and Liked Songs is the one
-    // destination that has none: it is a set of saved tracks rather than a
-    // playlist, so there is nothing for the player to be pointed at.
-    let uri = match &st.main {
-        MainView::Playlists => st.playlists.get(st.main_index).map(|p| p.uri.clone()),
+    // The two playlist branches play a source whose rows are not in hand:
+    // the client fetches the pages and fills the queue as they land. Liked
+    // Songs is the one destination with no such source shortcut worth the
+    // trip — opening it is the way in, as it always has been.
+    let playlist = match &st.main {
+        MainView::Playlists => st
+            .playlists
+            .get(st.main_index)
+            .map(|p| (p.id.clone(), p.name.clone())),
         MainView::Home => match st.home_items().get(st.main_index) {
             Some(HomeItem::LikedSongs) => {
                 st.toast("open liked songs to play them");
                 return;
             }
-            Some(HomeItem::DiscoverWeekly) => st.discover_weekly().map(|p| p.uri.clone()),
+            Some(HomeItem::DiscoverWeekly) => {
+                st.discover_weekly().map(|p| (p.id.clone(), p.name.clone()))
+            }
             _ => None,
         },
         // A station is played, never opened, so `x` and Enter are the same
@@ -1332,7 +1230,7 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             return;
         }
         // Only on the Stations tab; the other four fall through to the
-        // current view's context below, as they always have.
+        // current view's list below, as they always have.
         MainView::Search(_) if st.search_tab == SearchTab::Stations => {
             if let Some(station) = selected_station(st).cloned() {
                 play_station(st, station, tx);
@@ -1344,17 +1242,11 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             return;
         }
     };
-    if let Some(context_uri) = uri {
-        send_play(
-            st,
-            tx,
-            AppCommand::PlayContext {
-                context_uri,
-                offset_uri: None,
-            },
-            None,
-            None,
-        );
+    if let Some((id, name)) = playlist {
+        let _ = tx.send(AppCommand::PlayFetched {
+            source: FetchSource::Playlist { id },
+            name,
+        });
     }
 }
 
@@ -1573,24 +1465,24 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
     }
 }
 
-/// `a`: add the selected track to the queue (track lists only).
+/// `a`: put the selected track next in the queue (track lists only).
 fn queue_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    let uri = match &st.main {
+    let track = match &st.main {
         MainView::Tracks(list) => list
             .display
             .get(st.main_index)
-            .map(|&i| list.tracks[i].uri.clone()),
+            .map(|&i| list.tracks[i].clone()),
         MainView::Search(results) if st.search_tab == SearchTab::Tracks => {
-            results.tracks.get(st.main_index).map(|t| t.uri.clone())
+            results.tracks.get(st.main_index).cloned()
         }
         MainView::Artist(v) => match v.row(st.main_index) {
-            Some(ArtistRow::Track(t)) => Some(t.uri.clone()),
+            Some(ArtistRow::Track(t)) => Some(t.clone()),
             _ => None,
         },
         _ => None,
     };
-    if let Some(uri) = uri {
-        let _ = tx.send(AppCommand::AddToQueue(uri));
+    if let Some(track) = track {
+        let _ = tx.send(AppCommand::QueueInsertNext(track));
     }
 }
 
@@ -1648,7 +1540,7 @@ fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// [`open_deck_album`]: under a station, `playback` is a record that stopped
 /// playing when the stream started.
 fn toggle_like_deck(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    let Some(uri) = st.deck_track().and_then(|t| t.uri().map(str::to_string)) else {
+    let Some(uri) = st.deck_track().map(|t| t.uri.clone()) else {
         return radio_has_no_track(st, "track");
     };
     send_like(st, uri, tx);
@@ -1673,15 +1565,15 @@ fn play_selected_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let Some(ArtistRow::Album(a)) = v.row(st.main_index) else {
         return;
     };
-    // No track — the record plays from the top and Spotify picks — but the card
-    // knows the sleeve, so the deck gets the artwork straight away even though
-    // it has nothing to title it with yet.
-    let cmd = AppCommand::PlayContext {
-        context_uri: format!("spotify:album:{}", a.id),
-        offset_uri: None,
-    };
-    let cover = a.cover_url.clone();
-    send_play(st, tx, cmd, None, cover);
+    // The card holds no rows, so the client fetches them: the first page
+    // starts the record, and the rest stream into the queue behind it.
+    let _ = tx.send(AppCommand::PlayFetched {
+        source: FetchSource::Album {
+            id: a.id.clone(),
+            year: a.release_year.clone(),
+        },
+        name: a.name.clone(),
+    });
 }
 
 #[cfg(test)]
@@ -1709,7 +1601,7 @@ mod tests {
 
     fn artist_state() -> AppState {
         let mut st = AppState::new();
-        let mut top = TrackList::new("Muse", "top tracks", None, None);
+        let mut top = TrackList::new("Muse", "top tracks", None);
         top.append(vec![track("Uprising", Some("a1"))]);
         st.main = MainView::Artist(ArtistView {
             id: "r1".into(),
@@ -1739,35 +1631,18 @@ mod tests {
         unbounded_channel()
     }
 
-    /// A snapshot playing out of `context_uri`, which is all the deck's
-    /// context row and `open_player` read.
-    fn playing(context_uri: &str) -> crate::app::state::PlaybackSnapshot {
-        crate::app::state::PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 0,
-            duration_ms: 1000,
-            track_uri: Some("spotify:track:Uprising".into()),
-            context_uri: Some(context_uri.into()),
-            artist_id: None,
-            album_id: None,
-            track_name: "Uprising".into(),
-            artists: "Muse".into(),
-            album: "Black Holes".into(),
-            release_year: "2006".into(),
-            cover_url: None,
-            shuffle: false,
-            repeat: crate::app::state::RepeatMode::Context,
-            volume_percent: 50,
-            device_name: "dev".into(),
-            is_local_device: true,
-            fetched_at: Instant::now(),
-        }
+    /// Put "Uprising" on: install the queue and transport state the client
+    /// would have written for it, which is all the deck controls read.
+    fn start_playing(st: &mut AppState) {
+        let q = crate::app::queue::Queue::new(vec![track("Uprising", Some("a1"))], 0, "Q");
+        st.queue = Some(q);
+        st.playback = Some(crate::app::state::Playback::started(50, false));
     }
 
     /// A two-track list with the first row already saved.
     fn liked_state() -> AppState {
         let mut st = AppState::new();
-        let mut list = TrackList::new("Black Holes", "Muse · 2006", None, None);
+        let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
         list.kind = TrackListKind::Album;
         list.append(vec![
             track("Starlight", Some("a1")),
@@ -1778,79 +1653,126 @@ mod tests {
         st
     }
 
-    /// Playback is started over the Web API and heard back from a three-second
-    /// poll, so the deck has to be painted here or it wears the previous record
-    /// — over the previous record's audio — for the whole round trip.
+    /// Every play carries its tracks in display order: the queue the client
+    /// installs is exactly the list on screen, started at the clicked row.
     #[test]
-    fn activating_a_row_paints_it_before_the_command_leaves() {
+    fn activating_a_row_sends_the_display_order() {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
         st.main_index = 1; // Hysteria
 
         activate_selection(&mut st, &tx);
 
-        let pb = st
-            .playback
-            .as_ref()
-            .expect("the deck has something to draw");
-        assert_eq!(pb.track_name, "Hysteria");
-        assert_eq!(pb.artists, "Muse");
-        assert_eq!(pb.album, "Black Holes");
-        assert_eq!(pb.cover_url.as_deref(), Some("https://i.scdn.co/image/abc"));
-        assert_eq!(pb.interpolated_progress_ms(), 0);
-        assert_eq!(
-            st.pending_play
-                .as_ref()
-                .and_then(|p| p.expect_uri.as_deref()),
-            Some("spotify:track:Hysteria")
-        );
-        // And the play still goes out.
-        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayTracks { .. })));
+        match rx.try_recv() {
+            Ok(AppCommand::Play {
+                tracks,
+                start,
+                name,
+                ..
+            }) => {
+                assert_eq!(start, 1);
+                assert_eq!(name, "Black Holes");
+                let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, ["Starlight", "Hysteria"]);
+            }
+            other => panic!("sent {other:?}"),
+        }
     }
 
-    /// A station is playing and a track is clicked. Every deck checks radio
-    /// before Spotify, so a station left set would keep drawing over the track
-    /// that is starting — and it must go on the click, not when the client
-    /// gets round to the command.
+    /// A sorted view plays as the snapshot it is: the rows go out in display
+    /// order, and the cache key stays behind — later pages arrive in fetch
+    /// order and must not be appended to a queue that is not in it.
     #[test]
-    fn playing_a_track_drops_the_station_on_the_click() {
-        let (tx, _rx) = channel();
-        let mut st = liked_state();
-        st.radio = Some(crate::app::state::RadioPlayback {
-            station: test_station("s", "A Station"),
-            is_playing: true,
-            started_at: Instant::now(),
-            title: Default::default(),
-            volume_percent: 40,
-            matched: Default::default(),
-        });
-
-        activate_selection(&mut st, &tx);
-
-        assert!(st.radio.is_none());
-    }
-
-    /// The header's ▶ and `x` play a whole context from the top; with shuffle
-    /// on, Spotify picks which track. There is nothing honest to title the deck
-    /// with until the poll answers, but the wait still has to be recorded so
-    /// the row says LOADING and the poll cannot put the old record back.
-    #[test]
-    fn playing_a_view_from_the_top_names_no_track() {
+    fn a_sorted_view_plays_its_rows_without_the_source_key() {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
         if let MainView::Tracks(list) = &mut st.main {
-            list.context_uri = Some("spotify:album:a1".into());
+            list.cache_key = Some(state::album_key("a1"));
+            list.loading = true;
+            list.sort = crate::app::state::TrackSort {
+                key: SortKey::Title,
+                ascending: true,
+            };
+            list.rebuild_display();
         }
+        st.resort_main();
+
+        activate_selection(&mut st, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::Play { key, loading, .. }) => {
+                assert!(key.is_none(), "a sorted view kept its key");
+                assert!(!loading);
+            }
+            other => panic!("sent {other:?}"),
+        }
+
+        // In natural order the key rides along, so the queue can grow with
+        // the view.
+        let mut st = liked_state();
+        if let MainView::Tracks(list) = &mut st.main {
+            list.cache_key = Some(state::album_key("a1"));
+            list.loading = true;
+        }
+        activate_selection(&mut st, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::Play { key, loading, .. }) => {
+                assert_eq!(key.as_deref(), Some("album:a1"));
+                assert!(loading);
+            }
+            other => panic!("sent {other:?}"),
+        }
+    }
+
+    /// Enter on a queue row is one instant command: the queue is the play
+    /// order, so the client only has to point at the row.
+    #[test]
+    fn enter_on_a_queue_row_sends_a_jump() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.queue = Some(crate::app::queue::Queue::new(
+            vec![track("Starlight", None), track("Hysteria", None)],
+            0,
+            "Q",
+        ));
+        st.queue_index = 1;
+        play_from_queue(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::JumpTo(1))));
+
+        // A cursor past the end of the queue jumps nowhere.
+        st.queue_index = 7;
+        play_from_queue(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `a` carries the whole selected track, so the client can put it in the
+    /// queue without a fetch.
+    #[test]
+    fn a_sends_the_selected_track_to_play_next() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.main_index = 1;
+        queue_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::QueueInsertNext(t)) if t.name == "Hysteria"
+        ));
+    }
+
+    /// The header's ▶ and `x` play the view from the top.
+    #[test]
+    fn playing_a_view_from_the_top_starts_at_row_zero() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
 
         play_current_view(&mut st, &tx);
 
-        let pending = st.pending_play.as_ref().expect("a play is outstanding");
-        assert!(pending.expect_uri.is_none());
-        assert_eq!(
-            st.playback.as_ref().map(|pb| pb.track_name.as_str()),
-            Some("")
-        );
-        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayContext { .. })));
+        match rx.try_recv() {
+            Ok(AppCommand::Play { start, tracks, .. }) => {
+                assert_eq!(start, 0);
+                assert_eq!(tracks.len(), 2);
+            }
+            other => panic!("sent {other:?}"),
+        }
     }
 
     /// `L` flips whatever is known about the selected row: the saved one is
@@ -1884,7 +1806,7 @@ mod tests {
         st.show_player = true;
         // The selection says Starlight; playback says Uprising.
         st.main_index = 0;
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         toggle_like_selection(&mut st, &tx);
         assert!(
             matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
@@ -1899,7 +1821,7 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
         st.main = MainView::Playlists;
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         toggle_like_selection(&mut st, &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, .. })
                 if uri == "spotify:track:Uprising"));
@@ -1945,7 +1867,7 @@ mod tests {
     fn clicking_the_decks_control_likes_the_playing_track() {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         st.hit.like_btn = Rect::new(70, 20, 9, 1);
         handle_click(&mut st, Position { x: 72, y: 20 }, &tx);
         assert!(
@@ -2039,12 +1961,12 @@ mod tests {
         st.main_index = 1;
         play_selected_album(&mut st, &tx);
         match rx.try_recv() {
-            Ok(AppCommand::PlayContext {
-                context_uri,
-                offset_uri,
+            Ok(AppCommand::PlayFetched {
+                source: FetchSource::Album { id, .. },
+                name,
             }) => {
-                assert_eq!(context_uri, "spotify:album:a1");
-                assert_eq!(offset_uri, None);
+                assert_eq!(id, "a1");
+                assert_eq!(name, "Black Holes");
             }
             other => panic!("sent {other:?}"),
         }
@@ -2088,7 +2010,7 @@ mod tests {
         let mut st = AppState::new();
         // Home → the album, from a track row.
         st.push_view();
-        let mut list = TrackList::new("Black Holes", "Muse · 2006", None, None);
+        let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
         list.kind = TrackListKind::Album;
         list.cache_key = Some(state::album_key("a1"));
         list.append(vec![track("Starlight", Some("a1"))]);
@@ -2125,10 +2047,7 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = artist_state();
         st.push_view();
-        st.playback = Some(playing("spotify:playlist:p1"));
-        if let Some(pb) = st.playback.as_mut() {
-            pb.artist_id = Some("r1".into());
-        }
+        start_playing(&mut st);
         st.show_player = true;
         st.hit.now_artist = Rect::new(4, 9, 6, 1);
 
@@ -2211,7 +2130,7 @@ mod tests {
         let mut st = AppState::new();
         st.push_view(); // home
         for i in 0..40 {
-            let mut list = TrackList::new(format!("page {i}"), "", None, None);
+            let mut list = TrackList::new(format!("page {i}"), "", None);
             list.cache_key = Some(state::playlist_key(&i.to_string()));
             st.main = MainView::Tracks(list);
             st.push_view();
@@ -2230,7 +2149,7 @@ mod tests {
     fn an_album_page_does_not_reopen_itself() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        let mut list = TrackList::new("Black Holes", "Muse · 2006", None, None);
+        let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
         list.kind = TrackListKind::Album;
         // The identity is the cache key, not the context URI: the latter is
         // `None` for Liked Songs and empty for a playlist that was not in
@@ -2260,11 +2179,11 @@ mod tests {
 
         let make = |kind| {
             let mut st = AppState::new();
-            let mut before = TrackList::new("Liked Songs", "", None, None);
+            let mut before = TrackList::new("Liked Songs", "", None);
             before.append(vec![track("Uprising", Some("a1"))]);
             st.main = MainView::Tracks(before);
             st.push_view();
-            let mut list = TrackList::new("Black Holes", "Muse · 2006", None, None);
+            let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
             list.kind = kind;
             list.append(vec![track("Starlight", Some("a1"))]);
             st.main = MainView::Tracks(list);
@@ -2292,7 +2211,6 @@ mod tests {
     fn playlist(id: &str, name: &str, owner_id: &str) -> Playlist {
         Playlist {
             id: id.into(),
-            uri: format!("spotify:playlist:{id}"),
             name: name.into(),
             track_count: 18,
             owner: owner_id.into(),
@@ -2334,7 +2252,7 @@ mod tests {
         assert_eq!(st.view_stack.len(), 2);
         // The page is pushed on the click and the tracks arrive later, so
         // until they do the head is still the list you clicked from.
-        st.main = MainView::Tracks(TrackList::new("trendy", "", None, None));
+        st.main = MainView::Tracks(TrackList::new("trendy", "", None));
         // Each drill-in adds a step rather than replacing the one before it,
         // which is what the trail on the section row spells out.
         assert_eq!(labels(&st), ["playlists", "trendy"]);
@@ -2454,7 +2372,7 @@ mod tests {
         st.main = MainView::Playlists;
         st.main_index = 4;
         st.push_view();
-        st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+        st.main = MainView::Tracks(TrackList::new("Black Holes", "", None));
         st.main_index = 7;
 
         st.hit.crumbs = vec![
@@ -2508,7 +2426,7 @@ mod tests {
     fn the_back_control_follows_back_target() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        let mut list = TrackList::new("Black Holes", "Muse · 2006", None, None);
+        let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
         list.kind = TrackListKind::Album;
         list.append(vec![track("Starlight", Some("a1"))]);
         st.main = MainView::Tracks(list);
@@ -2544,12 +2462,9 @@ mod tests {
 
         handle_click(&mut st, on_name, &tx);
         assert!(st.show_player, "the name should open the player");
-        // Opening goes through `open_player`, so a queue belonging to some
-        // other context is reloaded — exactly as pressing `v` would.
-        st.show_player = false;
-        st.playback = Some(playing("spotify:playlist:p1"));
-        handle_click(&mut st, on_name, &tx);
-        assert!(matches!(rx.try_recv(), Ok(AppCommand::LoadQueue)));
+        // Nothing to fetch on the way in: the queue is always present and
+        // always correct, because spot wrote it on the play.
+        assert!(rx.try_recv().is_err());
 
         handle_click(&mut st, on_name, &tx);
         assert!(!st.show_player, "clicking it again should close the player");
@@ -2728,7 +2643,7 @@ mod tests {
                 count: 1,
             }],
         );
-        st.playback = Some(playing("spotify:playlist:p1"));
+        start_playing(&mut st);
         toggle_like_selection(&mut st, &tx);
         assert!(rx.try_recv().is_err(), "a facet row likes nothing");
     }
@@ -2787,7 +2702,7 @@ mod tests {
         let mut st = AppState::new();
         st.main = station_search(test_station("a", "Radio Paradise"));
         st.search_tab = SearchTab::Stations;
-        st.playback = Some(playing("spotify:playlist:p1"));
+        start_playing(&mut st);
         toggle_like_selection(&mut st, &tx);
         assert!(matches!(
             rx.try_recv(),
@@ -3126,11 +3041,12 @@ mod tests {
         handle_click(&mut st, on_status, &tx);
         assert!(!st.show_player, "and close it again");
 
-        // Opening goes through `open_player`, so a queue belonging to some
-        // other context is reloaded — exactly as pressing `v` would.
-        st.playback = Some(playing("spotify:playlist:p1"));
+        // Nothing to fetch on the way in: the queue is spot's own and needs
+        // no reload, whatever is playing.
+        start_playing(&mut st);
         handle_click(&mut st, on_status, &tx);
-        assert!(matches!(rx.try_recv(), Ok(AppCommand::LoadQueue)));
+        assert!(rx.try_recv().is_err());
+        st.show_player = false;
 
         // Clicked while typing it does not lose the mode quietly to the
         // "a click elsewhere cancels the input" branch: it clears the box
@@ -3165,7 +3081,7 @@ mod tests {
     fn the_decks_control_likes_the_matched_track_not_the_kept_snapshot() {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         st.radio = Some(matched_radio());
         st.hit.like_btn = Rect::new(70, 20, 9, 1);
 
@@ -3183,7 +3099,7 @@ mod tests {
     fn the_decks_control_says_why_it_did_nothing_without_a_match() {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         let mut r = live_radio(test_station("s1", "Adroit Jazz"));
         r.matched = RadioMatch::Unmatched;
         st.radio = Some(r);
@@ -3198,7 +3114,7 @@ mod tests {
     fn clicking_the_radio_decks_artist_opens_the_matched_artist() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         st.radio = Some(matched_radio());
         st.show_player = true;
         st.hit.now_artist = Rect::new(4, 9, 6, 1);
@@ -3218,7 +3134,7 @@ mod tests {
     fn clicking_the_radio_decks_album_opens_the_matched_album() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         st.radio = Some(matched_radio());
         st.hit.now_album = Rect::new(20, 9, 6, 1);
 
@@ -3257,7 +3173,7 @@ mod tests {
     fn b_still_does_nothing_on_a_spotify_page_with_no_album_row() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         open_album_of_selection(&mut st, &tx);
         assert!(rx.try_recv().is_err());
     }
@@ -3290,7 +3206,7 @@ mod tests {
     fn the_station_rows_star_saves_the_station_not_its_matched_record() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        st.playback = Some(playing("spotify:album:a1"));
+        start_playing(&mut st);
         st.radio = Some(matched_radio());
         st.hit.like_btn = Rect::new(70, 20, 9, 1);
         st.hit.save_station_btn = Rect::new(70, 24, 7, 1);

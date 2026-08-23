@@ -11,13 +11,13 @@ use crate::app::state::{
     TrackSort, format_duration,
 };
 
-/// Playback context needed to mark the playing row, copied out of
-/// `AppState.playback` before the draw split-borrow.
+/// Playback context needed to mark the playing row, copied out of the queue
+/// before the draw split-borrow.
 struct PlayMarks {
     /// URI of the playing track, if any.
     uri: Option<String>,
-    /// URI of the playing context, for marking the row of the playlist it
-    /// came out of.
+    /// The playing queue's source key ("playlist:<id>", …), for marking the
+    /// row of the playlist it came out of.
     context: Option<String>,
 }
 
@@ -31,9 +31,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let search_tab = state.search_tab;
     let main_index = state.main_index;
     let mouse = state.mouse_pos;
+    let playing_queue = state.playback.as_ref().and(state.queue.as_ref());
     let marks = PlayMarks {
-        uri: state.playback.as_ref().and_then(|p| p.track_uri.clone()),
-        context: state.playback.as_ref().and_then(|p| p.context_uri.clone()),
+        uri: playing_queue
+            .and_then(|q| q.current())
+            .map(|t| t.uri.clone()),
+        context: playing_queue.and_then(|q| q.source_key.clone()),
     };
     let me_id = state.me_id.clone();
     // The station playing, if one is, so a radio page can mark its row the way
@@ -282,7 +285,8 @@ fn draw_playlists(
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let playing = marks.context.as_deref() == Some(p.uri.as_str());
+            let playing =
+                marks.context.as_deref() == Some(crate::app::state::playlist_key(&p.id).as_str());
             playlist_row(p, &cols, me_id, playing, i == main_index)
         })
         .collect();
@@ -2482,7 +2486,8 @@ fn draw_search(
                 // the exception here, not the rule. The playing marker still
                 // applies — a result can be the queue you are listening to.
                 .map(|(i, p)| {
-                    let playing = marks.context.as_deref() == Some(p.uri.as_str());
+                    let playing = marks.context.as_deref()
+                        == Some(crate::app::state::playlist_key(&p.id).as_str());
                     playlist_row(p, &cols, None, playing, i == main_index)
                 })
                 .collect()
@@ -2502,7 +2507,7 @@ mod tests {
     use ratatui::layout::Position;
 
     use super::*;
-    use crate::app::state::{AppState, PlaybackSnapshot, Playlist, RepeatMode, SearchResults};
+    use crate::app::state::{AppState, Playlist, SearchResults};
 
     fn track(name: &str, artists: &str) -> Track {
         Track {
@@ -2521,33 +2526,19 @@ mod tests {
 
     fn tracks_state(tracks: Vec<Track>) -> AppState {
         let mut st = AppState::new();
-        let mut list = crate::app::state::TrackList::new("My List", "", None, None);
+        let mut list = crate::app::state::TrackList::new("My List", "", None);
         list.append(tracks);
         st.main = MainView::Tracks(list);
         st
     }
 
-    fn playing(uri: &str) -> PlaybackSnapshot {
-        PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 0,
-            duration_ms: 100_000,
-            track_uri: Some(uri.into()),
-            context_uri: None,
-            artist_id: None,
-            album_id: None,
-            track_name: "x".into(),
-            artists: "x".into(),
-            album: "x".into(),
-            release_year: "2020".into(),
-            cover_url: None,
-            shuffle: false,
-            repeat: RepeatMode::Off,
-            volume_percent: 50,
-            device_name: "dev".into(),
-            is_local_device: true,
-            fetched_at: std::time::Instant::now(),
-        }
+    /// Mark `uri` as the playing track: a one-row queue pointing at it, and
+    /// the transport state that says something is on.
+    fn play_uri(st: &mut AppState, uri: &str) {
+        let mut t = track("x", "x");
+        t.uri = uri.into();
+        st.queue = Some(crate::app::queue::Queue::new(vec![t], 0, "Q"));
+        st.playback = Some(crate::app::state::Playback::started(50, false));
     }
 
     /// Rows the header takes above the pane. The path a page draws is on it,
@@ -2745,7 +2736,7 @@ mod tests {
             name: "Donna The Buffalo".into(),
             image_url: None,
             genres: vec![],
-            top: crate::app::state::TrackList::new("Donna The Buffalo", "", None, None),
+            top: crate::app::state::TrackList::new("Donna The Buffalo", "", None),
             albums: vec![],
             display: Vec::new(),
             tab: crate::app::state::ArtistTab::Albums,
@@ -2781,7 +2772,7 @@ mod tests {
         let mut st = tracks_state(vec![track("One", "Donna")]);
         let page = st.main.clone();
         for name in ["home", "one", "two", "three"] {
-            let mut list = crate::app::state::TrackList::new(name, "", None, None);
+            let mut list = crate::app::state::TrackList::new(name, "", None);
             // Distinct identities, or `push_view` would collapse them.
             list.cache_key = Some(crate::app::state::playlist_key(name));
             st.main = MainView::Tracks(list);
@@ -2821,7 +2812,6 @@ mod tests {
         st.playlists = vec![
             Playlist {
                 id: "p1".into(),
-                uri: "spotify:playlist:p1".into(),
                 name: "trendy".into(),
                 track_count: 18,
                 owner: "Dalton M".into(),
@@ -2830,7 +2820,6 @@ mod tests {
             },
             Playlist {
                 id: "p2".into(),
-                uri: "spotify:playlist:p2".into(),
                 name: "New Music Friday".into(),
                 track_count: 38,
                 owner: "NPR Music".into(),
@@ -3056,7 +3045,7 @@ mod tests {
             track("Beta", "Bob"),
             track("Gamma", "Cyd"),
         ]);
-        st.playback = Some(playing("spotify:track:Beta"));
+        play_uri(&mut st, "spotify:track:Beta");
         let lines = render(&mut st, 90, 14);
         // Trail + blank, then the band (summary, ▶ play, spacer),
         // then the column header + spacer, then the rows.
@@ -3138,7 +3127,7 @@ mod tests {
             track("Apple", "A2"),
             track("Mango", "A3"),
         ]);
-        st.playback = Some(playing("spotify:track:Zebra"));
+        play_uri(&mut st, "spotify:track:Zebra");
         if let MainView::Tracks(list) = &mut st.main {
             list.sort = crate::app::state::TrackSort {
                 key: SortKey::Title,
@@ -3345,7 +3334,6 @@ mod tests {
             }],
             playlists: vec![Playlist {
                 id: "p1".into(),
-                uri: "spotify:playlist:p1".into(),
                 name: "Muse Mix".into(),
                 track_count: 42,
                 owner: "someone".into(),
@@ -3573,7 +3561,7 @@ mod tests {
 
     fn artist_state_with(albums: Vec<crate::app::state::AlbumItem>) -> AppState {
         let mut st = AppState::new();
-        let mut top = crate::app::state::TrackList::new("Muse", "top tracks", None, None);
+        let mut top = crate::app::state::TrackList::new("Muse", "top tracks", None);
         top.append(vec![track("Uprising", "Muse")]);
         let mut v = crate::app::state::ArtistView {
             id: "r1".into(),

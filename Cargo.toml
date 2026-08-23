@@ -16,12 +16,14 @@ winresource = "0.1"
 [dependencies]
 librespot-core = "0.8.0"
 librespot-playback = "0.8.0"
-librespot-connect = "0.8.0"
 # Already in the tree under librespot-playback, which does not re-export it —
 # `PlayerEvent::TrackChanged` carries an `AudioItem` and the deck reads it.
 librespot-metadata = "0.8.0"
 librespot-oauth = "0.8.0"
 rspotify = "0.16.1"
+# The queue's shuffle. Pinned to the 0.9 line librespot-playback already
+# resolves, so only one copy is compiled.
+rand = "0.9"
 ratatui = "0.30.2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

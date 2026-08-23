@@ -2,9 +2,6 @@
 //! column fitting, selection styling, hoverable segments, scrollbars, cover
 //! art, and the transport controls the player view and the bottom bar share.
 
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -402,31 +399,6 @@ fn placeholder(seed: &str, cols: usize, rows: usize) -> Vec<[u8; 3]> {
         .collect()
 }
 
-/// Period of the header status dot's pulse.
-const PULSE: Duration = Duration::from_millis(1800);
-
-/// Style for the header's status dot at a given moment. It breathes so the
-/// header shows liveness at a glance even when the visualizer has nothing to
-/// say — a silent passage, or audio coming from another device. Brightness
-/// rides a cosine so the turn at each end is soft; a linear ramp reads as a
-/// blink.
-///
-/// The player view already redraws at ~20 fps for the visualizer, so this
-/// costs no extra wakeups. The transport's own buttons sit still: they are
-/// controls to click, not indicators, and movement under the cursor is noise.
-pub(super) fn pulse_style(now: Instant) -> Style {
-    static ORIGIN: OnceLock<Instant> = OnceLock::new();
-    let elapsed = now.saturating_duration_since(*ORIGIN.get_or_init(|| now));
-    pulse_at(elapsed.as_secs_f32() / PULSE.as_secs_f32())
-}
-
-/// The pulse itself, as a fraction of a period. Split out from the clock so
-/// the shape can be checked without one.
-fn pulse_at(phase: f32) -> Style {
-    let t = (1.0 - (phase * std::f32::consts::TAU).cos()) / 2.0;
-    theme::accent_at(0.45 + 0.55 * t)
-}
-
 /// The play-state pill. The word is padded out to a fixed width so the run
 /// cannot shift under the cursor when it toggles; the run itself carries no
 /// padding, so the hover pill covers the text and nothing else.
@@ -523,8 +495,7 @@ pub fn draw_volume(
 
 #[cfg(test)]
 mod tests {
-    use super::{fit, pulse_at};
-    use crate::ui::theme;
+    use super::fit;
 
     #[test]
     fn fit_pads_short_strings_to_width() {
@@ -553,18 +524,5 @@ mod tests {
         assert_eq!(fit("abc", 0), "");
         assert_eq!(fit("abc", 1), "…");
         assert_eq!(fit("残", 1), "…");
-    }
-
-    /// The pulse rides a cosine, so it turns softly at each end rather than
-    /// blinking, and it comes all the way back around.
-    #[test]
-    fn playing_dot_breathes_over_its_period() {
-        let at = |phase: f32| pulse_at(phase).fg.unwrap();
-        assert_ne!(at(0.0), at(0.5), "the dot never changes brightness");
-        assert_eq!(at(0.0), at(1.0), "the pulse does not loop");
-        // Symmetric about the peak: rising and falling pass the same values.
-        assert_eq!(at(0.25), at(0.75));
-        // And it is a breath, not a blink — the dimmest state is still lit.
-        assert_ne!(at(0.0), theme::accent_at(0.0).fg.unwrap());
     }
 }

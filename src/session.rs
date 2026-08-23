@@ -1,11 +1,10 @@
-use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
-use librespot_core::config::{DeviceType, SessionConfig};
+use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_playback::config::PlayerConfig;
 use librespot_playback::mixer::{self, Mixer, MixerConfig};
@@ -13,15 +12,19 @@ use librespot_playback::player::{Player, PlayerEventChannel};
 
 use crate::audio_sink::SpotSink;
 use crate::audio_tap::{AudioTap, TapSink};
-use crate::{auth, config};
+use crate::{auth, client, config};
 
-/// Turn a failed Connect handshake into something a first-time user can act on.
+/// How often the player reports its position while playing. This is what
+/// keeps the progress bar anchored to the audio rather than to a guess.
+const POSITION_UPDATE: Duration = Duration::from_millis(500);
+
+/// Turn a failed session login into something a first-time user can act on.
 ///
 /// The two failures worth naming are a non-Premium account and stale cached
 /// credentials; librespot reports both as a login failure whose reason only
 /// appears in the message text, so that is what we match on. Anything else
 /// keeps the generic wrapper and the original error underneath.
-fn explain_connect_failure(e: librespot_core::Error) -> anyhow::Error {
+fn explain_session_failure(e: librespot_core::Error) -> anyhow::Error {
     let detail = e.to_string();
     let hint = if detail.contains("Premium account required") {
         "\nspot streams audio itself through librespot, which Spotify only \
@@ -32,26 +35,24 @@ fn explain_connect_failure(e: librespot_core::Error) -> anyhow::Error {
     } else {
         ""
     };
-    anyhow::anyhow!("failed to start Spotify Connect device: {detail}{hint}")
+    anyhow::anyhow!("failed to start the playback engine: {detail}{hint}")
 }
 
-/// Build the librespot session, audio player and Spirc Connect device.
-/// Returns the session, the Spirc control handle, the Spirc event-loop
-/// future (which the caller must spawn), the PCM tap feeding the visualizer,
-/// the soft mixer, and the player's event channel.
+/// Build the librespot session and the audio player spot drives directly.
+/// Returns the session, the player, the PCM tap feeding the visualizer, the
+/// soft mixer, and the player's event channel.
 ///
-/// The mixer and the event channel are what let the UI show playback state
-/// without waiting on the Web API: the mixer holds the volume actually being
-/// applied, and the events say when playback really started or stopped. Both
-/// are local and immediate, where `/me/player` is neither.
+/// There is no Spirc and no Connect device: spot owns the queue and the
+/// transport, so the session only has to stream audio and metadata. The
+/// mixer holds the volume actually being applied, and the player events say
+/// when playback really started, stopped or moved — all local and immediate.
 ///
 /// Credentials come from librespot's cache when available (stored on the
 /// first successful connect); otherwise this runs a one-time interactive
 /// OAuth flow with the keymaster client ID.
 pub async fn build() -> Result<(
     Session,
-    Spirc,
-    impl Future<Output = ()> + use<>,
+    Arc<Player>,
     Arc<AudioTap>,
     Arc<dyn Mixer>,
     PlayerEventChannel,
@@ -77,19 +78,38 @@ pub async fn build() -> Result<(
         }
     };
 
+    // The volume the last session left, before the session is built — the
+    // cache moves into it. Spirc used to restore this; now it is ours to do.
+    let saved_volume = cache
+        .volume()
+        .unwrap_or_else(|| client::pct_to_raw(client::DEFAULT_VOLUME_PCT));
+
     let session_config = SessionConfig::default(); // keymaster client_id on desktop
     let session = Session::new(session_config, Some(cache));
 
+    // The same login Spirc used to make on spot's behalf. Without it the
+    // session has no connection for the player to fetch audio over.
+    session
+        .connect(credentials, true)
+        .await
+        .map_err(explain_session_failure)?;
+
     let mixer_fn = mixer::find(None).context("no mixer available")?;
     let mixer = mixer_fn(MixerConfig::default()).context("failed to open mixer")?;
+    mixer.set_volume(saved_volume);
 
     let tap = Arc::new(AudioTap::new());
     let sink_tap = Arc::clone(&tap);
     // Second soft-volume handle for the tap, so it can undo the attenuation
     // the player applies before samples reach the sink.
     let tap_volume = mixer.get_soft_volume();
+    let player_config = PlayerConfig {
+        // Progress events while playing; the default is never to send them.
+        position_update_interval: Some(POSITION_UPDATE),
+        ..Default::default()
+    };
     let player = Player::new(
-        PlayerConfig::default(),
+        player_config,
         session.clone(),
         mixer.get_soft_volume(),
         move || {
@@ -102,25 +122,7 @@ pub async fn build() -> Result<(
         },
     );
 
-    // Taken before `Spirc::new` consumes the player: these are what tell the
-    // UI that playback really started or stopped, with no Web API round trip.
     let player_events = player.get_player_event_channel();
 
-    let connect_config = ConnectConfig {
-        name: config::DEVICE_NAME.to_string(),
-        device_type: DeviceType::Computer,
-        ..Default::default()
-    };
-
-    let (spirc, spirc_task) = Spirc::new(
-        connect_config,
-        session.clone(),
-        credentials,
-        player,
-        Arc::clone(&mixer),
-    )
-    .await
-    .map_err(explain_connect_failure)?;
-
-    Ok((session, spirc, spirc_task, tap, mixer, player_events))
+    Ok((session, player, tap, mixer, player_events))
 }

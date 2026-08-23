@@ -27,7 +27,8 @@ use super::table::{
     art_w, draw_art, draw_volume, fit, link, meter, right_row, segment, state_spans, width,
 };
 use super::theme;
-use crate::app::state::{HitAreas, PlaybackSnapshot, RadioPlayback, TrackList, format_duration};
+use crate::app::queue::Queue;
+use crate::app::state::{HitAreas, Playback, RadioPlayback, Track, format_duration};
 use crate::cover::Cover;
 
 /// Rows [`masthead`] occupies: the title, and the metadata under it.
@@ -89,7 +90,7 @@ pub fn no_playback_hint(frame: &mut Frame, area: Rect) {
 pub fn sleeve(
     frame: &mut Frame,
     area: Rect,
-    pb: &PlaybackSnapshot,
+    track: &Track,
     cover: Option<&Cover>,
     hit: &mut HitAreas,
 ) -> Rect {
@@ -99,7 +100,7 @@ pub fn sleeve(
     };
     // Seeded on the album so a given record always gets the same
     // placeholder, and it does not reshuffle between tracks of one sleeve.
-    let seed = pb.album_id.as_deref().unwrap_or(pb.track_name.as_str());
+    let seed = track.album_id.as_deref().unwrap_or(track.name.as_str());
     draw_art(frame, art, cover, seed);
     hit.art = art;
     art
@@ -120,7 +121,8 @@ pub fn sleeve(
 pub fn masthead(
     frame: &mut Frame,
     area: Rect,
-    pb: &PlaybackSnapshot,
+    track: &Track,
+    volume_percent: u8,
     liked: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
@@ -134,13 +136,12 @@ pub fn masthead(
     // control opposite it. The state pill used to hold that end; it moved down to the
     // transport, which left the one control the deck was missing a home.
     //
-    // Drawn only once the saved state is known — an episode has no track id to
-    // save, and a control that cannot say which way it would go is worse than
-    // none at all. `right_row` drops it whole on a row too narrow for it, so the
-    // title never has to share its cells with half a control.
+    // Drawn only once the saved state is known — a control that cannot say
+    // which way it would go is worse than none at all. `right_row` drops it
+    // whole on a row too narrow for it, so the title never has to share its
+    // cells with half a control.
     let title_row = Rect { height: 1, ..area };
-    let like = liked.filter(|_| pb.track_uri.is_some());
-    if let Some(liked) = like {
+    if let Some(liked) = liked {
         let style = if liked { theme::accent() } else { dim };
         let label = like_label(liked);
         hit.like_btn = right_row(
@@ -150,18 +151,6 @@ pub fn masthead(
             vec![vec![Span::styled(label, style)]],
         )[0];
     }
-    // A play in flight that named no track — the header's ▶ on a context, where
-    // Spotify picks which record starts. There is nothing honest to put here
-    // until the poll answers, and an empty title row reads as a rendering
-    // fault rather than as a title that has not arrived. The poll is
-    // the only other thing that writes the name, and it always writes one, so
-    // an empty one can only mean this.
-    let loading = pb.track_name.is_empty();
-    let title = if loading {
-        "loading…"
-    } else {
-        pb.track_name.as_str()
-    };
     // One cell of daylight between the title and the control, so a title that
     // runs the full width ends in an ellipsis rather than against the pill.
     let title_w = if hit.like_btn.is_empty() {
@@ -169,15 +158,11 @@ pub fn masthead(
     } else {
         title_row.width.saturating_sub(hit.like_btn.width + 1)
     };
-    // A placeholder is not a title: dim and unbolded, so it recedes rather than
-    // sitting where a record's name will be in the loudest weight on the deck.
-    let title_style = if loading {
-        theme::dim()
-    } else {
-        theme::accent().add_modifier(Modifier::BOLD)
-    };
     frame.render_widget(
-        Paragraph::new(Line::styled(fit(title, title_w as usize), title_style)),
+        Paragraph::new(Line::styled(
+            fit(&track.name, title_w as usize),
+            theme::accent().add_modifier(Modifier::BOLD),
+        )),
         Rect {
             width: title_w,
             ..title_row
@@ -196,7 +181,7 @@ pub fn masthead(
         height: 1,
         ..area
     };
-    let vol_seg = draw_volume(frame, row, pb.volume_percent, mouse, hit);
+    let vol_seg = draw_volume(frame, row, volume_percent, mouse, hit);
     let meta = Rect {
         width: row.width.saturating_sub(vol_seg.width + 1),
         ..row
@@ -211,15 +196,15 @@ pub fn masthead(
         &mut x,
         meta,
         mouse,
-        clip(&pb.artists, meta),
+        clip(&track.artists, meta),
         theme::text(),
-        pb.artist_id.is_some(),
+        track.artist_id.is_some(),
     );
     // The album is printed even when it only repeats the artist or the track.
     // A self-titled single does read as "Abeichizoku · Abeichizoku", but the
     // two names are links to two different pages, and dropping one leaves the
     // record with no way to be opened.
-    let album = clip(&pb.album, meta);
+    let album = clip(&track.album, meta);
     if sep(&mut spans, &mut x, &album, meta) {
         hit.now_album = link(
             &mut spans,
@@ -228,11 +213,11 @@ pub fn masthead(
             mouse,
             album,
             dim,
-            pb.album_id.is_some(),
+            track.album_id.is_some(),
         );
     }
-    if !pb.release_year.is_empty() && sep(&mut spans, &mut x, &pb.release_year, meta) {
-        spans.push(Span::styled(pb.release_year.clone(), dim));
+    if !track.release_year.is_empty() && sep(&mut spans, &mut x, &track.release_year, meta) {
+        spans.push(Span::styled(track.release_year.clone(), dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), meta);
 }
@@ -612,20 +597,20 @@ pub fn radio_station_row(
 /// seeks — the volume slider is the one that keeps its handle.
 ///
 /// Records `hit.gauge` over the track alone — clicking anywhere on it seeks.
-pub fn progress(frame: &mut Frame, row: Rect, pb: &PlaybackSnapshot, hit: &mut HitAreas) {
+pub fn progress(frame: &mut Frame, row: Rect, pb: &Playback, duration_ms: u64, hit: &mut HitAreas) {
     if row.width <= TIME_W {
         return;
     }
-    let progress = pb.interpolated_progress_ms();
-    let ratio = if pb.duration_ms > 0 {
-        (progress as f64 / pb.duration_ms as f64).clamp(0.0, 1.0)
+    let progress = pb.interpolated_progress_ms(duration_ms);
+    let ratio = if duration_ms > 0 {
+        (progress as f64 / duration_ms as f64).clamp(0.0, 1.0)
     } else {
         0.0
     };
     let elapsed = format!("{} ", format_duration(progress));
     let remaining = format!(
         " -{}",
-        format_duration(pb.duration_ms.saturating_sub(progress))
+        format_duration(duration_ms.saturating_sub(progress))
     );
     let track_w = row
         .width
@@ -735,8 +720,8 @@ pub fn transport(
 pub fn context_row(
     frame: &mut Frame,
     row: Rect,
-    pb: &PlaybackSnapshot,
-    queue: Option<&TrackList>,
+    shuffle: bool,
+    queue: Option<&Queue>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -749,8 +734,8 @@ pub fn context_row(
         row,
         mouse,
         vec![vec![Span::styled(
-            format!("shuffle {}", if pb.shuffle { "on" } else { "off" }),
-            if pb.shuffle { accent } else { dim },
+            format!("shuffle {}", if shuffle { "on" } else { "off" }),
+            if shuffle { accent } else { dim },
         )]],
     )[0];
 
@@ -763,12 +748,14 @@ pub fn context_row(
         return;
     }
 
-    let count = format!(" · {} tracks", q.display.len());
+    // A true count of the play order: the rows on the player screen are the
+    // rows this number describes.
+    let count = format!(" · {} tracks", q.len());
     // The name is clipped rather than the count: the count is three or four
     // cells and says how much of the queue there is, which a name cut in
     // half no longer does.
     let name_w = text.width.saturating_sub(width(&count) as u16);
-    let name = fit(&q.header.name, name_w as usize).trim_end().to_string();
+    let name = fit(q.name(), name_w as usize).trim_end().to_string();
 
     let mut spans = Vec::new();
     let mut x = text.x;
@@ -790,60 +777,58 @@ pub fn context_row(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
 
     use super::*;
-    use crate::app::state::{RepeatMode, Track, TrackListKind};
 
-    fn snapshot() -> PlaybackSnapshot {
-        PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 83_000,
-            // Off the second boundary: progress interpolates in real time, so
-            // a remaining value of exactly 142_000 ms would flip from 2:22 to
-            // 2:21 within 1 ms of the snapshot.
-            duration_ms: 225_500,
-            track_uri: Some("spotify:track:x".into()),
-            context_uri: None,
-            artist_id: Some("art1".into()),
-            album_id: Some("alb1".into()),
-            track_name: "Song Title".into(),
+    /// The playing track's length in the tests. Off the second boundary:
+    /// progress interpolates in real time, so a remaining value of exactly
+    /// 142_000 ms would flip from 2:22 to 2:21 within 1 ms of the anchor.
+    const DURATION: u64 = 225_500;
+
+    fn song() -> Track {
+        Track {
+            uri: "spotify:track:x".into(),
+            name: "Song Title".into(),
             artists: "Artist Name".into(),
             album: "Album Name".into(),
             release_year: "2020".into(),
+            duration_ms: DURATION,
+            track_number: 1,
+            album_id: Some("alb1".into()),
+            artist_id: Some("art1".into()),
             cover_url: None,
-            shuffle: false,
-            repeat: RepeatMode::Context,
-            volume_percent: 56,
-            device_name: "MyPC".into(),
-            is_local_device: true,
-            fetched_at: Instant::now(),
         }
     }
 
-    fn queue(len: usize) -> TrackList {
-        let mut q = TrackList::new("My Mix", "by me", None, None);
-        q.kind = TrackListKind::Playlist;
-        q.tracks = (0..len)
-            .map(|i| Track {
-                uri: format!("spotify:track:t{i}"),
-                name: format!("Track {i}"),
-                artists: "Someone".into(),
-                album: "Album".into(),
-                release_year: "2020".into(),
-                duration_ms: 60_000,
-                track_number: i as u32 + 1,
-                album_id: None,
-                artist_id: None,
-                cover_url: None,
-            })
-            .collect();
-        q.display = (0..len).collect();
-        q
+    fn transport_state() -> Playback {
+        let mut pb = Playback::started(56, false);
+        pb.anchor(83_000);
+        pb
+    }
+
+    fn queue(len: usize) -> Queue {
+        Queue::new(
+            (0..len)
+                .map(|i| Track {
+                    uri: format!("spotify:track:t{i}"),
+                    name: format!("Track {i}"),
+                    artists: "Someone".into(),
+                    album: "Album".into(),
+                    release_year: "2020".into(),
+                    duration_ms: 60_000,
+                    track_number: i as u32 + 1,
+                    album_id: None,
+                    artist_id: None,
+                    cover_url: None,
+                })
+                .collect(),
+            0,
+            "My Mix",
+        )
     }
 
     /// Render one deck row set into a bare rect and hand back the text plus
@@ -874,8 +859,8 @@ mod tests {
 
     #[test]
     fn the_masthead_writes_two_rows_and_their_controls() {
-        let pb = snapshot();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        let t = song();
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
         assert!(lines[0].starts_with("Song Title"), "{:?}", lines[0]);
         // The state pill left this row for the transport; the title has the
         // whole width to itself now.
@@ -892,30 +877,17 @@ mod tests {
         assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
     }
 
-    /// A play that named no track — the header's ▶ on a context, where Spotify
-    /// picks the record. An empty title row would read as a rendering fault
-    /// rather than as a name that has not arrived.
-    #[test]
-    fn a_nameless_play_says_loading_rather_than_an_empty_row() {
-        let mut pb = snapshot();
-        pb.track_name = String::new();
-        let (lines, _, buffer) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
-        assert!(lines[0].starts_with("loading…"), "{:?}", lines[0]);
-        // Dim, so a placeholder does not sit where a title will be in the
-        // loudest weight on the deck.
-        assert_eq!(buffer.cell(Position { x: 0, y: 0 }).unwrap().fg, theme::DIM);
-    }
-
     /// The control holds the right end of the title row, says which way it would
     /// go, and keeps one width in both states so nothing under the cursor
     /// moves when it flips.
     #[test]
     fn the_masthead_carries_a_liked_control_for_the_playing_track() {
-        let pb = snapshot();
+        let t = song();
         let (liked_lines, liked_hit, _) =
-            render(80, 2, |f, a, h| masthead(f, a, &pb, Some(true), None, h));
-        let (plain_lines, plain_hit, _) =
-            render(80, 2, |f, a, h| masthead(f, a, &pb, Some(false), None, h));
+            render(80, 2, |f, a, h| masthead(f, a, &t, 56, Some(true), None, h));
+        let (plain_lines, plain_hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, Some(false), None, h)
+        });
 
         // The same mark either way; the word is what changes, so the two
         // states never come down to telling one glyph's shade from another's.
@@ -938,22 +910,13 @@ mod tests {
     }
 
     /// Nothing known about the track, so no control: one that cannot say
-    /// which way it would go is worse than no control. Same for an episode,
-    /// which has no track id to save.
+    /// which way it would go is worse than no control.
     #[test]
     fn the_liked_control_waits_for_an_answer() {
-        let pb = snapshot();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        let t = song();
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
         let mark = super::super::table::LIKED_MARK;
         assert!(!lines[0].contains(mark));
-        assert!(hit.like_btn.is_empty());
-
-        let mut episode = snapshot();
-        episode.track_uri = None;
-        let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &episode, Some(false), None, h)
-        });
-        assert!(!lines[0].contains(mark), "{:?}", lines[0]);
         assert!(hit.like_btn.is_empty());
     }
 
@@ -961,18 +924,18 @@ mod tests {
     /// the masthead is one block, not a note with a hanging column.
     #[test]
     fn the_metadata_row_is_not_indented() {
-        let pb = snapshot();
-        let (_, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        let t = song();
+        let (_, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
         assert_eq!(hit.now_artist.x, 0);
     }
 
     /// Names without ids are drawn but inert, so no rect is recorded.
     #[test]
     fn metadata_links_need_their_ids() {
-        let mut pb = snapshot();
-        pb.artist_id = None;
-        pb.album_id = None;
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        let mut t = song();
+        t.artist_id = None;
+        t.album_id = None;
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
         assert!(lines[1].contains("Artist Name · Album Name"));
         assert!(hit.now_artist.is_empty() && hit.now_album.is_empty());
     }
@@ -982,10 +945,10 @@ mod tests {
     /// exactly the dangling " · " the check exists to prevent.
     #[test]
     fn a_wide_album_name_is_measured_in_cells() {
-        let mut pb = snapshot();
-        pb.artists = "高橋洋子".into();
-        pb.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
-        let (lines, hit, _) = render(60, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        let mut t = song();
+        t.artists = "高橋洋子".into();
+        t.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
+        let (lines, hit, _) = render(60, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
         let row = &lines[1];
         assert!(
             !row.trim_end().ends_with('·'),
@@ -1003,9 +966,9 @@ mod tests {
     /// different pages, and dropping one leaves the album with no way in.
     #[test]
     fn a_self_titled_album_is_still_printed() {
-        let mut pb = snapshot();
-        pb.album = "Artist Name".into();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        let mut t = song();
+        t.album = "Artist Name".into();
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
         assert!(
             lines[1].starts_with("Artist Name · Artist Name · 2020"),
             "{:?}",
@@ -1018,8 +981,8 @@ mod tests {
     /// slider is the one that kept its knob.
     #[test]
     fn the_progress_track_has_no_knob() {
-        let pb = snapshot();
-        let (lines, _, _) = render(80, 1, |f, a, h| progress(f, a, &pb, h));
+        let pb = transport_state();
+        let (lines, _, _) = render(80, 1, |f, a, h| progress(f, a, &pb, DURATION, h));
         assert!(!lines[0].contains('●'), "{:?}", lines[0]);
         assert!(lines[0].starts_with("1:23 ━"), "{:?}", lines[0]);
         assert!(lines[0].trim_end().ends_with("-2:22"), "{:?}", lines[0]);
@@ -1092,13 +1055,13 @@ mod tests {
     /// making sound underneath a station.
     #[test]
     fn the_live_bar_does_not_inherit_the_seek_rect() {
-        let pb = snapshot();
+        let pb = transport_state();
         let r = radio("Adroit Jazz");
         let mut hit = HitAreas::default();
         let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
         // Frame one: a Spotify track, which arms the gauge.
         terminal
-            .draw(|f| progress(f, f.area(), &pb, &mut hit))
+            .draw(|f| progress(f, f.area(), &pb, DURATION, &mut hit))
             .unwrap();
         assert!(!hit.gauge.is_empty(), "the Spotify deck arms the gauge");
         // Frame two: a station on the same row.
@@ -1124,9 +1087,8 @@ mod tests {
 
     #[test]
     fn the_context_row_names_the_queue_and_is_clickable() {
-        let pb = snapshot();
         let q = queue(24);
-        let (lines, hit, _) = render(60, 1, |f, a, h| context_row(f, a, &pb, Some(&q), None, h));
+        let (lines, hit, _) = render(60, 1, |f, a, h| context_row(f, a, false, Some(&q), None, h));
         assert!(lines[0].starts_with("My Mix · 24 tracks"), "{:?}", lines[0]);
         assert!(lines[0].contains("shuffle off"));
         assert_eq!(hit.queue_name.x, 0);
@@ -1138,8 +1100,7 @@ mod tests {
     /// claims a click on the empty half of the row.
     #[test]
     fn the_context_row_survives_an_empty_queue() {
-        let pb = snapshot();
-        let (lines, hit, _) = render(60, 1, |f, a, h| context_row(f, a, &pb, None, None, h));
+        let (lines, hit, _) = render(60, 1, |f, a, h| context_row(f, a, false, None, None, h));
         assert!(lines[0].contains("shuffle off"));
         assert!(hit.queue_name.is_empty());
     }
@@ -1149,9 +1110,9 @@ mod tests {
     /// half-blocks as stripes.
     #[test]
     fn the_sleeve_is_square_and_fully_painted() {
-        let pb = snapshot();
+        let t = song();
         let (_, hit, buffer) = render(40, 7, |f, a, h| {
-            sleeve(f, a, &pb, None, h);
+            sleeve(f, a, &t, None, h);
         });
         assert_eq!((hit.art.width, hit.art.height), (art_w(7), 7));
         for y in hit.art.y..hit.art.bottom() {
@@ -1165,15 +1126,16 @@ mod tests {
 
     #[test]
     fn every_row_degrades_without_panicking() {
-        let pb = snapshot();
+        let t = song();
+        let pb = transport_state();
         let q = queue(3);
         for width in 0..40u16 {
             render(width.max(1), 2, |f, a, h| {
                 let a = Rect { width, ..a };
-                masthead(f, a, &pb, Some(true), None, h);
-                progress(f, Rect { height: 1, ..a }, &pb, h);
+                masthead(f, a, &t, 56, Some(true), None, h);
+                progress(f, Rect { height: 1, ..a }, &pb, DURATION, h);
                 transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
-                context_row(f, Rect { height: 1, ..a }, &pb, Some(&q), None, h);
+                context_row(f, Rect { height: 1, ..a }, false, Some(&q), None, h);
             });
         }
     }

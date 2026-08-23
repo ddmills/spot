@@ -247,24 +247,19 @@ fn status_spans(state: &mut AppState) -> Vec<Span<'static>> {
         ],
         PlayState::Playing => {
             // The dot rides the loudness envelope, so it keeps time with
-            // whatever is on — and falls back to the transport's own timed
-            // breath when there is no local audio to ride (playback on another
-            // device), which is the case that pulse was written for.
-            let dot = if status.ours {
-                let level =
-                    state
-                        .pulse
-                        .update(&state.audio_tap, status.fresh, std::time::Instant::now());
-                // A wider travel than the transport's own breathing dot, which
-                // only has to say "something is happening": this one is
-                // tracking the beat, and it has to be visible from across the
-                // room to be worth doing. The floor is not black — a dot that
-                // goes out between kicks reads as dropping out rather than as
-                // keeping time.
-                theme::accent_at(PULSE_FLOOR + (1.0 - PULSE_FLOOR) * level)
-            } else {
-                super::table::pulse_style(std::time::Instant::now())
-            };
+            // whatever is on — every sample spot makes goes through the tap,
+            // so there is always a level to ride.
+            let level =
+                state
+                    .pulse
+                    .update(&state.audio_tap, status.fresh, std::time::Instant::now());
+            // A wider travel than the transport's own breathing dot, which
+            // only has to say "something is happening": this one is
+            // tracking the beat, and it has to be visible from across the
+            // room to be worth doing. The floor is not black — a dot that
+            // goes out between kicks reads as dropping out rather than as
+            // keeping time.
+            let dot = theme::accent_at(PULSE_FLOOR + (1.0 - PULSE_FLOOR) * level);
             vec![
                 Span::styled("● ", dot),
                 Span::styled(status.word, theme::accent()),
@@ -675,29 +670,10 @@ mod tests {
             .unwrap();
     }
 
-    /// A Spotify snapshot on our own device, with PCM already in the tap.
+    /// A playing Spotify transport, with PCM already in the tap.
     fn streaming() -> AppState {
         let mut st = AppState::new();
-        st.playback = Some(crate::app::state::PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 0,
-            duration_ms: 1000,
-            track_uri: None,
-            context_uri: None,
-            artist_id: None,
-            album_id: None,
-            track_name: "Envejecer".into(),
-            artists: "Erameld".into(),
-            album: "Días Despejados".into(),
-            release_year: "2020".into(),
-            cover_url: None,
-            shuffle: false,
-            repeat: crate::app::state::RepeatMode::Off,
-            volume_percent: 70,
-            device_name: "spot".into(),
-            is_local_device: true,
-            fetched_at: std::time::Instant::now(),
-        });
+        st.playback = Some(crate::app::state::Playback::started(70, false));
         audible(&st);
         st
     }
@@ -822,34 +798,15 @@ mod tests {
         );
         let dot = st.hit.status.x;
         assert_eq!(fg(&mut st, 80, dot), theme::WARN);
-
-        // But only when the audio is ours to judge. Playing on a phone,
-        // librespot is idle and the tap will never fill.
-        let mut st = streaming();
-        st.audio_tap.clear();
-        st.playback.as_mut().unwrap().is_local_device = false;
-        let lines = render(&mut st, 80);
-        assert!(
-            lines[PROMPT_ROW].trim_end().ends_with("● STREAMING"),
-            "{:?}",
-            lines[PROMPT_ROW]
-        );
     }
 
-    /// A track that has been clicked but not started yet. Its snapshot says it
-    /// is not playing — because it is not — so before the pending state existed
-    /// the whole switch read as a dim `STREAMING`, which is the opposite of
-    /// what was happening.
+    /// A track that has been asked for but has not made sound yet: the client
+    /// clears the tap on the load, so the gap reads as `LOADING` rather than
+    /// as a dim `STREAMING`.
     #[test]
     fn a_track_asked_for_but_not_started_reads_as_loading() {
         let mut st = streaming();
         st.audio_tap.clear();
-        st.playback.as_mut().unwrap().is_playing = false;
-        st.pending_play = Some(crate::app::state::PendingPlay {
-            expect_uri: Some("spotify:track:new".into()),
-            prev_uri: Some("spotify:track:old".into()),
-            since: std::time::Instant::now(),
-        });
         let lines = render(&mut st, 80);
         assert!(
             lines[PROMPT_ROW].trim_end().ends_with("● LOADING"),
@@ -906,12 +863,7 @@ mod tests {
     fn a_tight_row_sheds_the_status_before_the_query() {
         let mut st = streaming();
         st.push_view();
-        st.main = MainView::Tracks(crate::app::state::TrackList::new(
-            "Black Holes",
-            "",
-            None,
-            None,
-        ));
+        st.main = MainView::Tracks(crate::app::state::TrackList::new("Black Holes", "", None));
         let lines = render(&mut st, 40);
         assert!(!lines[PROMPT_ROW].contains("STREAMING"), "{:?}", lines[0]);
         assert!(st.hit.status.is_empty());

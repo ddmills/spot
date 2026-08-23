@@ -109,14 +109,13 @@ mod tests {
     use ratatui::layout::Position;
 
     use super::*;
-    use crate::app::state::{PlaybackSnapshot, Playlist, RepeatMode, TrackList};
+    use crate::app::state::{Playback, Playlist, TrackList};
 
     fn browse_state() -> AppState {
         let mut st = AppState::new();
         st.playlists = (0..8)
             .map(|i| Playlist {
                 id: format!("p{i}"),
-                uri: format!("spotify:playlist:p{i}"),
                 name: format!("Playlist {i}"),
                 track_count: 10 + i,
                 owner: "me".into(),
@@ -124,7 +123,7 @@ mod tests {
                 snapshot_id: "s".into(),
             })
             .collect();
-        let mut list = TrackList::new("Hey Arnold!", "by me", None, None);
+        let mut list = TrackList::new("Hey Arnold!", "by me", None);
         list.tracks = (0..12)
             .map(|i| crate::app::state::Track {
                 uri: format!("spotify:track:t{i}"),
@@ -140,29 +139,19 @@ mod tests {
             })
             .collect();
         list.display = (0..list.tracks.len()).collect();
-        // The same list is what is playing, so the bar's context row names it.
-        st.queue = Some(list.clone());
+        // The same list is what is playing, so the bar's context row names it
+        // — the queue is the list's rows, at the row that is on.
+        let mut q = crate::app::queue::Queue::new(list.tracks.clone(), 3, "My Mix");
+        q.source_key = Some(crate::app::state::playlist_key("p2"));
+        st.queue = Some(q);
         st.main = crate::app::state::MainView::Tracks(list);
-        st.playback = Some(PlaybackSnapshot {
-            is_playing: true,
-            progress_ms: 49_000,
-            duration_ms: 67_500,
-            track_uri: Some("spotify:track:t3".into()),
-            context_uri: Some("spotify:playlist:p2".into()),
-            artist_id: Some("art".into()),
-            album_id: Some("alb".into()),
-            track_name: "Envejecer".into(),
-            artists: "Erameld, Hipnos".into(),
-            album: "Días Despejados".into(),
-            release_year: "2020".into(),
-            cover_url: None,
-            shuffle: false,
-            repeat: RepeatMode::Context,
-            volume_percent: 70,
-            device_name: "spot".into(),
-            is_local_device: true,
-            fetched_at: Instant::now(),
-        });
+        let mut pb = Playback::started(70, false);
+        pb.anchor(49_000);
+        // Freeze the readout: with the anchor in the future, `elapsed()`
+        // saturates to zero, so two renders a millisecond apart cannot
+        // disagree about the remaining time.
+        pb.anchored_at = Instant::now() + Duration::from_secs(60);
+        st.playback = Some(pb);
         st
     }
 
@@ -283,14 +272,14 @@ mod tests {
                 name: "Muse".into(),
                 image_url: None,
                 genres: vec![],
-                top: TrackList::new("Muse", "", None, None),
+                top: TrackList::new("Muse", "", None),
                 albums: vec![],
                 display: Vec::new(),
                 tab: crate::app::state::ArtistTab::Albums,
                 loading: false,
             });
             st.push_view();
-            st.main = MainView::Tracks(TrackList::new("Black Holes", "", None, None));
+            st.main = MainView::Tracks(TrackList::new("Black Holes", "", None));
             st
         };
         let mut browse = nested();
@@ -359,7 +348,6 @@ mod tests {
         let mut st = browse_state();
         st.playlists.push(Playlist {
             id: "dw".into(),
-            uri: "spotify:playlist:dw".into(),
             name: "Discover Weekly".into(),
             track_count: 30,
             owner: "Spotify".into(),
@@ -539,7 +527,7 @@ mod tests {
     fn arrive_via(st: &mut AppState, name: &str) {
         let page = std::mem::replace(&mut st.main, crate::app::state::MainView::Home);
         st.push_view();
-        st.main = crate::app::state::MainView::Tracks(TrackList::new(name, "", None, None));
+        st.main = crate::app::state::MainView::Tracks(TrackList::new(name, "", None));
         st.push_view();
         st.main = page;
     }
@@ -567,7 +555,7 @@ mod tests {
         let crate::app::state::MainView::Tracks(list) = st.main.clone() else {
             unreachable!()
         };
-        let mut top = TrackList::new("Roy Hargrove", "top tracks", None, None);
+        let mut top = TrackList::new("Roy Hargrove", "top tracks", None);
         top.append(list.tracks);
         let mut view = crate::app::state::ArtistView {
             id: "r1".into(),

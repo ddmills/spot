@@ -37,7 +37,7 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Enter", "open item / play selection"),
             ("x", "play without opening"),
-            ("a", "add selected track to queue"),
+            ("a", "play the selected track next"),
             ("L", "like the track, or save the station"),
             ("b / B", "open track's album / artist"),
             ("o / O", "cycle sort / flip direction"),
