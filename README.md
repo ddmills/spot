@@ -108,6 +108,13 @@ is a jump rather than a run of single steps: clicking `HOME` from three pages de
 restores Home as you left it. `Esc` and `Backspace` take one step back along the same
 path.
 
+An artist page carries their top tracks, then their records as cards under an **Albums**
+heading. Where the catalogue runs to more than one kind, the heading gets a strip of tabs
+(`←` / `→`, or click them) — **Albums**, **Singles**, **Compilations** and **Appears On** —
+and it names only the ones that artist has records in. The whole catalogue arrives in one
+fetch, so a tab changes what you're looking at without asking Spotify again, and without
+adding a step to the path.
+
 The path stays a path rather than a log of everything you clicked. Opening a page that is
 already on it walks *back* to that page instead of adding a second copy, so bouncing
 between an album and its artist never lengthens the trail, and opening the page you are
@@ -184,7 +191,7 @@ is a worse answer than a row that says why it won't play.
 | `Ctrl-d/u` | half page down / up |
 | `H` | go home |
 | `v` | toggle player view (Esc closes) |
-| `← / →` | switch tab (search results, radio pages) |
+| `← / →` | switch tab (search results, artist pages, radio pages) |
 | `Backspace` | back to the previous view |
 | `Esc` | back to the previous view · closes an overlay |
 | `Enter` | drill into the selected row, or play it |

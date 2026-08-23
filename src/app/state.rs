@@ -243,6 +243,13 @@ pub struct AlbumItem {
     pub release_year: String,
     /// "album", "single", or "compilation"; may be empty.
     pub album_type: String,
+    /// How the record relates to the artist whose page it was fetched for:
+    /// "album", "single", "compilation" or "appears_on". This is what the
+    /// artist page's tabs group by, and it is not the same as
+    /// [`Self::album_type`] — a record the artist only guests on carries the
+    /// type of whatever it is, and the group `appears_on`. Empty outside the
+    /// artist page, which is the only place Spotify reports it.
+    pub album_group: String,
     /// Tracks on the record, or 0 when the source did not report one.
     pub track_count: u32,
     /// CDN URL of the sleeve, so opening the album can show it without a
@@ -855,12 +862,60 @@ impl TrackList {
     }
 }
 
+/// How the catalogue is cut, as a tab strip under the "Albums" heading.
+///
+/// Grouped by [`AlbumItem::album_group`] rather than the type, because only
+/// the group tells a record the artist made from one they play on.
+///
+/// Cuts of one answer, like [`SearchTab`] and unlike [`RadioTab`]: the fetch
+/// asks for all four groups at once, so switching tab costs nothing and pushes
+/// nothing onto the back stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtistTab {
+    Albums,
+    Singles,
+    Compilations,
+    AppearsOn,
+}
+
+impl ArtistTab {
+    pub const ALL: [ArtistTab; 4] = [
+        ArtistTab::Albums,
+        ArtistTab::Singles,
+        ArtistTab::Compilations,
+        ArtistTab::AppearsOn,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            ArtistTab::Albums => "Albums",
+            ArtistTab::Singles => "Singles",
+            ArtistTab::Compilations => "Compilations",
+            ArtistTab::AppearsOn => "Appears On",
+        }
+    }
+
+    /// Whether a record belongs under this tab.
+    ///
+    /// Anything Spotify labelled with nothing we know falls under Albums, so
+    /// no record can go missing between the tabs.
+    pub fn holds(self, album: &AlbumItem) -> bool {
+        match album.album_group.as_str() {
+            "single" => self == ArtistTab::Singles,
+            "compilation" => self == ArtistTab::Compilations,
+            "appears_on" => self == ArtistTab::AppearsOn,
+            _ => self == ArtistTab::Albums,
+        }
+    }
+}
+
 /// A browsable artist page: a header band, the artist's top tracks, and their
 /// records as cards under them.
 ///
-/// The two used to be tabs. They are one page now: the hits and the catalogue
-/// are the same answer to the same question, and a tab strip made you ask it
-/// twice to see all of it.
+/// Hits and catalogue used to be tabs. They are one page now: they are the
+/// same answer to the same question, and a tab strip made you ask it twice to
+/// see all of it. The strip [`ArtistTab`] draws is a different axis — it cuts
+/// the catalogue into its groups, and never hides the top tracks.
 #[derive(Debug, Clone)]
 pub struct ArtistView {
     pub id: String,
@@ -873,7 +928,12 @@ pub struct ArtistView {
     /// now — so the band draws the line only when one arrives.
     pub genres: Vec<String>,
     pub top: TrackList,
+    /// The whole catalogue, every group together.
     pub albums: Vec<AlbumItem>,
+    /// Indexes into [`Self::albums`] the active tab shows, in the order they
+    /// are drawn — the same display-permutation model [`TrackList`] uses.
+    pub display: Vec<usize>,
+    pub tab: ArtistTab,
     pub loading: bool,
 }
 
@@ -889,11 +949,50 @@ impl ArtistView {
             let &ti = self.top.display.get(index)?;
             return self.top.tracks.get(ti).map(ArtistRow::Track);
         }
-        self.albums.get(index - split).map(ArtistRow::Album)
+        let &ai = self.display.get(index - split)?;
+        self.albums.get(ai).map(ArtistRow::Album)
     }
 
     pub fn len(&self) -> usize {
-        self.top.display.len() + self.albums.len()
+        self.top.display.len() + self.display.len()
+    }
+
+    /// The tabs worth drawing: the groups this artist actually has records in.
+    ///
+    /// An empty tab is a dead end you can still walk into, so the strip never
+    /// offers one. A catalogue with everything in one group yields one tab,
+    /// and the page draws no strip at all for it.
+    pub fn tabs(&self) -> Vec<ArtistTab> {
+        ArtistTab::ALL
+            .into_iter()
+            .filter(|t| self.albums.iter().any(|a| t.holds(a)))
+            .collect()
+    }
+
+    /// Re-cut [`Self::display`] for the active tab, moving to the first tab
+    /// that has records when the active one has none.
+    ///
+    /// Called whenever either side of that pairing changes: when the catalogue
+    /// lands, and when the tab is switched.
+    pub fn retab(&mut self) {
+        if !self.albums.is_empty()
+            && !self.albums.iter().any(|a| self.tab.holds(a))
+            && let Some(&first) = self.tabs().first()
+        {
+            self.tab = first;
+        }
+        self.display = self
+            .albums
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| self.tab.holds(a))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    pub fn set_tab(&mut self, tab: ArtistTab) {
+        self.tab = tab;
+        self.retab();
     }
 }
 
@@ -1110,6 +1209,9 @@ pub struct HitAreas {
     pub search_tabs: Vec<(Rect, SearchTab)>,
     /// The radio page's tab strip, in the same spirit as [`Self::search_tabs`].
     pub radio_tabs: Vec<(Rect, RadioTab)>,
+    /// The artist page's album-group strip. It scrolls with the body it sits
+    /// in, so it is recorded only where the line is on screen.
+    pub artist_tabs: Vec<(Rect, ArtistTab)>,
     /// The main pane's flat line model, in the same spirit as
     /// [`Self::library_lines`]: for each content line of [`Self::main_list`],
     /// the row it belongs to, or `None` for a heading, a column header, or a
@@ -1787,6 +1889,91 @@ mod tests {
             artist_id: None,
             cover_url: None,
         }
+    }
+
+    fn record(name: &str, group: &str) -> AlbumItem {
+        AlbumItem {
+            id: format!("id-{name}"),
+            name: name.into(),
+            artists: "artist".into(),
+            release_year: "2020".into(),
+            album_type: "album".into(),
+            album_group: group.into(),
+            track_count: 10,
+            cover_url: None,
+        }
+    }
+
+    fn artist_view(albums: Vec<AlbumItem>) -> ArtistView {
+        let mut v = ArtistView {
+            id: "r1".into(),
+            uri: "spotify:artist:r1".into(),
+            name: "artist".into(),
+            image_url: None,
+            genres: Vec::new(),
+            top: TrackList::new("artist", "top tracks", None, None),
+            albums,
+            display: Vec::new(),
+            tab: ArtistTab::Albums,
+            loading: false,
+        };
+        v.retab();
+        v
+    }
+
+    /// The strip offers the groups this artist has records in, in one fixed
+    /// order, and nothing else.
+    #[test]
+    fn a_catalogue_names_the_groups_it_holds() {
+        let v = artist_view(vec![
+            record("A Record", "album"),
+            record("A Cut", "single"),
+            record("A Guest Spot", "appears_on"),
+            record("Another Cut", "single"),
+        ]);
+        assert_eq!(
+            v.tabs(),
+            vec![ArtistTab::Albums, ArtistTab::Singles, ArtistTab::AppearsOn]
+        );
+        assert!(artist_view(Vec::new()).tabs().is_empty());
+    }
+
+    /// A record Spotify grouped as nothing we know still has to be reachable,
+    /// so it falls under Albums rather than out of the page.
+    #[test]
+    fn an_unlabelled_record_falls_under_albums() {
+        let v = artist_view(vec![record("A Record", "")]);
+        assert_eq!(v.tabs(), vec![ArtistTab::Albums]);
+        assert_eq!(v.display, vec![0]);
+    }
+
+    /// An artist with only guest spots opens on the tab that has them: the
+    /// default tab must not leave the page looking empty.
+    #[test]
+    fn the_page_opens_on_a_group_that_has_records() {
+        let v = artist_view(vec![record("A Guest Spot", "appears_on")]);
+        assert_eq!(v.tab, ArtistTab::AppearsOn);
+        assert_eq!(v.display, vec![0]);
+        assert_eq!(v.len(), 1);
+    }
+
+    /// `row` reads through the open group, so the same index means a different
+    /// record on a different tab.
+    #[test]
+    fn a_row_points_into_the_open_group() {
+        let mut v = artist_view(vec![
+            record("A Record", "album"),
+            record("A Cut", "single"),
+            record("A Compilation", "compilation"),
+        ]);
+        let name = |v: &ArtistView| match v.row(0) {
+            Some(ArtistRow::Album(a)) => a.name.clone(),
+            _ => panic!("row 0 is not a card"),
+        };
+        assert_eq!(name(&v), "A Record");
+        v.set_tab(ArtistTab::Compilations);
+        assert_eq!(name(&v), "A Compilation");
+        assert_eq!(v.len(), 1);
     }
 
     /// A minimal directory row, for the deck-subject tests.

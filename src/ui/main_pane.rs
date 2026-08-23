@@ -609,7 +609,11 @@ enum ArtistLine {
     TrackHeader,
     /// A top track, by index into `top.display`.
     Track(usize),
-    /// One row of an album card: `row` counts from the top of its sleeve.
+    /// The album-group tab strip, under the "Albums" heading.
+    Tabs,
+    /// One row of an album card: `row` counts from the top of its sleeve, and
+    /// `album` indexes `display` — the cards of the open tab, not the whole
+    /// catalogue.
     Card {
         album: usize,
         row: u16,
@@ -785,7 +789,14 @@ fn artist_band(
         ..inner
     }
 }
-/// "30 albums", or nothing until the catalogue lands.
+/// "30 records", or nothing until the catalogue lands.
+///
+/// Records rather than albums: the catalogue holds every group now — singles,
+/// compilations and the records the artist only plays on — and calling that
+/// total "albums" would disagree with the tab of that name under it.
+///
+/// The whole catalogue, not the open tab. The band is about the artist, and a
+/// number that changed every time you switched tab would be about the strip.
 ///
 /// The top tracks are not counted here. They are a numbered list a few rows
 /// below, under a heading that names them — a band reading "10 top tracks"
@@ -793,8 +804,8 @@ fn artist_band(
 fn artist_counts(v: &crate::app::state::ArtistView) -> String {
     match v.albums.len() {
         0 => String::new(),
-        1 => "1 album".to_string(),
-        n => format!("{n} albums"),
+        1 => "1 record".to_string(),
+        n => format!("{n} records"),
     }
 }
 
@@ -834,15 +845,25 @@ fn artist_body(
     }
     let tracks_at = (split > 0).then_some(3usize);
     let cards_at = plan.len();
+    // One group is no choice, so its strip would only say what the heading
+    // above it already says.
+    let tabs = v.tabs();
+    let strip = tabs.len() > 1;
     if !v.albums.is_empty() {
         plan.push(ArtistLine::Heading("Albums"));
         plan.push(ArtistLine::Blank);
-        for album in 0..v.albums.len() {
+        if strip {
+            // Strip, blank, then the rows — the rhythm the radio and search
+            // pages keep above their tables.
+            plan.push(ArtistLine::Tabs);
+            plan.push(ArtistLine::Blank);
+        }
+        for album in 0..v.display.len() {
             plan.extend((0..CARD_ART_H).map(|row| ArtistLine::Card { album, row }));
             plan.push(ArtistLine::Blank);
         }
     }
-    let cards_from = cards_at + 2;
+    let cards_from = cards_at + if strip { 4 } else { 2 };
 
     super::clamp_offset(list_state, plan.len(), height);
     let offset = list_state.offset();
@@ -861,11 +882,36 @@ fn artist_body(
     let indent = if art_w > 0 { art_w + CARD_GAP } else { 0 };
     let card_text_w = width.saturating_sub(indent as usize);
 
+    // The tab strip scrolls with the body, so it is a control only while it
+    // is on screen: off it, `segment` clips every rect to nothing and the
+    // labels cannot be clicked where they are not drawn.
+    hit.artist_tabs.clear();
+    let mut tab_spans: Vec<Span<'static>> = Vec::new();
+    if strip {
+        let row = Rect {
+            x: body.x,
+            y: screen_y(cards_at + 2).unwrap_or(body.y),
+            width: body.width,
+            height: u16::from(screen_y(cards_at + 2).is_some()),
+        };
+        let mut x = row.x;
+        tab_segments(
+            &mut tab_spans,
+            &mut x,
+            row,
+            mouse,
+            &tabs,
+            v.tab,
+            crate::app::state::ArtistTab::title,
+            &mut hit.artist_tabs,
+        );
+    }
+
     // The two controls on each visible card — its name and its ▶ play —
     // recorded before the rows are built, so hovering one can light it.
     hit.card_play.clear();
     hit.album_names.clear();
-    for (album, a) in v.albums.iter().enumerate() {
+    for (album, a) in v.display.iter().map(|&i| &v.albums[i]).enumerate() {
         let first = cards_from + album * CARD_H;
         let push = |hits: &mut Vec<(Rect, usize)>, row: u16, w: u16| {
             let Some(y) = screen_y(first + row as usize) else {
@@ -973,8 +1019,9 @@ fn artist_body(
                     hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
                 )
             }
+            ArtistLine::Tabs => ListItem::new(Line::from(tab_spans.clone())),
             ArtistLine::Card { album, row } => card_line(
-                &v.albums[album],
+                &v.albums[v.display[album]],
                 row,
                 indent as usize,
                 card_text_w,
@@ -991,7 +1038,7 @@ fn artist_body(
     // are drawn over the block the rows left blank for them, clipped to the
     // body so a card scrolling off the top slides under it.
     if art_w > 0 {
-        for (album, a) in v.albums.iter().enumerate() {
+        for (album, a) in v.display.iter().map(|&i| &v.albums[i]).enumerate() {
             let first = cards_from + album * CARD_H;
             let top = body.y as i64 + first as i64 - offset as i64;
             if top + CARD_ART_H as i64 <= body.y as i64 || top >= body.bottom() as i64 {
@@ -1078,19 +1125,14 @@ fn card_line(
     ListItem::new(line)
 }
 
-/// "2006 · Single · 10 tracks" — every part Spotify actually reported.
+/// "2006 · 10 tracks" — every part Spotify actually reported.
 ///
-/// "Album" is left off: on an artist's page a record is an album unless it
-/// says otherwise, and printing the word on nine cards in ten says nothing.
+/// The kind of record is not among them. The cards are grouped by it now, and
+/// a card reading "Single" under a tab reading "Singles" says it twice.
 fn album_meta(a: &crate::app::state::AlbumItem) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !a.release_year.is_empty() {
         parts.push(a.release_year.clone());
-    }
-    if !a.album_type.is_empty() && !a.album_type.eq_ignore_ascii_case("album") {
-        let mut kind = a.album_type.clone();
-        kind[..1].make_ascii_uppercase();
-        parts.push(kind);
     }
     if a.track_count > 0 {
         parts.push(format!(
@@ -2705,6 +2747,8 @@ mod tests {
             genres: vec![],
             top: crate::app::state::TrackList::new("Donna The Buffalo", "", None, None),
             albums: vec![],
+            display: Vec::new(),
+            tab: crate::app::state::ArtistTab::Albums,
             loading: false,
         });
         st.push_view();
@@ -3290,6 +3334,7 @@ mod tests {
                 artists: "Muse".into(),
                 release_year: "2006".into(),
                 album_type: "album".into(),
+                album_group: "album".into(),
                 track_count: 12,
                 cover_url: None,
             }],
@@ -3501,31 +3546,49 @@ mod tests {
     }
 
     fn album_item(name: &str, year: &str, cover: Option<&str>) -> crate::app::state::AlbumItem {
+        grouped_item(name, year, cover, "album")
+    }
+
+    fn grouped_item(
+        name: &str,
+        year: &str,
+        cover: Option<&str>,
+        group: &str,
+    ) -> crate::app::state::AlbumItem {
         crate::app::state::AlbumItem {
             id: format!("id-{name}"),
             name: name.into(),
             artists: "Muse".into(),
             release_year: year.into(),
-            album_type: "album".into(),
+            album_type: group.into(),
+            album_group: group.into(),
             track_count: 12,
             cover_url: cover.map(Into::into),
         }
     }
 
     fn artist_state() -> AppState {
+        artist_state_with(vec![album_item("Black Holes", "2006", None)])
+    }
+
+    fn artist_state_with(albums: Vec<crate::app::state::AlbumItem>) -> AppState {
         let mut st = AppState::new();
         let mut top = crate::app::state::TrackList::new("Muse", "top tracks", None, None);
         top.append(vec![track("Uprising", "Muse")]);
-        st.main = MainView::Artist(crate::app::state::ArtistView {
+        let mut v = crate::app::state::ArtistView {
             id: "r1".into(),
             uri: "spotify:artist:r1".into(),
             name: "Muse".into(),
             image_url: Some("https://i.scdn.co/image/artist".into()),
             genres: vec!["alt rock".into(), "space rock".into()],
             top,
-            albums: vec![album_item("Black Holes", "2006", None)],
+            albums,
+            display: Vec::new(),
+            tab: crate::app::state::ArtistTab::Albums,
             loading: false,
-        });
+        };
+        v.retab();
+        st.main = MainView::Artist(v);
         st
     }
 
@@ -3551,13 +3614,14 @@ mod tests {
         assert!(lines[5].contains("alt rock · space rock"));
         // The catalogue is counted; the top tracks are not — the list below
         // numbers itself.
-        assert!(lines[6].contains("1 album"));
+        assert!(lines[6].contains("1 record"));
         assert!(!lines[6].contains("top track"));
         assert!(lines[8].contains("▶ play"));
         assert!(!st.hit.header_play_btn.is_empty());
 
-        // Body: the two sections, in order, with no tab strip anywhere. Both
-        // headings keep a blank row under them.
+        // Body: the two sections, in order. Both headings keep a blank row
+        // under them, and this catalogue is one group deep, so the album
+        // strip stays away — see `the_album_strip_names_only_the_groups_the_artist_has`.
         assert!(lines[11].contains("Top Tracks"));
         assert!(lines[12].trim().is_empty());
         assert!(lines[13].contains("Title"));
@@ -3575,13 +3639,10 @@ mod tests {
     /// several rows past whatever it was aimed at.
     #[test]
     fn album_cards_map_every_line_back_to_one_row() {
-        let mut st = artist_state();
-        if let MainView::Artist(v) = &mut st.main {
-            v.albums = vec![
-                album_item("One", "2001", None),
-                album_item("Two", "2002", None),
-            ];
-        }
+        let mut st = artist_state_with(vec![
+            album_item("One", "2001", None),
+            album_item("Two", "2002", None),
+        ]);
         render(&mut st, 90, 32);
         let rows: Vec<Option<usize>> = st.hit.main_lines.clone();
         // Heading, blank, column header, one track, blank, heading, blank,
@@ -3591,6 +3652,90 @@ mod tests {
         assert_eq!(&rows[12..17], &[Some(2), Some(2), Some(2), Some(2), None]);
         assert_eq!(st.hit.album_names.len(), 2);
         assert_eq!(st.hit.card_play.len(), 2);
+    }
+
+    /// A catalogue in several groups gets a strip under the heading, and the
+    /// strip offers only the groups the artist has records in — an empty tab
+    /// is a dead end you can still walk into.
+    #[test]
+    fn the_album_strip_names_only_the_groups_the_artist_has() {
+        use crate::app::state::ArtistTab;
+        let mut st = artist_state_with(vec![
+            grouped_item("Origin Of Symmetry", "2001", None, "album"),
+            grouped_item("Hysteria", "2003", None, "single"),
+            grouped_item("Live At Rome", "2013", None, "appears_on"),
+        ]);
+        let lines = render(&mut st, 90, 32);
+        assert!(lines[16].contains("Albums"));
+        assert!(lines[17].trim().is_empty());
+        let strip = &lines[18];
+        assert!(strip.contains("Albums"), "{strip:?}");
+        assert!(strip.contains("Singles"), "{strip:?}");
+        assert!(strip.contains("Appears On"), "{strip:?}");
+        assert!(!strip.contains("Compilations"), "{strip:?}");
+        assert!(lines[19].trim().is_empty());
+        // Only the open group's cards, one blank row below the strip.
+        assert!(lines[20].contains("Origin Of Symmetry"));
+        assert!(!lines.iter().any(|l| l.contains("Hysteria")));
+        assert_eq!(st.hit.card_play.len(), 1);
+        assert_eq!(
+            st.hit
+                .artist_tabs
+                .iter()
+                .map(|(_, t)| *t)
+                .collect::<Vec<_>>(),
+            vec![ArtistTab::Albums, ArtistTab::Singles, ArtistTab::AppearsOn]
+        );
+    }
+
+    /// Every recorded tab rect sits over the label it belongs to, the way the
+    /// search strip's do — a strip you cannot aim at is decoration.
+    #[test]
+    fn artist_tab_hit_rects_match_rendered_labels() {
+        let mut st = artist_state_with(vec![
+            album_item("Origin Of Symmetry", "2001", None),
+            grouped_item("Hysteria", "2003", None, "single"),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(90, 32)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(st.hit.artist_tabs.len(), 2);
+        for (rect, tab) in &st.hit.artist_tabs {
+            assert!(!rect.is_empty());
+            let text: String = (rect.x..rect.right())
+                .filter_map(|x| buffer.cell(Position { x, y: rect.y }).map(|c| c.symbol()))
+                .collect();
+            assert!(
+                text.contains(tab.title()),
+                "tab {tab:?} rect {rect:?} shows {text:?}"
+            );
+        }
+    }
+
+    /// Switching the tab re-cuts the cards and the row model with them, so a
+    /// click on the second tab's first card cannot land on the first tab's.
+    #[test]
+    fn switching_the_album_tab_re_cuts_the_cards() {
+        use crate::app::state::{ArtistRow, ArtistTab};
+        let mut st = artist_state_with(vec![
+            album_item("Origin Of Symmetry", "2001", None),
+            grouped_item("Hysteria", "2003", None, "single"),
+        ]);
+        if let MainView::Artist(v) = &mut st.main {
+            v.set_tab(ArtistTab::Singles);
+        }
+        let lines = render(&mut st, 90, 32);
+        assert!(lines.iter().any(|l| l.contains("Hysteria")));
+        assert!(!lines.iter().any(|l| l.contains("Origin Of Symmetry")));
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        // One top track, so the first card is row 1 whichever tab is open.
+        assert_eq!(v.len(), 2);
+        let Some(ArtistRow::Album(a)) = v.row(1) else {
+            panic!("row 1 is not a card")
+        };
+        assert_eq!(a.name, "Hysteria");
     }
 
     /// The sleeve is shed before the text is, on a card as on a header band.

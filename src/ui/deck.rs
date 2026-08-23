@@ -116,25 +116,11 @@ pub fn sleeve(
 /// Records `hit.volume_slider`, `hit.now_artist` and `hit.now_album`. It does
 /// *not* touch `hit.now_playing`: which region the wheel adjusts volume over
 /// is the caller's decision.
-/// Whether the title wears the `♫` that says "this is what is playing".
-///
-/// The bottom bar needs it: the bar sits under a page about something else,
-/// and without the note its title is one more line of text on the screen. The
-/// player does not — everything on that screen is the playing track, and the
-/// mark two rows above it already owns the note and the column. Two of them
-/// stacked read as a rendering fault rather than as two different things.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Note {
-    Show,
-    Hide,
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn masthead(
     frame: &mut Frame,
     area: Rect,
     pb: &PlaybackSnapshot,
-    note: Note,
     liked: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
@@ -166,15 +152,15 @@ pub fn masthead(
     }
     // A play in flight that named no track — the header's ▶ on a context, where
     // Spotify picks which record starts. There is nothing honest to put here
-    // until the poll answers, and a bare `♫` with nothing after it reads as a
-    // rendering fault rather than as a title that has not arrived. The poll is
+    // until the poll answers, and an empty title row reads as a rendering
+    // fault rather than as a title that has not arrived. The poll is
     // the only other thing that writes the name, and it always writes one, so
     // an empty one can only mean this.
     let loading = pb.track_name.is_empty();
-    let title = match (loading, note) {
-        (true, _) => "loading…".to_string(),
-        (false, Note::Show) => format!("♫ {}", pb.track_name),
-        (false, Note::Hide) => pb.track_name.clone(),
+    let title = if loading {
+        "loading…"
+    } else {
+        pb.track_name.as_str()
     };
     // One cell of daylight between the title and the control, so a title that
     // runs the full width ends in an ellipsis rather than against the pill.
@@ -191,7 +177,7 @@ pub fn masthead(
         theme::accent().add_modifier(Modifier::BOLD)
     };
     frame.render_widget(
-        Paragraph::new(Line::styled(fit(&title, title_w as usize), title_style)),
+        Paragraph::new(Line::styled(fit(title, title_w as usize), title_style)),
         Rect {
             width: title_w,
             ..title_row
@@ -199,9 +185,9 @@ pub fn masthead(
     );
 
     // Row 1: artists · album · year, with the volume slider right-aligned.
-    // It starts flush with the title's `♫` rather than under the title's
-    // first letter — the indent that used to hang it off the note made the
-    // masthead read as two columns instead of one block.
+    // It starts flush with the title above it, one block rather than two
+    // columns — the indent that used to hang it off the title's leading
+    // note outlived the note itself.
     if area.height < MASTHEAD_H {
         return;
     }
@@ -304,7 +290,6 @@ pub fn radio_masthead(
     frame: &mut Frame,
     area: Rect,
     radio: &RadioPlayback,
-    note: Note,
     liked: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
@@ -329,14 +314,10 @@ pub fn radio_masthead(
         )[0];
     }
 
-    let name = match (matched, &announced) {
+    let title = match (matched, &announced) {
         (Some(t), _) => t.name.clone(),
         (None, Some(said)) => said.clone(),
         (None, None) => radio.station.name.clone(),
-    };
-    let title = match note {
-        Note::Show => format!("♫ {name}"),
-        Note::Hide => name,
     };
     // One cell of daylight between the title and the control, as on the
     // Spotify deck, so a long name ends in an ellipsis rather than against
@@ -894,10 +875,8 @@ mod tests {
     #[test]
     fn the_masthead_writes_two_rows_and_their_controls() {
         let pb = snapshot();
-        let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
-        assert!(lines[0].starts_with("♫ Song Title"), "{:?}", lines[0]);
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
+        assert!(lines[0].starts_with("Song Title"), "{:?}", lines[0]);
         // The state pill left this row for the transport; the title has the
         // whole width to itself now.
         assert!(!lines[0].contains("playing"), "{:?}", lines[0]);
@@ -914,17 +893,14 @@ mod tests {
     }
 
     /// A play that named no track — the header's ▶ on a context, where Spotify
-    /// picks the record. A bare `♫` with nothing after it would read as a
-    /// rendering fault rather than as a name that has not arrived.
+    /// picks the record. An empty title row would read as a rendering fault
+    /// rather than as a name that has not arrived.
     #[test]
-    fn a_nameless_play_says_loading_rather_than_a_stray_note() {
+    fn a_nameless_play_says_loading_rather_than_an_empty_row() {
         let mut pb = snapshot();
         pb.track_name = String::new();
-        let (lines, _, buffer) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
+        let (lines, _, buffer) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
         assert!(lines[0].starts_with("loading…"), "{:?}", lines[0]);
-        assert!(!lines[0].contains('♫'), "{:?}", lines[0]);
         // Dim, so a placeholder does not sit where a title will be in the
         // loudest weight on the deck.
         assert_eq!(buffer.cell(Position { x: 0, y: 0 }).unwrap().fg, theme::DIM);
@@ -936,12 +912,10 @@ mod tests {
     #[test]
     fn the_masthead_carries_a_liked_control_for_the_playing_track() {
         let pb = snapshot();
-        let (liked_lines, liked_hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, Some(true), None, h)
-        });
-        let (plain_lines, plain_hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, Some(false), None, h)
-        });
+        let (liked_lines, liked_hit, _) =
+            render(80, 2, |f, a, h| masthead(f, a, &pb, Some(true), None, h));
+        let (plain_lines, plain_hit, _) =
+            render(80, 2, |f, a, h| masthead(f, a, &pb, Some(false), None, h));
 
         // The same mark either way; the word is what changes, so the two
         // states never come down to telling one glyph's shade from another's.
@@ -960,7 +934,7 @@ mod tests {
         assert_eq!(liked_hit.like_btn.y, 0, "the control left the title row");
         assert_eq!(liked_hit.like_btn.right(), 80);
         // The title still leads the row, and stops clear of the control.
-        assert!(liked_lines[0].starts_with("♫ Song Title"));
+        assert!(liked_lines[0].starts_with("Song Title"));
     }
 
     /// Nothing known about the track, so no control: one that cannot say
@@ -969,9 +943,7 @@ mod tests {
     #[test]
     fn the_liked_control_waits_for_an_answer() {
         let pb = snapshot();
-        let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
         let mark = super::super::table::LIKED_MARK;
         assert!(!lines[0].contains(mark));
         assert!(hit.like_btn.is_empty());
@@ -979,20 +951,18 @@ mod tests {
         let mut episode = snapshot();
         episode.track_uri = None;
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &episode, Note::Show, Some(false), None, h)
+            masthead(f, a, &episode, Some(false), None, h)
         });
         assert!(!lines[0].contains(mark), "{:?}", lines[0]);
         assert!(hit.like_btn.is_empty());
     }
 
-    /// The metadata row starts flush with the title's `♫`, not indented past
-    /// it — the masthead is one block, not a note with a hanging column.
+    /// The metadata row starts flush with the title, not indented past it —
+    /// the masthead is one block, not a note with a hanging column.
     #[test]
     fn the_metadata_row_is_not_indented() {
         let pb = snapshot();
-        let (_, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
+        let (_, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
         assert_eq!(hit.now_artist.x, 0);
     }
 
@@ -1002,9 +972,7 @@ mod tests {
         let mut pb = snapshot();
         pb.artist_id = None;
         pb.album_id = None;
-        let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
         assert!(lines[1].contains("Artist Name · Album Name"));
         assert!(hit.now_artist.is_empty() && hit.now_album.is_empty());
     }
@@ -1017,9 +985,7 @@ mod tests {
         let mut pb = snapshot();
         pb.artists = "高橋洋子".into();
         pb.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
-        let (lines, hit, _) = render(60, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
+        let (lines, hit, _) = render(60, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
         let row = &lines[1];
         assert!(
             !row.trim_end().ends_with('·'),
@@ -1039,9 +1005,7 @@ mod tests {
     fn a_self_titled_album_is_still_printed() {
         let mut pb = snapshot();
         pb.album = "Artist Name".into();
-        let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &pb, Note::Show, None, None, h)
-        });
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &pb, None, None, h));
         assert!(
             lines[1].starts_with("Artist Name · Artist Name · 2020"),
             "{:?}",
@@ -1206,7 +1170,7 @@ mod tests {
         for width in 0..40u16 {
             render(width.max(1), 2, |f, a, h| {
                 let a = Rect { width, ..a };
-                masthead(f, a, &pb, Note::Show, Some(true), None, h);
+                masthead(f, a, &pb, Some(true), None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, h);
                 transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
                 context_row(f, Rect { height: 1, ..a }, &pb, Some(&q), None, h);
@@ -1264,10 +1228,10 @@ mod tests {
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
 
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Note::Show, Some(false), None, h)
+            radio_masthead(f, a, &r, Some(false), None, h)
         });
         // Row 0 names the record, not the station.
-        assert!(lines[0].starts_with("♫ Frenesi"), "{:?}", lines[0]);
+        assert!(lines[0].starts_with("Frenesi"), "{:?}", lines[0]);
         assert!(
             lines[1].starts_with("Peter Appleyard · The Lost 1974 Sessions · 1974"),
             "{:?}",
@@ -1290,9 +1254,7 @@ mod tests {
     fn the_liked_control_waits_until_the_saved_state_is_known() {
         let mut r = radio("Adroit Jazz");
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
-        let (_, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Note::Show, None, None, h)
-        });
+        let (_, hit, _) = render(80, 2, |f, a, h| radio_masthead(f, a, &r, None, None, h));
         assert!(hit.like_btn.is_empty(), "{:?}", hit.like_btn);
     }
 
@@ -1305,13 +1267,9 @@ mod tests {
         r.matched = crate::app::state::RadioMatch::Unmatched;
 
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Note::Show, Some(true), None, h)
+            radio_masthead(f, a, &r, Some(true), None, h)
         });
-        assert!(
-            lines[0].starts_with("♫ Some Band - A Song"),
-            "{:?}",
-            lines[0]
-        );
+        assert!(lines[0].starts_with("Some Band - A Song"), "{:?}", lines[0]);
         // Row 1 falls back to what the station says about itself.
         assert!(lines[1].starts_with("jazz"), "{:?}", lines[1]);
         // The country moved to the station row; saying it twice on one deck
@@ -1327,9 +1285,9 @@ mod tests {
     fn a_station_that_says_nothing_still_names_itself() {
         let r = radio("Adroit Jazz");
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Note::Show, Some(true), None, h)
+            radio_masthead(f, a, &r, Some(true), None, h)
         });
-        assert!(lines[0].starts_with("♫ Adroit Jazz"), "{:?}", lines[0]);
+        assert!(lines[0].starts_with("Adroit Jazz"), "{:?}", lines[0]);
         assert!(lines[1].starts_with("jazz"), "{:?}", lines[1]);
         // The country moved to the station row; saying it twice on one deck
         // means reading it twice to find out it was the same fact.
@@ -1442,7 +1400,7 @@ mod tests {
             for saved in [false, true] {
                 render(width.max(1), 2, |f, a, h| {
                     let a = Rect { width, ..a };
-                    radio_masthead(f, a, &r, Note::Show, Some(true), None, h);
+                    radio_masthead(f, a, &r, Some(true), None, h);
                     radio_status(f, Rect { height: 1, ..a }, &r, h);
                     radio_transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
                     radio_station_row(f, Rect { height: 1, ..a }, &r, saved, None, h);

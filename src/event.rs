@@ -132,6 +132,24 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
+    // The artist page's album groups. Search's kind, not radio's: one fetch
+    // holds every group, so a click re-cuts the catalogue in place.
+    if let Some(tab) = st
+        .hit
+        .artist_tabs
+        .iter()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, tab)| *tab)
+    {
+        if let MainView::Artist(v) = &mut st.main
+            && v.tab != tab
+        {
+            v.set_tab(tab);
+            st.main_to_top();
+        }
+        return;
+    }
+
     // An album card's two controls, ahead of the list they sit in: the name
     // opens the record, the ▶ play starts it. A click anywhere else on the
     // card falls through and merely selects it, like any other row.
@@ -904,14 +922,28 @@ fn flip_sort(st: &mut AppState) {
     snap_to_selection(st);
 }
 
-/// ←/→: switch tabs on the two tabbed views.
+/// ←/→: switch tabs on the three tabbed views.
 ///
 /// Search's tabs are five cuts of one query already answered, so switching is
 /// free — Stations came from a second catalogue, but it was asked at the same
-/// moment and is in hand by the time you reach it. Radio's are four different
-/// queries, so switching *navigates* — the new tab is its own page, and Esc
-/// walks back to the one you left.
+/// moment and is in hand by the time you reach it. The artist page's album
+/// groups are the same kind of thing: one fetch brought all four back. Radio's
+/// are four different queries, so switching *navigates* — the new tab is its
+/// own page, and Esc walks back to the one you left.
 fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand>) {
+    if let MainView::Artist(v) = &mut st.main {
+        // Only the groups this artist has records in, so ←/→ never lands on
+        // an empty page.
+        let tabs = v.tabs();
+        if tabs.len() > 1 {
+            let pos = tabs.iter().position(|t| *t == v.tab).unwrap_or(0) as i64;
+            let n = tabs.len() as i64;
+            let tab = tabs[((pos + delta).rem_euclid(n)) as usize];
+            v.set_tab(tab);
+            st.main_to_top();
+        }
+        return;
+    }
     match &st.main {
         MainView::Search(_) => {
             let pos = SearchTab::ALL
@@ -1690,9 +1722,12 @@ mod tests {
                 artists: "Muse".into(),
                 release_year: "2006".into(),
                 album_type: "album".into(),
+                album_group: "album".into(),
                 track_count: 12,
                 cover_url: Some("https://i.scdn.co/image/abc".into()),
             }],
+            display: vec![0],
+            tab: crate::app::state::ArtistTab::Albums,
             loading: false,
         });
         st
@@ -2828,6 +2863,120 @@ mod tests {
                 scope: RadioScope::Genres
             })
         ));
+    }
+
+    /// The artist page's groups are cuts of one answer, so ←/→ re-cuts them
+    /// where it stands: no command goes out, and nothing is pushed for Esc to
+    /// walk back off. The wrap runs both ways, over the groups that have
+    /// records and no others.
+    #[test]
+    fn arrows_re_cut_the_artist_page_without_leaving_it() {
+        use crate::app::state::ArtistTab;
+        let (tx, mut rx) = channel();
+        let mut st = artist_state();
+        let MainView::Artist(v) = &mut st.main else {
+            unreachable!()
+        };
+        v.albums.push(AlbumItem {
+            id: "a2".into(),
+            name: "Hysteria".into(),
+            artists: "Muse".into(),
+            release_year: "2003".into(),
+            album_type: "single".into(),
+            album_group: "single".into(),
+            track_count: 1,
+            cover_url: None,
+        });
+        v.retab();
+        let depth = st.view_stack.len();
+
+        cycle_view_tab(&mut st, 1, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "switching a group asked the network"
+        );
+        assert_eq!(
+            st.view_stack.len(),
+            depth,
+            "switching a group pushed a page"
+        );
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.tab, ArtistTab::Singles);
+        assert_eq!(v.display, vec![1]);
+
+        // Two groups, so one more step wraps back to the first.
+        cycle_view_tab(&mut st, 1, &tx);
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.tab, ArtistTab::Albums);
+        cycle_view_tab(&mut st, -1, &tx);
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.tab, ArtistTab::Singles);
+    }
+
+    /// Clicking a group label picks that group, the way clicking a search tab
+    /// picks a cut of the query — in place, with the list back at the top.
+    #[test]
+    fn clicking_an_album_group_re_cuts_the_page() {
+        use crate::app::state::ArtistTab;
+        let (tx, mut rx) = channel();
+        let mut st = artist_state();
+        let MainView::Artist(v) = &mut st.main else {
+            unreachable!()
+        };
+        v.albums.push(AlbumItem {
+            id: "a2".into(),
+            name: "Hysteria".into(),
+            artists: "Muse".into(),
+            release_year: "2003".into(),
+            album_type: "single".into(),
+            album_group: "single".into(),
+            track_count: 1,
+            cover_url: None,
+        });
+        v.retab();
+        st.main_index = 1;
+        st.hit.artist_tabs = vec![(
+            Rect {
+                x: 10,
+                y: 18,
+                width: 7,
+                height: 1,
+            },
+            ArtistTab::Singles,
+        )];
+
+        handle_click(&mut st, Position { x: 12, y: 18 }, &tx);
+        assert!(rx.try_recv().is_err(), "a group click asked the network");
+        assert_eq!(
+            st.main_index, 0,
+            "the list stayed where the last tab left it"
+        );
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.tab, ArtistTab::Singles);
+        assert_eq!(v.display, vec![1]);
+    }
+
+    /// One group is no choice: the strip is not drawn, and ←/→ has nothing to
+    /// do rather than flicking the same tab back at you.
+    #[test]
+    fn arrows_do_nothing_on_a_one_group_catalogue() {
+        use crate::app::state::ArtistTab;
+        let (tx, _rx) = channel();
+        let mut st = artist_state();
+        cycle_view_tab(&mut st, 1, &tx);
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.tab, ArtistTab::Albums);
+        assert_eq!(v.display, vec![0]);
     }
 
     /// While a station is live the Spotify-only transport keys must not reach

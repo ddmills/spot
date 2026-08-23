@@ -16,6 +16,8 @@ use crate::app::state::{
 };
 
 pub const PAGE_LIMIT: u32 = 50;
+/// Pages of an artist's catalogue to walk before giving up on the rest.
+const ARTIST_ALBUM_PAGES: u32 = 4;
 const MAX_PLAYLISTS: u32 = 1000;
 
 /// Everything the artist page is built from.
@@ -38,6 +40,9 @@ struct RawAlbum {
     id: Option<String>,
     name: String,
     album_type: Option<String>,
+    /// The artist's relationship to the record, which `album_type` cannot
+    /// express: only this says a record merely *features* them.
+    album_group: Option<String>,
     release_date: Option<String>,
     total_tracks: Option<u32>,
     #[serde(default)]
@@ -308,28 +313,45 @@ impl Api {
         })
     }
 
-    /// An artist's albums and singles, newest first.
+    /// An artist's whole catalogue — albums, singles, compilations and the
+    /// records they only guest on — newest first.
+    ///
+    /// All four groups come back in one pass because the page's tabs are cuts
+    /// of one answer, not four queries: switching tab must not wait on the
+    /// network.
     ///
     /// Read as raw JSON rather than through rspotify's typed call: its
-    /// `SimplifiedAlbum` drops `total_tracks`, and an album card names how
-    /// many tracks the record holds. Everything else here is the documented
-    /// shape of the same response, and anything unparseable is skipped.
+    /// `SimplifiedAlbum` drops both `total_tracks` and `album_group`, and a
+    /// card names how many tracks a record holds while the tabs are grouped by
+    /// the latter. Everything else here is the documented shape of the same
+    /// response, and anything unparseable is skipped.
     async fn artist_albums(&self, artist_id: &str) -> Result<Vec<AlbumItem>> {
         let limit = PAGE_LIMIT.to_string();
-        let params: Query = [
-            ("include_groups", "album,single"),
-            ("limit", limit.as_str()),
-            ("offset", "0"),
-        ]
-        .into_iter()
-        .collect();
-        let body = self
-            .client
-            .api_get(&format!("artists/{artist_id}/albums"), &params)
-            .await
-            .context("failed to fetch artist albums")?;
-        let page: RawAlbumPage = serde_json::from_str(&body)?;
-        let mut albums: Vec<AlbumItem> = page.items.iter().filter_map(album_from_raw).collect();
+        let mut albums: Vec<AlbumItem> = Vec::new();
+        // Four groups overrun one page for anyone prolific, so walk them —
+        // but only so far. Past this a card list is longer than anyone
+        // scrolls, and the page has already cost four round trips.
+        for page_no in 0..ARTIST_ALBUM_PAGES {
+            let offset = (page_no * PAGE_LIMIT).to_string();
+            let params: Query = [
+                ("include_groups", "album,single,compilation,appears_on"),
+                ("limit", limit.as_str()),
+                ("offset", offset.as_str()),
+            ]
+            .into_iter()
+            .collect();
+            let body = self
+                .client
+                .api_get(&format!("artists/{artist_id}/albums"), &params)
+                .await
+                .context("failed to fetch artist albums")?;
+            let page: RawAlbumPage = serde_json::from_str(&body)?;
+            let full = page.items.len() as u32 == PAGE_LIMIT;
+            albums.extend(page.items.iter().filter_map(album_from_raw));
+            if !full {
+                break;
+            }
+        }
         // Newest first. A stable sort, so records sharing a year keep the
         // order Spotify returned them in.
         albums.sort_by(|a, b| b.release_year.cmp(&a.release_year));
@@ -480,8 +502,9 @@ fn album_from_simplified(a: &SimplifiedAlbum) -> Option<AlbumItem> {
         artists: artists_line(&a.artists),
         release_year: release_year(a.release_date.as_deref()),
         album_type: a.album_type.clone().unwrap_or_default(),
-        // Not modelled by rspotify's `SimplifiedAlbum`; only the artist page's
-        // raw read (see `album_from_raw`) reports one.
+        // Neither is modelled by rspotify's `SimplifiedAlbum`; only the artist
+        // page's raw read (see `album_from_raw`) reports them.
+        album_group: String::new(),
         track_count: 0,
         // Comes back with the album itself, so opening one can show its sleeve
         // without a second round trip.
@@ -501,6 +524,15 @@ fn album_from_raw(a: &RawAlbum) -> Option<AlbumItem> {
             .join(", "),
         release_year: release_year(a.release_date.as_deref()),
         album_type: a.album_type.clone().unwrap_or_default(),
+        // Spotify sends `album_group` only on this endpoint. Where it is
+        // absent the type is the closest thing to it — it agrees with the
+        // group for everything except the records an artist merely guests on,
+        // which this response would have labelled `appears_on`.
+        album_group: a
+            .album_group
+            .clone()
+            .or_else(|| a.album_type.clone())
+            .unwrap_or_default(),
         track_count: a.total_tracks.unwrap_or(0),
         cover_url: crate::cover::pick_url(&a.images),
     })

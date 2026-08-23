@@ -285,6 +285,8 @@ mod tests {
                 genres: vec![],
                 top: TrackList::new("Muse", "", None, None),
                 albums: vec![],
+                display: Vec::new(),
+                tab: crate::app::state::ArtistTab::Albums,
                 loading: false,
             });
             st.push_view();
@@ -567,7 +569,7 @@ mod tests {
         };
         let mut top = TrackList::new("Roy Hargrove", "top tracks", None, None);
         top.append(list.tracks);
-        st.main = crate::app::state::MainView::Artist(crate::app::state::ArtistView {
+        let mut view = crate::app::state::ArtistView {
             id: "r1".into(),
             uri: "spotify:artist:r1".into(),
             name: "Roy Hargrove".into(),
@@ -575,18 +577,26 @@ mod tests {
             genres: vec!["jazz".into(), "hard bop".into()],
             top,
             albums: (0..12)
-                .map(|i| crate::app::state::AlbumItem {
-                    id: format!("a{i}"),
-                    name: format!("Record Number {i}"),
-                    artists: "Roy Hargrove".into(),
-                    release_year: (2010 - i).to_string(),
-                    album_type: if i % 3 == 0 { "single" } else { "album" }.into(),
-                    track_count: 4 + i as u32,
-                    cover_url: Some(format!("https://i.scdn.co/image/a{i}")),
+                .map(|i| {
+                    let group = if i % 3 == 0 { "single" } else { "album" };
+                    crate::app::state::AlbumItem {
+                        id: format!("a{i}"),
+                        name: format!("Record Number {i}"),
+                        artists: "Roy Hargrove".into(),
+                        release_year: (2010 - i).to_string(),
+                        album_type: group.into(),
+                        album_group: group.into(),
+                        track_count: 4 + i as u32,
+                        cover_url: Some(format!("https://i.scdn.co/image/a{i}")),
+                    }
                 })
                 .collect(),
+            display: Vec::new(),
+            tab: crate::app::state::ArtistTab::Albums,
             loading: false,
-        });
+        };
+        view.retab();
+        st.main = crate::app::state::MainView::Artist(view);
         arrive_via(&mut st, "Jazz");
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");

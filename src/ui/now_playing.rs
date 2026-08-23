@@ -133,7 +133,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .track_uri
         .as_ref()
         .and_then(|uri| liked.get(uri).copied());
-    deck::masthead(frame, text, pb, deck::Note::Show, like, mouse, hit);
+    deck::masthead(frame, text, pb, like, mouse, hit);
 
     // The whole bar is the wheel target, sleeve included, which is wider than
     // the two rows `masthead` claims for the player's benefit. Assigned after
@@ -223,7 +223,7 @@ fn draw_radio(
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
 ) {
-    deck::radio_masthead(frame, body, radio, deck::Note::Show, liked, mouse, hit);
+    deck::radio_masthead(frame, body, radio, liked, mouse, hit);
 
     if body.height < 3 {
         return;
@@ -375,7 +375,7 @@ mod tests {
                 .skip(1)
                 .any(|l| l.contains('│') || l.contains('╭'))
         );
-        assert!(lines[TITLE_ROW].contains("♫ Song Title"));
+        assert!(lines[TITLE_ROW].contains("Song Title"));
         assert!(
             !lines[TITLE_ROW].contains("playing"),
             "{:?}",
@@ -435,8 +435,8 @@ mod tests {
         assert_eq!(state.hit.now_playing.height, BAR_H);
     }
 
-    /// The metadata row starts flush with the title's `♫` rather than under
-    /// the title's first letter, so the masthead reads as one block.
+    /// The metadata row starts flush with the title above it, so the masthead
+    /// reads as one block rather than two columns.
     #[test]
     fn the_metadata_row_is_not_indented() {
         let mut state = playing_state();
@@ -444,7 +444,7 @@ mod tests {
         let col = |s: &str, c: char| s.chars().position(|x| x == c);
         assert_eq!(
             col(&lines[META_ROW], 'A'),
-            col(&lines[TITLE_ROW], '♫'),
+            col(&lines[TITLE_ROW], 'S'),
             "{:?} / {:?}",
             lines[META_ROW],
             lines[TITLE_ROW]

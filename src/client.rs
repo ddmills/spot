@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use crate::api::{Api, PAGE_LIMIT};
 use crate::app::command::AppCommand;
 use crate::app::state::{
-    self, AppState, ArtistView, LocalPlayback, MainView, TrackList, TrackListKind,
+    self, AppState, ArtistTab, ArtistView, LocalPlayback, MainView, TrackList, TrackListKind,
 };
 use crate::cover::{Cover, CoverCache};
 use crate::radio::api::RadioApi;
@@ -1280,6 +1280,8 @@ impl Client {
             genres: Vec::new(),
             top: TrackList::new(name, "top tracks", None, None),
             albums: Vec::new(),
+            display: Vec::new(),
+            tab: ArtistTab::Albums,
             loading: true,
         };
         let generation = {
@@ -1309,19 +1311,33 @@ impl Client {
                     Ok(overview) => {
                         let uris: Vec<String> =
                             overview.top.iter().map(|t| t.uri.clone()).collect();
-                        // The photo first: it is the one image already on
-                        // screen when the page lands, and the fetches run in
-                        // order.
-                        let art: Vec<String> = overview
-                            .image_url
-                            .iter()
-                            .chain(overview.albums.iter().filter_map(|a| a.cover_url.as_ref()))
-                            .cloned()
-                            .collect();
                         v.image_url = overview.image_url;
                         v.genres = overview.genres;
                         v.top.append(overview.top);
                         v.albums = overview.albums;
+                        v.retab();
+                        // The photo first: it is the one image already on
+                        // screen when the page lands, and the fetches run in
+                        // order. Then the tab you are looking at, then the
+                        // rest — every group came back in one pass, and the
+                        // sleeves of a tab nobody opened can wait.
+                        let open = v
+                            .display
+                            .iter()
+                            .filter_map(|&i| v.albums[i].cover_url.clone());
+                        let rest = v
+                            .albums
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !v.display.contains(i))
+                            .filter_map(|(_, a)| a.cover_url.clone());
+                        let art: Vec<String> = v
+                            .image_url
+                            .iter()
+                            .cloned()
+                            .chain(open)
+                            .chain(rest)
+                            .collect();
                         (uris, art)
                     }
                     Err(e) => {

@@ -303,7 +303,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if let Some(r) = radio.as_ref() {
         if rows.header > 0 {
             let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
-            deck::radio_masthead(frame, header_area, r, deck::Note::Hide, like, mouse, hit);
+            deck::radio_masthead(frame, header_area, r, like, mouse, hit);
             hit.now_playing = Rect {
                 height: header_area.height.min(deck::MASTHEAD_H),
                 ..header_area
@@ -376,13 +376,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     };
 
     if rows.header > 0 {
-        // No `♫` on the title here: the mark two rows above owns the note and
-        // the column. See [`deck::Note`].
         let like = pb
             .track_uri
             .as_ref()
             .and_then(|uri| liked.get(uri).copied());
-        deck::masthead(frame, header_area, pb, deck::Note::Hide, like, mouse, hit);
+        deck::masthead(frame, header_area, pb, like, mouse, hit);
 
         // Only the two written rows are the volume wheel's target: a wheel on
         // the blank one below is a scroll. (The bottom bar claims its whole
@@ -871,6 +869,8 @@ mod tests {
             genres: vec![],
             top: TrackList::new(name, "", None, None),
             albums: vec![],
+            display: Vec::new(),
+            tab: crate::app::state::ArtistTab::Albums,
             loading: false,
         }
     }
@@ -995,8 +995,8 @@ mod tests {
         // The masthead spans the pane above the cover: the title, then
         // artists · album · year with the volume opposite. The play state is
         // not up here — it is centred under the progress bar.
-        // The title wears no `♫` here — the mark two rows above owns the note
-        // and the column. See [`deck::Note`].
+        // No note on the title: the `♫ spot` mark two rows above owns that
+        // glyph and that column.
         assert!(lines[0].trim_start().starts_with("Beta"), "{:?}", lines[0]);
         assert!(!lines[0].contains("♫"), "{:?}", lines[0]);
         assert!(!lines[0].contains("playing"), "{:?}", lines[0]);
