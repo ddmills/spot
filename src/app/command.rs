@@ -95,4 +95,12 @@ pub enum AppCommand {
     StopRadio,
     /// `L` on a station row: keep it, or stop keeping it.
     ToggleSavedStation(Box<Station>),
+
+    /// Quit: silence both engines and end the client loop.
+    ///
+    /// The only command whose completion the sender waits for — see
+    /// `Client::new`'s `shutdown_ack`. Everything else about quitting is
+    /// cosmetic, but audio that outlives the UI is not, and only the client
+    /// holds the handles that can stop it.
+    Shutdown,
 }

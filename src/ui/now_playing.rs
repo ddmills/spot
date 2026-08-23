@@ -43,6 +43,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let AppState {
         playback,
         radio,
+        radio_favorites,
         queue,
         toast,
         hit,
@@ -78,12 +79,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         // Only for a matched record, and only once the answer is in: the deck
         // draws no control it cannot answer for.
         let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
+        // Whether the station itself is kept — a file of spot's own, so unlike
+        // the liked answer above there is never a "not yet known".
+        let saved = radio_favorites.iter().any(|f| f.uuid == r.station.uuid);
         draw_radio(
             frame,
             body,
             r,
             toast.as_ref().map(|(m, _)| m.as_str()),
             like,
+            saved,
             play,
             mouse,
             hit,
@@ -201,7 +206,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
 /// The same six rows in the same order as the Spotify bar, so the eye does not
 /// have to relearn the bottom of the screen when the source changes: station,
 /// what it is playing, the toast, a LIVE marker where the progress track goes,
-/// the transport, and a row saying where the sound is coming from. No sleeve —
+/// the transport, and the station itself where the Spotify bar names its queue.
+/// No sleeve —
 /// `cover` is allowlisted to Spotify's CDN and decodes JPEG only, while station
 /// artwork is mostly SVG, so there would be nothing to draw but a placeholder
 /// taking cells the name can use.
@@ -212,6 +218,7 @@ fn draw_radio(
     radio: &crate::app::state::RadioPlayback,
     toast: Option<&str>,
     liked: Option<bool>,
+    saved: bool,
     play: PlayState,
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
@@ -236,7 +243,7 @@ fn draw_radio(
     if body.height < deck::DECK_H {
         return;
     }
-    deck::radio_context_row(frame, row_at(body, 6), radio, hit);
+    deck::radio_station_row(frame, row_at(body, 6), radio, saved, mouse, hit);
 }
 
 /// One row of `area`, `n` rows down.

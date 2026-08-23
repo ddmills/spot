@@ -291,6 +291,18 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
+    // The station row, under the transport while a station is on. Before the
+    // liked control below, which wears the same `★` two rows up and means the
+    // record rather than the station.
+    if st.hit.station_country.contains(pos) {
+        open_station_country(st, tx);
+        return;
+    }
+    if st.hit.save_station_btn.contains(pos) {
+        toggle_saved_station(st, tx);
+        return;
+    }
+
     // The deck's liked control is about the playing track, which is what the
     // row it sits on is about — not the selection on the page underneath.
     if st.hit.like_btn.contains(pos) {
@@ -1405,6 +1417,49 @@ fn open_deck_artist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     // the player and onto the page it names.
     st.show_player = false;
     navigate(st, cmd, tx);
+}
+
+/// The station row's country: open the directory's page for it.
+///
+/// Same shape as [`open_deck_album`] and [`open_deck_artist`], and the same
+/// reason it closes the player first — the page opens in the main view, which
+/// the player would otherwise sit on top of.
+///
+/// The directory is queried by ISO code, not by name (see
+/// [`crate::radio::api::RadioApi::by_country`]), so a station the directory gave
+/// no code for has nowhere to lead. The row draws the name inert in that case,
+/// which means this cannot normally be reached; the guard is here because a
+/// silent `unwrap` on a field the network fills is not a guard.
+fn open_station_country(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(code) = st
+        .radio
+        .as_ref()
+        .map(|r| r.station.countrycode.clone())
+        .filter(|c| !c.is_empty())
+    else {
+        return;
+    };
+    st.show_player = false;
+    navigate(
+        st,
+        AppCommand::LoadRadio {
+            scope: RadioScope::Country(code),
+        },
+        tx,
+    );
+}
+
+/// The station row's `★`: keep the playing station, or drop it.
+///
+/// The same command the `L` key sends from a station row in the directory
+/// ([`toggle_like_selection`]) — the difference is only which station is meant.
+/// Here it is the one making the sound, which is what every other control on
+/// the deck is about.
+fn toggle_saved_station(st: &AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(station) = st.radio.as_ref().map(|r| r.station.clone()) else {
+        return;
+    };
+    let _ = tx.send(AppCommand::ToggleSavedStation(Box::new(station)));
 }
 
 /// Say why a deck control did nothing, when the reason is radio.
@@ -3068,5 +3123,58 @@ mod tests {
             rx.try_recv(),
             Ok(AppCommand::ToggleSavedStation(s)) if s.uuid == station.uuid
         ));
+    }
+
+    /// The station row's `★` keeps the station making the sound, not the
+    /// record on the masthead above it — the two wear the same mark on the
+    /// same deck, so this is the pair that has to be told apart.
+    #[test]
+    fn the_station_rows_star_saves_the_station_not_its_matched_record() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.playback = Some(playing("spotify:album:a1"));
+        st.radio = Some(matched_radio());
+        st.hit.like_btn = Rect::new(70, 20, 9, 1);
+        st.hit.save_station_btn = Rect::new(70, 24, 7, 1);
+
+        handle_click(&mut st, Position { x: 72, y: 24 }, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::ToggleSavedStation(s)) if s.uuid == "s1"
+        ));
+    }
+
+    /// The country opens the directory's page for it, and gets out of the
+    /// player on the way — the page it opens is in the view the player covers.
+    #[test]
+    fn the_station_rows_country_opens_that_countrys_page() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.show_player = true;
+        st.radio = Some(live_radio(test_station("s1", "Adroit Jazz")));
+        st.hit.station_country = Rect::new(14, 24, 28, 1);
+
+        handle_click(&mut st, Position { x: 20, y: 24 }, &tx);
+        assert!(!st.show_player, "the player would cover the page it opened");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio { scope: RadioScope::Country(code) }) if code == "US"
+        ));
+    }
+
+    /// The directory gave no code to ask by, so there is nothing to open. The
+    /// row draws such a country inert, but a click resolved against a stale
+    /// rect must not send a query for `""` either.
+    #[test]
+    fn a_station_with_no_country_code_opens_nothing() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        let mut station = test_station("s1", "Adroit Jazz");
+        station.countrycode = String::new();
+        st.radio = Some(live_radio(station));
+        st.hit.station_country = Rect::new(14, 24, 28, 1);
+
+        handle_click(&mut st, Position { x: 20, y: 24 }, &tx);
+        assert!(rx.try_recv().is_err());
     }
 }

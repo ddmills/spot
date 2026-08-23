@@ -293,8 +293,8 @@ fn sep(spans: &mut Vec<Span<'static>>, x: &mut u16, next: &str, meta: Rect) -> b
 /// Row 0 falls back through what is actually known: the matched record's name,
 /// else the station's own words, else the station's name. Something like six
 /// popular stations in ten announce anything at all; the station's name is what
-/// the row says for the rest, and [`radio_context_row`] carries the name in the
-/// other two cases so it is never off the screen.
+/// the row says for the rest, and [`radio_station_row`] carries the name in
+/// every case, so it is never off the screen.
 ///
 /// The `★` is drawn only against a matched record, and only once its saved
 /// state is known — the same rule [`masthead`] follows. Keeping a *station* is
@@ -424,13 +424,13 @@ pub fn radio_masthead(
 }
 
 /// What a station says about itself when it is not announcing a track.
+///
+/// Its genres, and nothing else. The country used to follow them here; it is on
+/// [`radio_station_row`] now, along with the station's name and its format, and
+/// a fact said twice on one deck is a fact you have to read twice to find out it
+/// was the same one.
 fn station_subtitle(radio: &RadioPlayback) -> String {
-    let s = &radio.station;
-    let parts: Vec<&str> = [s.tags.as_str(), s.country.as_str()]
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .collect();
-    parts.join(" · ")
+    radio.station.tags.clone()
 }
 
 /// The radio deck's answer to [`progress`]: `LIVE`, a filled track, and how
@@ -496,50 +496,125 @@ pub fn radio_transport(
     frame.render_widget(Paragraph::new(Line::from(spans)), seg);
 }
 
-/// The radio deck's bottom row: what is playing this, and how it sounds.
-/// Shuffle is not here — there is one stream and no order to put it in.
+/// The station control at the right end of [`radio_station_row`], in both
+/// states.
 ///
-/// The Spotify deck names the queue here, because that is what the record on
-/// its masthead is coming out of. The station is exactly that for a broadcast,
-/// so it is named here whenever the masthead is busy saying what is *on* the
-/// station. Where the masthead has fallen back to the station's own name there
-/// is nothing to add, and the row says what kind of thing it is instead — which
-/// is what it always said.
-pub fn radio_context_row(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hit: &mut HitAreas) {
+/// Built from [`super::table::LIKED_MARK`] and padded to one width for the same
+/// reasons [`like_label`] is: the directory's own table marks a kept station
+/// with the same `★`, and a control that changes width when it flips moves out
+/// from under the cursor that just pressed it.
+///
+/// "saved", not "liked" — the deck's other `★` is about the record the station
+/// is playing, and Spotify is where that one is kept. This one is a station,
+/// kept in a file of spot's own because the directory has no account to keep it
+/// in. The two sit on different rows and say different words.
+fn save_label(saved: bool) -> String {
+    let mark = super::table::LIKED_MARK;
+    if saved {
+        format!("{mark} saved")
+    } else {
+        format!("{mark} save ")
+    }
+}
+
+/// The radio deck's bottom row: the station itself — what it is called, where
+/// it broadcasts from, how it sounds, and whether you have kept it.
+///
+/// Shuffle is not here, and neither is a queue name: there is one stream and no
+/// order to put it in. What there is instead is the one thing the deck could not
+/// act on before. This row used to say `internet radio` (or the station's name)
+/// with the format opposite it, inert on both counts, which spent a whole row
+/// restating what the masthead had already said.
+///
+/// The name is white and the rest grey, so the row reads as one fact with its
+/// footnotes rather than as three of equal weight. The country is a link into
+/// the directory's page for it — clickable only where the directory gave us a
+/// code to ask by; without one the name is still printed, just inert, exactly as
+/// an artist without an id is on the masthead. The genres are deliberately not
+/// here: they are what the masthead falls back to (see [`station_subtitle`]),
+/// and this row is about the station, not its programming.
+///
+/// Records `hit.save_station_btn` and `hit.station_country`, and clears the two
+/// Spotify-deck controls that share the row so a click cannot land on last
+/// frame's rects.
+pub fn radio_station_row(
+    frame: &mut Frame,
+    row: Rect,
+    radio: &RadioPlayback,
+    saved: bool,
+    mouse: Option<Position>,
+    hit: &mut HitAreas,
+) {
     hit.shuffle_btn = Rect::default();
     hit.queue_name = Rect::default();
     if row.width == 0 {
         return;
     }
-    let quality = radio.station.quality();
-    if !quality.is_empty() {
-        right_row(
-            frame,
-            row,
-            None,
-            vec![vec![Span::styled(format!(" {quality} "), theme::dim())]],
-        );
-    }
+    let s = &radio.station;
+
+    // The control first, so the text is what gives way on a tight row rather
+    // than the one thing here you can press. `right_row` drops it whole below
+    // its own width, which leaves the row a plain readout rather than half a
+    // button.
+    hit.save_station_btn = right_row(
+        frame,
+        row,
+        mouse,
+        vec![vec![Span::styled(
+            save_label(saved),
+            if saved { theme::accent() } else { theme::dim() },
+        )]],
+    )[0];
+
+    // One cell of daylight between the text and the control, as on the
+    // masthead.
     let left = Rect {
-        width: row.width.saturating_sub(width(&quality) as u16 + 2),
+        width: match hit.save_station_btn.is_empty() {
+            true => row.width,
+            false => row.width.saturating_sub(hit.save_station_btn.width + 1),
+        },
         ..row
     };
     if left.width == 0 {
         return;
     }
-    // The masthead is naming a record, so this row names what is playing it.
-    // Where the masthead has fallen back to the station's own name, repeating
-    // it here would say nothing twice.
-    let names_a_track = radio.matched_track().is_some() || radio.now_title().is_some();
-    let label = if names_a_track {
-        radio.station.name.as_str()
-    } else {
-        "internet radio"
-    };
-    frame.render_widget(
-        Paragraph::new(Line::styled(fit(label, left.width as usize), theme::dim())),
-        left,
-    );
+
+    let dim = theme::dim();
+    let mut spans = Vec::new();
+    let mut x = left.x;
+    // `link` with nothing to click: it draws the run and advances `x` the way
+    // every other segment on the deck does, and hands back an empty rect that
+    // can never be hit. There is no page for one station, so the name is the
+    // row's subject rather than its control.
+    let name = clip(&s.name, left);
+    if sep(&mut spans, &mut x, &name, left) {
+        link(
+            &mut spans,
+            &mut x,
+            left,
+            mouse,
+            name,
+            theme::bright().add_modifier(Modifier::BOLD),
+            false,
+        );
+    }
+    let country = clip(&s.country, left);
+    if !country.is_empty() && sep(&mut spans, &mut x, &country, left) {
+        hit.station_country = link(
+            &mut spans,
+            &mut x,
+            left,
+            mouse,
+            country,
+            dim,
+            !s.countrycode.is_empty(),
+        );
+    }
+    let quality = s.quality();
+    if !quality.is_empty() && sep(&mut spans, &mut x, &quality, left) {
+        spans.push(Span::styled(quality, dim));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), left);
 }
 
 /// One row: elapsed, the track, time remaining.
@@ -1208,7 +1283,10 @@ mod tests {
             lines[0]
         );
         // Row 1 falls back to what the station says about itself.
-        assert!(lines[1].starts_with("jazz · Germany"), "{:?}", lines[1]);
+        assert!(lines[1].starts_with("jazz"), "{:?}", lines[1]);
+        // The country moved to the station row; saying it twice on one deck
+        // means reading it twice to find out it was the same fact.
+        assert!(!lines[1].contains("Germany"), "{:?}", lines[1]);
         assert!(hit.now_artist.is_empty());
         assert!(hit.now_album.is_empty());
         assert!(hit.like_btn.is_empty(), "nothing to save");
@@ -1222,22 +1300,108 @@ mod tests {
             radio_masthead(f, a, &r, Note::Show, Some(true), None, h)
         });
         assert!(lines[0].starts_with("♫ Adroit Jazz"), "{:?}", lines[0]);
-        assert!(lines[1].starts_with("jazz · Germany"), "{:?}", lines[1]);
+        assert!(lines[1].starts_with("jazz"), "{:?}", lines[1]);
+        // The country moved to the station row; saying it twice on one deck
+        // means reading it twice to find out it was the same fact.
+        assert!(!lines[1].contains("Germany"), "{:?}", lines[1]);
         assert!(hit.like_btn.is_empty());
     }
 
-    /// The station moves to the context row exactly when a record takes its
-    /// place on the masthead, so it is never drawn twice and never missing.
+    /// The station's own row: what it is called, where from, how it sounds —
+    /// and the control that keeps it. It says the same thing whether or not the
+    /// masthead above has found a record, because it is about the station and
+    /// not about what is on it.
     #[test]
-    fn the_context_row_names_the_station_once_the_masthead_names_a_record() {
-        let quiet = radio("Adroit Jazz");
-        let (lines, _, _) = render(80, 1, |f, a, h| radio_context_row(f, a, &quiet, h));
-        assert!(lines[0].starts_with("internet radio"), "{:?}", lines[0]);
+    fn the_station_row_names_the_station_its_country_and_its_format() {
+        let r = radio("Adroit Jazz");
+        let (lines, hit, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        assert!(
+            lines[0].starts_with("Adroit Jazz · Germany · MP3 128k"),
+            "{:?}",
+            lines[0]
+        );
+        // The row it replaced said this, about a station it could not name.
+        assert!(!lines[0].contains("internet radio"), "{:?}", lines[0]);
+        // The genres stay on the masthead's fallback row; this one is about the
+        // station, not its programming.
+        assert!(!lines[0].contains("jazz ·"), "{:?}", lines[0]);
 
-        let playing = radio("Adroit Jazz");
+        // The country is the link, and it covers the name and nothing else.
+        let at = |rect: Rect| -> String {
+            lines[0]
+                .chars()
+                .skip(rect.x as usize)
+                .take(rect.width as usize)
+                .collect()
+        };
+        assert_eq!(at(hit.station_country), "Germany");
+        assert!(hit.save_station_btn.right() == 80);
+        // The deck's other controls do not belong on a radio row, and a rect
+        // left over from the Spotify deck would still be hittable.
+        assert!(hit.shuffle_btn.is_empty() && hit.queue_name.is_empty());
+
+        // A record on the masthead changes nothing here.
+        let mut playing = radio("Adroit Jazz");
         *playing.title.lock() = Some("Peter Appleyard - Frenesi".into());
-        let (lines, _, _) = render(80, 1, |f, a, h| radio_context_row(f, a, &playing, h));
-        assert!(lines[0].starts_with("Adroit Jazz"), "{:?}", lines[0]);
+        playing.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
+        let (named, _, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &playing, false, None, h)
+        });
+        assert_eq!(named[0], lines[0]);
+    }
+
+    /// Both states are the same width and land on the same cells, so the
+    /// control does not move out from under the cursor that just pressed it —
+    /// the rule the liked control on the masthead follows.
+    #[test]
+    fn the_save_control_says_which_way_it_would_go_without_moving() {
+        let r = radio("Adroit Jazz");
+        let (saved_lines, saved_hit, saved_buf) =
+            render(80, 1, |f, a, h| radio_station_row(f, a, &r, true, None, h));
+        let (plain_lines, plain_hit, plain_buf) =
+            render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let mark = super::super::table::LIKED_MARK;
+        assert!(
+            saved_lines[0].contains(&format!("{mark} saved")),
+            "{:?}",
+            saved_lines[0]
+        );
+        assert!(
+            plain_lines[0].contains(&format!("{mark} save ")),
+            "{:?}",
+            plain_lines[0]
+        );
+        assert_eq!(saved_hit.save_station_btn, plain_hit.save_station_btn);
+
+        // Accent when kept, grey when not — the only colour on the row either
+        // way is the one that reports a state.
+        let fg = |buf: &ratatui::buffer::Buffer, x: u16| buf.cell(Position { x, y: 0 }).unwrap().fg;
+        let x = saved_hit.save_station_btn.x;
+        assert_eq!(fg(&saved_buf, x), theme::accent_color());
+        assert_eq!(fg(&plain_buf, x), theme::DIM);
+    }
+
+    /// No code to ask the directory by, so the country is printed and inert —
+    /// the same rule an artist name without an id follows on the masthead.
+    #[test]
+    fn a_country_with_no_code_is_drawn_but_leads_nowhere() {
+        let mut r = radio("Adroit Jazz");
+        r.station.countrycode = String::new();
+        let (lines, hit, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        assert!(lines[0].contains("Germany"), "{:?}", lines[0]);
+        assert!(hit.station_country.is_empty());
+    }
+
+    /// A station the directory knows nothing technical about: the format
+    /// segment goes whole rather than leaving a dangling separator.
+    #[test]
+    fn a_station_with_no_format_drops_the_segment() {
+        let mut r = radio("Adroit Jazz");
+        r.station.codec = "UNKNOWN".into();
+        r.station.bitrate = 0;
+        let (lines, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let text = lines[0].split('★').next().unwrap().trim_end();
+        assert_eq!(text, "Adroit Jazz · Germany", "{:?}", lines[0]);
     }
 
     #[test]
@@ -1245,13 +1409,15 @@ mod tests {
         let mut r = radio("Adroit Jazz");
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
         for width in 0..40u16 {
-            render(width.max(1), 2, |f, a, h| {
-                let a = Rect { width, ..a };
-                radio_masthead(f, a, &r, Note::Show, Some(true), None, h);
-                radio_status(f, Rect { height: 1, ..a }, &r);
-                radio_transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
-                radio_context_row(f, Rect { height: 1, ..a }, &r, h);
-            });
+            for saved in [false, true] {
+                render(width.max(1), 2, |f, a, h| {
+                    let a = Rect { width, ..a };
+                    radio_masthead(f, a, &r, Note::Show, Some(true), None, h);
+                    radio_status(f, Rect { height: 1, ..a }, &r);
+                    radio_transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
+                    radio_station_row(f, Rect { height: 1, ..a }, &r, saved, None, h);
+                });
+            }
         }
     }
 }

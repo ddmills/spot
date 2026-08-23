@@ -7,6 +7,7 @@ use librespot_connect::Spirc;
 use librespot_playback::mixer::Mixer;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 
 use crate::api::{Api, PAGE_LIMIT};
 use crate::app::command::AppCommand;
@@ -107,6 +108,9 @@ pub struct Client {
     /// The radio audio thread. Held whether or not radio is in use; the thread
     /// is idle and the output device is not opened until a station plays.
     radio_player: RadioPlayer,
+    /// Fired once both engines are silent, so the quit path can wait for it.
+    /// Taken on use — a shutdown happens once and ends the loop.
+    shutdown_ack: Option<oneshot::Sender<()>>,
 }
 
 impl Client {
@@ -118,7 +122,11 @@ impl Client {
         state: Arc<RwLock<AppState>>,
         rx: UnboundedReceiver<AppCommand>,
         audio_tap: Arc<crate::audio_tap::AudioTap>,
-    ) -> Self {
+    ) -> (Self, oneshot::Receiver<()>) {
+        // Returned rather than taken as an argument: the receiver has exactly
+        // one caller, the quit path, and pairing it with the client here keeps
+        // the two ends from being wired up wrongly.
+        let (shutdown_ack, shutdown_done) = oneshot::channel();
         // Timeouts rather than defaults: a stalled CDN request would otherwise
         // leave a generation guard armed indefinitely.
         let http = reqwest::Client::builder()
@@ -127,7 +135,7 @@ impl Client {
             .user_agent(concat!("spot/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
-        Self {
+        let client = Self {
             api,
             spirc,
             mixer,
@@ -145,7 +153,9 @@ impl Client {
             covers: Arc::new(Mutex::new(CoverCache::default())),
             liked_probe: None,
             radio_probe: None,
-        }
+            shutdown_ack: Some(shutdown_ack),
+        };
+        (client, shutdown_done)
     }
 
     pub async fn run(mut self) {
@@ -160,6 +170,13 @@ impl Client {
             let repoll = self.repoll_at;
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
+                    // Handled here rather than in `handle`: it is the one
+                    // command that ends the loop, and it must not be racing a
+                    // poll that would talk to a device we just disconnected.
+                    Some(AppCommand::Shutdown) => {
+                        self.shutdown();
+                        break;
+                    }
                     Some(cmd) => {
                         if command_touches_playback(&cmd) {
                             self.repoll_at = Some(Instant::now() + COMMAND_REPOLL_DELAY);
@@ -403,6 +420,10 @@ impl Client {
             PlayStation(station) => self.play_station(*station).await,
             StopRadio => self.stop_radio(),
             ToggleSavedStation(station) => self.toggle_saved_station(*station),
+            // Intercepted by `run`, which is the only place that can end the
+            // loop. Listed rather than swept into a catch-all so a new command
+            // still has to be handled deliberately.
+            Shutdown => {}
         }
         Ok(())
     }
@@ -622,6 +643,28 @@ impl Client {
     fn stop_radio(&self) {
         self.radio_player.stop();
         self.state.write().radio = None;
+    }
+
+    /// Silence both engines on the way out, then let the quit path know.
+    ///
+    /// The client is the only holder of the two handles that can do this, so
+    /// without it nothing stopped playing when spot quit: the radio thread is
+    /// detached and its stop command is only ever sent on user action, and the
+    /// Connect device was left for the backend to time out. Both survived until
+    /// the process died — which, if librespot's player thread was wedged, could
+    /// be a long time after the terminal came back.
+    fn shutdown(&mut self) {
+        // Radio first: it is the one that kept playing, and it blocks until
+        // the output device is actually closed.
+        self.radio_player.shutdown();
+        // Pauses playback, drops the Connect device off the user's device list
+        // and ends the spirc future, which is what drops librespot's `Player`.
+        if let Err(e) = self.spirc.shutdown() {
+            log::warn!("spirc shutdown failed: {e}");
+        }
+        if let Some(ack) = self.shutdown_ack.take() {
+            let _ = ack.send(());
+        }
     }
 
     /// Look up what the station just announced, once per announcement.

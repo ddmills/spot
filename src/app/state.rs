@@ -1163,6 +1163,16 @@ pub struct HitAreas {
     /// playing track. Empty while its saved state is still unknown — a control
     /// that cannot say which way it would go is worse than no control.
     pub like_btn: Rect,
+    /// The playing station's country, on the deck's station row. Opens the
+    /// directory's page for that country. Empty when the directory gave us no
+    /// code to ask by — the name is still printed, it just leads nowhere, the
+    /// same rule an artist name without an id follows.
+    pub station_country: Rect,
+    /// The deck's save control, at the right of the station row: keeps or drops
+    /// the *station*, where [`Self::like_btn`] two rows up is about the record
+    /// it is playing. Always drawn while a station is on — unlike the liked
+    /// control, the answer is in a file of spot's own and is never unknown.
+    pub save_station_btn: Rect,
     /// Volume slider track only; click position maps linearly to percent.
     pub volume_slider: Rect,
     /// The playing queue's name on the deck's context row. Clicking it

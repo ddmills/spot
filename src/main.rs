@@ -5,6 +5,8 @@ mod audio_tap;
 mod auth;
 mod client;
 mod config;
+#[cfg(windows)]
+mod console_ctrl;
 mod cover;
 mod event;
 mod radio;
@@ -38,6 +40,11 @@ use crate::client::Client;
 const MIN_COLS: u16 = 80;
 const MIN_ROWS: u16 = 24;
 
+/// How long the quit path waits for the client to silence both engines.
+/// Generous, because it is only ever spent when something is already wrong —
+/// a healthy shutdown answers in milliseconds.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // Before anything else touches the disk: a double-clicked spot hands
@@ -49,8 +56,16 @@ async fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
+    // Hard-exit rather than returning, on both paths below. Returning from
+    // `main` drops the `#[tokio::main]` runtime, and that drop joins
+    // librespot's player thread — which can be parked inside a sink write on a
+    // device that has stopped draining. When it was, spot never exited: the
+    // terminal was restored, the window was closed, and a detached radio thread
+    // went on streaming from a process nobody could see. `run` has already
+    // stopped both engines by this point, so there is nothing left to tear down
+    // that is worth risking that on.
     match run().await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => std::process::exit(0),
         Err(e) => {
             // Everything that can fail here fails before the TUI starts, or
             // after it has restored the terminal, so plain printing is safe.
@@ -60,13 +75,17 @@ async fn main() -> std::process::ExitCode {
             eprintln!("\nspot: {e:#}");
             eprintln!("\nPress Enter to close.");
             let _ = std::io::stdin().read_line(&mut String::new());
-            std::process::ExitCode::FAILURE
+            std::process::exit(1)
         }
     }
 }
 
 async fn run() -> Result<()> {
     init_logging()?;
+    // Installed before anything can open an audio device, so closing the
+    // window is never the one quit path that leaves a station playing.
+    #[cfg(windows)]
+    console_ctrl::install();
     warn_about_terminal();
 
     // Auth and session setup happen before the TUI takes the terminal, so
@@ -117,15 +136,36 @@ async fn run() -> Result<()> {
         tx.clone(),
     ));
     // The radio player writes into the same tap librespot's sink does, so the
-    // visualizer follows whichever engine is playing.
-    tokio::spawn(Client::new(api, spirc, mixer, local, Arc::clone(&state), rx, audio_tap).run());
+    // visualizer follows whichever engine is playing. The client is also the
+    // only holder of the handles that can stop either engine, so quitting has
+    // to ask it and wait for the answer — see the shutdown block below.
+    let (client, shutdown_done) =
+        Client::new(api, spirc, mixer, local, Arc::clone(&state), rx, audio_tap);
+    tokio::spawn(client.run());
 
     let _ = tx.send(AppCommand::LoadPlaylists);
     let _ = tx.send(AppCommand::RefreshPlayback);
 
     let terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
-    let result = run_tui(terminal, state, tx).await;
+    let result = run_tui(terminal, state, tx.clone()).await;
+
+    // Before the terminal comes back, not after: the audio has to stop while
+    // the UI still says spot is running, or quitting looks finished while a
+    // station is still playing. `main` hard-exits once this returns, so this is
+    // the only chance either engine gets to stop cleanly.
+    if tx.send(AppCommand::Shutdown).is_ok() {
+        // A timeout rather than a plain await: a client task that is stuck on
+        // a network call must not strand the quit. The exit in `main` is what
+        // actually guarantees silence; this is what makes it graceful.
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, shutdown_done)
+            .await
+            .is_err()
+        {
+            log::warn!("the client did not finish shutting down in time");
+        }
+    }
+
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, SetTitle(""));
     ratatui::restore();
     result

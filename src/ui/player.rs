@@ -260,6 +260,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let AppState {
         playback,
         radio,
+        radio_favorites,
         queue,
         queue_index,
         queue_list,
@@ -351,13 +352,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             );
         }
         if rows.list_head > 0 {
-            deck::radio_context_row(
+            let saved = radio_favorites.iter().any(|f| f.uuid == r.station.uuid);
+            deck::radio_station_row(
                 frame,
                 Rect {
                     height: 1,
                     ..list_head_area
                 },
                 r,
+                saved,
+                mouse,
                 hit,
             );
         }

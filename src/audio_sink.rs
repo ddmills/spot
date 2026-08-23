@@ -10,7 +10,7 @@
 //! only other place in spot that talks to rodio directly.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::convert::Converter;
@@ -32,6 +32,10 @@ const QUEUE_HIGH_WATER: usize = 26;
 
 /// How long to wait for rodio to drain when the queue is full.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
+
+/// The longest a write will wait for the queue to drain before giving up on
+/// it. See the loop in [`SpotSink::write`] for why the wait has to be bounded.
+const MAX_DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 pub struct SpotSink {
     sink: rodio::Sink,
@@ -96,8 +100,26 @@ impl Sink for SpotSink {
 
         // Back-pressure: librespot hands over packets as fast as it can decode
         // them, so without this the queue grows without bound.
-        while self.sink.len() > QUEUE_HIGH_WATER {
-            thread::sleep(DRAIN_POLL);
+        //
+        // Bounded, and skipped outright while paused, because this runs on
+        // librespot's player thread — the thread `Player::drop` joins. A sink
+        // that has stopped draining (paused, or on a device that has been
+        // suspended or unplugged) would otherwise park that thread forever,
+        // which parks the runtime teardown behind it, which is how spot ended
+        // up still holding the audio device after its window was gone. Two
+        // seconds of no drain is already an audible glitch; returning lets the
+        // player loop notice why.
+        //
+        // The clock is only read once the queue is actually full, which it
+        // usually is not: this runs once per decoded packet.
+        if self.sink.len() > QUEUE_HIGH_WATER {
+            let deadline = Instant::now() + MAX_DRAIN_WAIT;
+            while self.sink.len() > QUEUE_HIGH_WATER
+                && !self.sink.is_paused()
+                && Instant::now() < deadline
+            {
+                thread::sleep(DRAIN_POLL);
+            }
         }
         Ok(())
     }

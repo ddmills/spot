@@ -21,9 +21,9 @@
 //! connecting and hands the finished reader across.
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -63,6 +63,18 @@ const TAP_FLUSH: usize = 512;
 /// wants a `Read + Seek` type, not a trait object.
 type RadioReader = IcyMetadataReader<StreamDownload<BoundedStorageProvider<MemoryStorageProvider>>>;
 
+/// How long a shutdown waits for the audio thread to confirm the device is
+/// closed. Long enough for a thread that is mid-command, short enough that a
+/// wedged one never holds up the quit — the caller exits the process either
+/// way.
+const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// A clone of the live thread's command sender, for callers that have no
+/// [`RadioPlayer`] to hand — specifically the Windows console-control handler,
+/// which runs on its own thread with no tokio runtime under it and cannot
+/// reach the one the client owns.
+static SHUTDOWN_HOOK: OnceLock<Sender<AudioCmd>> = OnceLock::new();
+
 enum AudioCmd {
     /// Play a connected stream. Carries the generation it was opened for, so a
     /// station the user has already moved on from is dropped rather than
@@ -76,6 +88,9 @@ enum AudioCmd {
     Resume,
     Stop,
     SetVolume(f32),
+    /// Close the device and end the thread. The ack is what makes this
+    /// synchronous: the sender knows the output is silent when it arrives.
+    Shutdown(Sender<()>),
 }
 
 /// Handle on the radio audio thread.
@@ -113,6 +128,9 @@ impl RadioPlayer {
             .name("spot-radio".to_string())
             .spawn(move || audio_thread(rx, thread_tap, thread_generation))
             .expect("failed to spawn the radio audio thread");
+        // Only the first player ever registers, which is the only one there
+        // is: `Client` builds exactly one and holds it for the session.
+        let _ = SHUTDOWN_HOOK.set(tx.clone());
         Self {
             tx,
             title: Arc::new(Mutex::new(None)),
@@ -234,6 +252,25 @@ impl RadioPlayer {
         self.send(AudioCmd::SetVolume(amplitude(percent)));
     }
 
+    /// Close the device and end the audio thread, and do not return until it
+    /// has happened.
+    ///
+    /// [`Self::stop`] is not enough on the way out: it queues a command and
+    /// returns, and spot's quit path used to reach the terminal restore — and
+    /// the end of `main` — while a station was still streaming. This blocks on
+    /// the thread's acknowledgement so quitting is audibly silent before the
+    /// UI goes away.
+    pub fn shutdown(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.live.store(false, Ordering::SeqCst);
+        *self.title.lock() = None;
+        let (ack_tx, ack_rx) = channel();
+        self.send(AudioCmd::Shutdown(ack_tx));
+        if ack_rx.recv_timeout(SHUTDOWN_ACK_TIMEOUT).is_err() {
+            log::warn!("the radio audio thread did not confirm shutdown in time");
+        }
+    }
+
     /// A dead channel means the audio thread panicked. There is nothing useful
     /// to do about it from here and no reason to take the app down with it —
     /// radio simply stops working, and the log says why.
@@ -241,6 +278,22 @@ impl RadioPlayer {
         if self.tx.send(cmd).is_err() {
             log::error!("the radio audio thread is gone; the command was dropped");
         }
+    }
+}
+
+/// Silence the radio thread from anywhere, without a [`RadioPlayer`] handle.
+///
+/// For the Windows console-control handler, which gets a few seconds' notice
+/// that the window is closing and has no way to reach the client task. Does
+/// nothing before the client is built, or once the thread has already been
+/// shut down by the ordinary quit path.
+pub fn stop_all_audio() {
+    let Some(tx) = SHUTDOWN_HOOK.get() else {
+        return;
+    };
+    let (ack_tx, ack_rx) = channel();
+    if tx.send(AudioCmd::Shutdown(ack_tx)).is_ok() {
+        let _ = ack_rx.recv_timeout(SHUTDOWN_ACK_TIMEOUT);
     }
 }
 
@@ -303,6 +356,14 @@ fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<Atom
                 if let Some((_, sink)) = &out {
                     sink.set_volume(v);
                 }
+            }
+            AudioCmd::Shutdown(ack) => {
+                // Dropped before the ack, not after: the sender's contract is
+                // that the device is closed by the time it hears back.
+                drop(out);
+                tap.clear();
+                let _ = ack.send(());
+                return;
             }
         }
     }
