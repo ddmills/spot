@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_width::UnicodeWidthChar;
 
+use super::play_state::PlayState;
 use super::theme;
 use crate::app::state::HitAreas;
 use crate::cover::Cover;
@@ -440,7 +441,22 @@ fn pulse_at(phase: f32) -> Style {
 /// colour the playing sleeve has put on the rest of the screen. Neither state
 /// moves: the header's dot is where liveness is shown, and a button that
 /// breathes under the pointer is just something to flinch at.
-pub fn state_spans(is_playing: bool) -> Vec<Span<'static>> {
+///
+/// `None` on [`PlayState::Loading`], which is the pill's third face and the
+/// only one that is not a control. It used to have a `⋯ load` of its own,
+/// which meant the row carried a word that answered a question nobody asked:
+/// the corner of the header already says `LOADING`, in the same colour, in the
+/// place the eye goes for that. Two of them said it twice — and worse, the
+/// pill's copy outlived the corner's, because it was driven by a poll rather
+/// than by the audio. Nothing is the honest thing to draw: there is no state
+/// to report and nothing a click could do. The caller leaves `hit.play_btn`
+/// empty to match.
+pub fn state_spans(play: PlayState) -> Option<Vec<Span<'static>>> {
+    let is_playing = match play {
+        PlayState::Playing => true,
+        PlayState::Paused => false,
+        PlayState::Loading => return None,
+    };
     let (glyph, word) = if is_playing {
         ("■", "pause")
     } else {
@@ -451,27 +467,10 @@ pub fn state_spans(is_playing: bool) -> Vec<Span<'static>> {
     } else {
         theme::stopped_dim()
     };
-    vec![
+    Some(vec![
         Span::styled(glyph, style),
         Span::styled(format!(" {:<5}", word), style),
-    ]
-}
-
-/// The pill's third face: a play asked for and not started yet.
-///
-/// [`state_spans`] names what a click *does*, so it would offer `▶ play` here —
-/// on a track that is already starting, under a `● LOADING` in the corner
-/// saying so. This says what is happening instead and offers nothing; the
-/// caller leaves the hit rect empty to match, so the click cannot land.
-///
-/// Same width and shape as the other two, because the row must not shift
-/// underneath the pointer when the state turns over.
-pub fn loading_spans() -> Vec<Span<'static>> {
-    let style = theme::warn();
-    vec![
-        Span::styled("⋯", style),
-        Span::styled(format!(" {:<5}", "load"), style),
-    ]
+    ])
 }
 
 /// Width of the volume-slider track, in cells. The player view and the bottom

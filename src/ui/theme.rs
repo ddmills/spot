@@ -387,17 +387,6 @@ pub const PLACEHOLDER: [([u8; 3], [u8; 3]); 6] = [
     ([0x33, 0x1E, 0x26], [0x4F, 0x33, 0x3D]), // wine
 ];
 
-/// The one rule left on the browse screen, above the bottom bar.
-///
-/// Everything else lost its border, but the bar still needs separating from the
-/// list it sits under: without a line there, a track row and the bar's first
-/// row are the same kind of mark at the same weight, and the eye has nothing to
-/// stop at. A single dim `─` is the least that does the job, and unlike a frame
-/// it is one edge rather than four.
-pub fn rule() -> Style {
-    dim()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

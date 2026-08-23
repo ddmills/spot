@@ -17,6 +17,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use super::deck;
+use super::play_state::{self, PlayState};
 use super::table::{art_w, fit};
 use super::theme;
 use crate::app::state::AppState;
@@ -33,11 +34,14 @@ const MIN_TEXT_W: u16 = 44;
 const TOAST_MIN_W: u16 = 14;
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    // What the corner of the header is saying, read before the split borrow
+    // below so the pill under the progress track can only agree with it.
+    let play = play_state::or_paused(play_state::status(state));
+
     // Split borrows: playback/queue/toast/cover are read while hit areas are
     // written.
     let AppState {
         playback,
-        pending_play,
         radio,
         queue,
         toast,
@@ -48,20 +52,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..
     } = state;
     let mouse = *mouse_pos;
-    let pending = pending_play.is_some();
     let cover = cover.as_deref();
     if area.height == 0 || area.width == 0 {
         return;
     }
 
-    // The one rule left on the browse screen. Everything else lost its border,
-    // but the bar still has to separate itself from the list above: without a
-    // line there, a track row and the bar's first row are the same mark at the
-    // same weight, and the eye has nothing to stop at.
-    frame.render_widget(
-        Paragraph::new(Line::styled("─".repeat(area.width as usize), theme::rule())),
-        Rect { height: 1, ..area },
-    );
+    // The bar keeps its top row blank rather than ruled. The gap alone is
+    // enough to stop the list above from running into it, and it does so
+    // without putting another mark on a screen that wears no frames.
     let body = Rect {
         y: area.y + 1,
         height: area.height.saturating_sub(1),
@@ -86,6 +84,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             r,
             toast.as_ref().map(|(m, _)| m.as_str()),
             like,
+            play,
             mouse,
             hit,
         );
@@ -173,8 +172,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             height: 1,
             ..text
         },
-        pb,
-        pending,
+        play,
         mouse,
         hit,
     );
@@ -207,12 +205,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
 /// `cover` is allowlisted to Spotify's CDN and decodes JPEG only, while station
 /// artwork is mostly SVG, so there would be nothing to draw but a placeholder
 /// taking cells the name can use.
+#[allow(clippy::too_many_arguments)]
 fn draw_radio(
     frame: &mut Frame,
     body: Rect,
     radio: &crate::app::state::RadioPlayback,
     toast: Option<&str>,
     liked: Option<bool>,
+    play: PlayState,
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
 ) {
@@ -231,7 +231,7 @@ fn draw_radio(
     if body.height < 5 {
         return;
     }
-    deck::radio_transport(frame, row_at(body, 4), radio, mouse, hit);
+    deck::radio_transport(frame, row_at(body, 4), play, mouse, hit);
 
     if body.height < deck::DECK_H {
         return;
@@ -336,6 +336,10 @@ mod tests {
                 .collect(),
         );
         state.queue = Some(q);
+        // Samples arriving, which is what "playing" means to the header and
+        // the transport alike: a snapshot claiming to play with a silent tap
+        // is a track still loading. See [`super::super::play_state`].
+        state.audio_tap.push(&[0.0; 2048], 1.0);
         state
     }
 
@@ -353,11 +357,11 @@ mod tests {
     }
 
     #[test]
-    fn renders_a_rule_a_sleeve_and_the_deck() {
+    fn renders_a_blank_row_a_sleeve_and_the_deck() {
         let mut state = playing_state();
         let lines = render(&mut state, 120, BAR_H);
-        // One rule, and it is the only box-drawing left on the bar.
-        assert!(lines[0].starts_with("───"));
+        // A blank row where the rule used to be, and no box-drawing left.
+        assert!(lines[0].trim().is_empty(), "{:?}", lines[0]);
         assert!(
             !lines
                 .iter()
@@ -386,7 +390,7 @@ mod tests {
         // state centred between them.
         assert!(lines[TRANSPORT_ROW].contains("◂◂ previous"));
         assert!(lines[TRANSPORT_ROW].contains("■ pause"));
-        assert!(lines[TRANSPORT_ROW].trim_end().ends_with("▸▸ next"));
+        assert!(lines[TRANSPORT_ROW].trim_end().ends_with("next ▸▸"));
         // The queue's name and length, with shuffle opposite.
         assert!(lines[CONTEXT_ROW].contains("My Mix · 24 tracks"));
         assert!(lines[CONTEXT_ROW].contains("shuffle off"));

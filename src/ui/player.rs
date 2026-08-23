@@ -24,6 +24,7 @@ use ratatui::widgets::{List, ListItem, Paragraph};
 
 use super::deck;
 use super::main_pane;
+use super::play_state;
 use super::table::{apply_selection, art_w, draw_scrollbar, fit};
 use super::theme;
 use crate::app::state::{AppState, HitAreas, PlaybackSnapshot, TrackList, format_duration};
@@ -250,11 +251,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..inner
     };
 
+    // What the corner of the header is saying, read before the split borrow
+    // below so the pill under the progress track can only agree with it.
+    let play = play_state::or_paused(play_state::status(state));
+
     // Split borrows: queue/playback are read while list state, hit areas
     // and the visualizer's smoothing state are written.
     let AppState {
         playback,
-        pending_play,
         radio,
         queue,
         queue_index,
@@ -268,7 +272,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..
     } = state;
     let mouse = *mouse_pos;
-    let pending = pending_play.is_some();
     let state_cover = state_cover.as_deref();
 
     let rows = Rows::new(inner.width, inner.height);
@@ -342,7 +345,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     height: 1,
                     ..transport_area
                 },
-                r,
+                play,
                 mouse,
                 hit,
             );
@@ -425,8 +428,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 height: 1,
                 ..transport_area
             },
-            pb,
-            pending,
+            play,
             mouse,
             hit,
         );
@@ -833,6 +835,10 @@ mod tests {
             track("Gamma", "Cyd"),
         ]);
         st.queue = Some(q);
+        // Samples arriving, which is what "playing" means to the header and
+        // the transport alike: a snapshot claiming to play with a silent tap
+        // is a track still loading. See [`super::super::play_state`].
+        st.audio_tap.push(&[0.0; 2048], 1.0);
         st
     }
 
@@ -903,7 +909,11 @@ mod tests {
         );
         // And the playback status is opposite it, the same as on the browse
         // screen — the player draws this row from the same function.
-        assert!(lines[0].trim_end().ends_with("● LOADING"), "{:?}", lines[0]);
+        assert!(
+            lines[0].trim_end().ends_with("● STREAMING"),
+            "{:?}",
+            lines[0]
+        );
         assert!(lines[1].trim().is_empty(), "{:?}", lines[1]);
         assert!(!lines[2].contains("/  search"), "{:?}", lines[2]);
         assert!(lines[2].contains("Beta"), "the masthead took the row");
@@ -1019,7 +1029,7 @@ mod tests {
             lines[17]
         );
         assert!(lines[17].contains("■ pause"), "{:?}", lines[17]);
-        assert!(lines[17].trim_end().ends_with("▸▸ next"), "{:?}", lines[17]);
+        assert!(lines[17].trim_end().ends_with("next ▸▸"), "{:?}", lines[17]);
         assert!(lines[18].trim().is_empty() && lines[20].trim().is_empty());
         // Then one row heads the list: name on the left, shuffle opposite.
         assert!(lines[19].contains("My Mix · 3 tracks"), "{:?}", lines[19]);

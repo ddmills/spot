@@ -2,6 +2,7 @@ mod deck;
 mod help;
 mod main_pane;
 mod now_playing;
+mod play_state;
 mod player;
 mod table;
 mod theme;
@@ -180,9 +181,9 @@ mod tests {
 
     /// The whole point of the redesign: the browse screen wears no frames.
     ///
-    /// Two marks are allowed to survive. The `─` rule above the bottom bar is
-    /// what stops the bar floating into the list above it, and the scrollbar
-    /// track is a control rather than chrome.
+    /// One mark is allowed to survive — the scrollbar track, which is a control
+    /// rather than chrome. The bottom bar is separated from the list above it
+    /// by a blank row, not a rule.
     #[test]
     fn the_browse_screen_draws_no_pane_frames() {
         let mut st = browse_state();
@@ -192,17 +193,22 @@ mod tests {
                 assert!(!line.contains(c), "corner {c:?} on row {y}: {line:?}");
             }
         }
-        // Exactly one horizontal rule, and it is the bar's. Matched as a row
-        // of nothing but `─` and margin — the progress and volume tracks are
-        // drawn with the same glyph, but always alongside other marks.
+        // No horizontal rules at all. Matched as a row of nothing but `─` and
+        // margin — the progress and volume tracks are drawn with the same
+        // glyph, but always alongside other marks.
         let rules: Vec<usize> = lines
             .iter()
             .enumerate()
             .filter(|(_, l)| l.contains('─') && l.chars().all(|c| c == '─' || c == ' '))
             .map(|(y, _)| y)
             .collect();
-        assert_eq!(rules.len(), 1, "expected one rule, got rows {rules:?}");
-        assert_eq!(rules[0], 34 - BAR_H as usize);
+        assert!(rules.is_empty(), "expected no rules, got rows {rules:?}");
+        // And the bar's own top row is blank.
+        assert!(
+            lines[34 - BAR_H as usize].trim().is_empty(),
+            "bar's top row is not blank: {:?}",
+            lines[34 - BAR_H as usize]
+        );
     }
 
     /// The layout bands are fixed, so entering and leaving search mode must

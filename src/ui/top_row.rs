@@ -45,6 +45,7 @@ use ratatui::widgets::Paragraph;
 
 use super::main_pane;
 use super::main_pane::PageHeader;
+use super::play_state::{self, PlayState};
 use super::table::{brand, right_row};
 use super::theme;
 use crate::app::state::{AppState, InputMode, MainView};
@@ -85,13 +86,6 @@ const MIN_QUERY_W: u16 = 24;
 /// can type in. Room for the longest placeholder and half again is what a
 /// field looks like; past that the fill stops saying anything new.
 const MAX_QUERY_W: u16 = 56;
-
-/// How long the tap may go quiet before a source that says it is playing is
-/// read as still loading. Longer than the visualizer's own freshness window,
-/// which is tuned to drop the bars' colour the instant audio stops: a word
-/// that flickers between `STREAMING` and `LOADING` on a momentary underrun is
-/// worse than one that waits.
-const LOAD_WITHIN: std::time::Duration = std::time::Duration::from_millis(1200);
 
 /// How dim the playing dot goes between beats, as a fraction of the accent.
 /// Low enough that the swing is unmistakable, high enough that the dot never
@@ -231,71 +225,52 @@ fn path_row(frame: &mut Frame, row: Rect, state: &mut AppState, page: PageHeader
 /// whether it is. Empty when nothing is — an idle word would be a control
 /// that leads to a player with nothing in it.
 ///
-/// Radio is checked first, as it is everywhere else: the two sources are
-/// mutually exclusive by construction, and while a station is on the Spotify
-/// snapshot is kept only so stopping the stream puts the last track back.
+/// Which of the three states it is comes from [`play_state::status`], so this
+/// word and the transport's pill cannot drift apart. All that is decided here
+/// is how to paint it.
 fn status_spans(state: &mut AppState) -> Vec<Span<'static>> {
-    // A play asked for and not heard yet. Its snapshot says it is not playing,
-    // because it is not — nothing has come out of the sink. But it is on its
-    // way, and that is what this row is for: without the extra term the whole
-    // gap read as a dim `STREAMING`, which is the opposite of the truth. It
-    // also covers the ordinary track boundary, where librespot's `Stopped`
-    // clears `is_playing` for the moment the next track takes to load.
-    let switching = state.pending_play.is_some();
-    let (word, is_playing) = match (&state.radio, &state.playback) {
-        (Some(r), _) => ("RADIO", r.is_playing),
-        (None, Some(pb)) => ("STREAMING", pb.is_playing || switching),
-        (None, None) => return Vec::new(),
+    let Some(status) = play_state::status(state) else {
+        return Vec::new();
     };
-
-    // Whether the audio is ours to judge. Playing on a phone, librespot is
-    // idle and the tap will never fill — reading that as "loading" would
-    // leave the word stuck yellow for the length of the record. A play we
-    // asked for is ours by definition, whatever the last poll was describing.
-    let ours = switching
-        || state.radio.is_some()
-        || state.playback.as_ref().is_some_and(|pb| pb.is_local_device);
-    let fresh = state.audio_tap.is_fresh(LOAD_WITHIN);
-    // Claims to be playing, but nothing has come out of it yet: a station
-    // still connecting and prefetching, or a track still being fetched. The
-    // radio player clears the tap before it connects, so this window is
-    // exactly the buffering one.
-    if is_playing && ours && !fresh {
+    match status.state {
         // The dot does not pulse here. Nothing is arriving to pulse to, and a
         // moving dot would say the opposite of the word beside it.
-        return vec![
+        PlayState::Loading => vec![
             Span::styled("● ", theme::warn()),
             Span::styled("LOADING", theme::warn()),
-        ];
-    }
-
-    if !is_playing {
+        ],
         // Paused is a resting state: one flat grey for the dot and the word
         // alike, so the whole control recedes rather than half of it.
-        return vec![
+        PlayState::Paused => vec![
             Span::styled("● ", theme::dim()),
-            Span::styled(word, theme::dim()),
-        ];
+            Span::styled(status.word, theme::dim()),
+        ],
+        PlayState::Playing => {
+            // The dot rides the loudness envelope, so it keeps time with
+            // whatever is on — and falls back to the transport's own timed
+            // breath when there is no local audio to ride (playback on another
+            // device), which is the case that pulse was written for.
+            let dot = if status.ours {
+                let level =
+                    state
+                        .pulse
+                        .update(&state.audio_tap, status.fresh, std::time::Instant::now());
+                // A wider travel than the transport's own breathing dot, which
+                // only has to say "something is happening": this one is
+                // tracking the beat, and it has to be visible from across the
+                // room to be worth doing. The floor is not black — a dot that
+                // goes out between kicks reads as dropping out rather than as
+                // keeping time.
+                theme::accent_at(PULSE_FLOOR + (1.0 - PULSE_FLOOR) * level)
+            } else {
+                super::table::pulse_style(std::time::Instant::now())
+            };
+            vec![
+                Span::styled("● ", dot),
+                Span::styled(status.word, theme::accent()),
+            ]
+        }
     }
-
-    // Playing. The dot rides the loudness envelope, so it keeps time with
-    // whatever is on — and falls back to the transport's own timed breath
-    // when there is no local audio to ride (playback on another device),
-    // which is the case that pulse was written for.
-    let dot = if ours {
-        let level = state
-            .pulse
-            .update(&state.audio_tap, fresh, std::time::Instant::now());
-        // A wider travel than the transport's own breathing dot, which only
-        // has to say "something is happening": this one is tracking the beat,
-        // and it has to be visible from across the room to be worth doing.
-        // The floor is not black — a dot that goes out between kicks reads as
-        // dropping out rather than as keeping time.
-        theme::accent_at(PULSE_FLOOR + (1.0 - PULSE_FLOOR) * level)
-    } else {
-        super::table::pulse_style(std::time::Instant::now())
-    };
-    vec![Span::styled("● ", dot), Span::styled(word, theme::accent())]
 }
 
 /// The search prompt, in the field beside the mark.

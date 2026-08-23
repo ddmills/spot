@@ -22,9 +22,9 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::play_state::PlayState;
 use super::table::{
-    art_w, draw_art, draw_volume, fit, link, loading_spans, meter, right_row, segment, state_spans,
-    width,
+    art_w, draw_art, draw_volume, fit, link, meter, right_row, segment, state_spans, width,
 };
 use super::theme;
 use crate::app::state::{HitAreas, PlaybackSnapshot, RadioPlayback, TrackList, format_duration};
@@ -48,7 +48,7 @@ pub(super) const TIME_W: u16 = 5 + 6;
 
 /// The transport's two buttons, in the order they are laid out.
 const PREV_LABEL: &str = "◂◂ previous";
-const NEXT_LABEL: &str = "▸▸ next";
+const NEXT_LABEL: &str = "next ▸▸";
 
 /// The liked control at the right end of the title row, in both states.
 /// Unpadded, like every other control on the deck — the hover pill covers the
@@ -464,17 +464,23 @@ pub fn radio_status(frame: &mut Frame, row: Rect, radio: &RadioPlayback) {
 /// track before or after it, and a greyed control that never lights is a
 /// question the UI keeps asking and answering. Records `hit.play_btn`, and
 /// clears the other two so a click cannot land on last frame's rects.
+///
+/// `play` is what the corner is saying — see [`transport`] for why a station
+/// still connecting gets no pill at all.
 pub fn radio_transport(
     frame: &mut Frame,
     row: Rect,
-    radio: &RadioPlayback,
+    play: PlayState,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
     hit.prev_btn = Rect::default();
     hit.next_btn = Rect::default();
+    hit.play_btn = Rect::default();
 
-    let pill = state_spans(radio.is_playing);
+    let Some(pill) = state_spans(play) else {
+        return;
+    };
     let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
     if row.width < pill_w {
         return;
@@ -597,20 +603,24 @@ pub fn progress(frame: &mut Frame, row: Rect, pb: &PlaybackSnapshot, hit: &mut H
 /// the pill rather than colliding with it. Records `hit.prev_btn`,
 /// `hit.play_btn` and `hit.next_btn`.
 ///
-/// `pending` is a play that has been asked for and not started; the pill says
-/// so and stops being a control for as long as it lasts — see
-/// [`super::table::loading_spans`].
+/// `play` is the same answer the corner of the header is drawing, so the two
+/// always agree — see [`super::play_state`]. On [`PlayState::Loading`] the
+/// pill is left out entirely and `hit.play_btn` stays empty: the sound has
+/// been asked for and has not arrived, so `▶ play` would offer to start what
+/// is already starting and `■ pause` would claim audio nobody can hear. The
+/// corner says `LOADING` for exactly that window, and previous and next stay
+/// where they are, so the row does not move around what is missing.
 pub fn transport(
     frame: &mut Frame,
     row: Rect,
-    pb: &PlaybackSnapshot,
-    pending: bool,
+    play: PlayState,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
     let button = theme::text();
     let mut spans = Vec::new();
     let mut x = row.x;
+    hit.play_btn = Rect::default();
     hit.prev_btn = segment(
         &mut spans,
         &mut x,
@@ -620,33 +630,24 @@ pub fn transport(
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), row);
 
+    let edges = (width(PREV_LABEL) + width(NEXT_LABEL)) as u16;
+
     // Centred on the row rather than between the two buttons: they are of
     // different widths, and a pill centred between them would not line up with
     // the middle of the progress track above it.
-    let pill = if pending {
-        loading_spans()
-    } else {
-        state_spans(pb.is_playing)
-    };
-    let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
-    let edges = (width(PREV_LABEL) + width(NEXT_LABEL)) as u16;
-    if row.width >= edges + pill_w + 2 {
-        let seg = Rect {
-            x: row.x + (row.width - pill_w) / 2,
-            width: pill_w,
-            ..row
-        };
-        let mut spans = Vec::new();
-        let mut x = seg.x;
-        // Drawn without `segment` while loading: it is a word, not a button,
-        // and it must not light up under the pointer or take a click meant for
-        // the play it is already doing. `hit.play_btn` stays empty.
-        if pending {
-            spans.extend(pill);
-        } else {
+    if let Some(pill) = state_spans(play) {
+        let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
+        if row.width >= edges + pill_w + 2 {
+            let seg = Rect {
+                x: row.x + (row.width - pill_w) / 2,
+                width: pill_w,
+                ..row
+            };
+            let mut spans = Vec::new();
+            let mut x = seg.x;
             hit.play_btn = segment(&mut spans, &mut x, row, mouse, pill);
+            frame.render_widget(Paragraph::new(Line::from(spans)), seg);
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), seg);
     }
 
     if row.width < edges + 1 {
@@ -983,9 +984,10 @@ mod tests {
     /// between them — and the buttons in grey, not the accent.
     #[test]
     fn the_transport_pushes_its_buttons_to_the_edges() {
-        let pb = snapshot();
-        let (lines, hit, buffer) = render(60, 1, |f, a, h| transport(f, a, &pb, false, None, h));
-        assert!(lines[0].contains("◂◂ previous") && lines[0].contains("▸▸ next"));
+        let (lines, hit, buffer) = render(60, 1, |f, a, h| {
+            transport(f, a, PlayState::Playing, None, h)
+        });
+        assert!(lines[0].contains("◂◂ previous") && lines[0].contains("next ▸▸"));
         assert_eq!(hit.prev_btn.x, 0);
         assert_eq!(hit.next_btn.right(), 60);
         assert_eq!(hit.prev_btn.y, hit.next_btn.y);
@@ -1004,28 +1006,37 @@ mod tests {
 
     /// A play asked for and not started. The pill names what a click does, so
     /// left alone it would offer `▶ play` on a track that is already starting,
-    /// under a `● LOADING` in the corner saying exactly that. It says what is
-    /// happening instead, and stops being a control while it does.
+    /// or `■ pause` on audio nobody can hear yet. It is left out instead: the
+    /// corner of the header says `LOADING` for exactly this window, and the
+    /// row has no second opinion to offer.
     #[test]
-    fn the_pill_says_loading_while_a_play_is_in_flight() {
-        let mut pb = snapshot();
-        pb.is_playing = false;
-        let (lines, hit, buffer) = render(60, 1, |f, a, h| transport(f, a, &pb, true, None, h));
-        assert!(lines[0].contains("⋯ load"), "{:?}", lines[0]);
+    fn the_pill_goes_away_while_a_play_is_in_flight() {
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            transport(f, a, PlayState::Loading, None, h)
+        });
         assert!(!lines[0].contains("play"), "{:?}", lines[0]);
+        assert!(!lines[0].contains("pause"), "{:?}", lines[0]);
         assert!(
             hit.play_btn.is_empty(),
             "a click must not land on a play already happening"
         );
-        // The buttons either side are untouched — only the middle is waiting.
+        // The buttons either side are untouched — only the middle is waiting,
+        // so the row does not shuffle around the gap.
         assert_eq!(hit.prev_btn.x, 0);
         assert_eq!(hit.next_btn.right(), 60);
-        // In the same colour the status pill uses for something in flight.
-        let at = lines[0].find('⋯').expect("the mark is on the row") as u16;
-        assert_eq!(
-            buffer.cell(Position { x: at, y: 0 }).unwrap().fg,
-            theme::WARN
-        );
+    }
+
+    /// The radio deck's transport is the pill and nothing else, so a station
+    /// still connecting leaves the row empty rather than offering `■ pause`
+    /// over silence — which is what it used to do, under a corner already
+    /// saying `LOADING`.
+    #[test]
+    fn the_radio_pill_goes_away_while_a_station_connects() {
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            radio_transport(f, a, PlayState::Loading, None, h)
+        });
+        assert!(lines[0].trim().is_empty(), "{:?}", lines[0]);
+        assert!(hit.play_btn.is_empty());
     }
 
     /// Too narrow for both, previous keeps the row — `right_row` would
@@ -1033,8 +1044,9 @@ mod tests {
     /// than colliding with the buttons it sits between.
     #[test]
     fn a_narrow_transport_keeps_previous_alone() {
-        let pb = snapshot();
-        let (lines, hit, _) = render(18, 1, |f, a, h| transport(f, a, &pb, false, None, h));
+        let (lines, hit, _) = render(18, 1, |f, a, h| {
+            transport(f, a, PlayState::Playing, None, h)
+        });
         assert!(lines[0].contains("◂◂ previous"), "{:?}", lines[0]);
         assert!(!lines[0].contains("next"), "{:?}", lines[0]);
         assert!(!lines[0].contains("playing"), "{:?}", lines[0]);
@@ -1091,7 +1103,7 @@ mod tests {
                 let a = Rect { width, ..a };
                 masthead(f, a, &pb, Note::Show, Some(true), None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, h);
-                transport(f, Rect { height: 1, ..a }, &pb, false, None, h);
+                transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
                 context_row(f, Rect { height: 1, ..a }, &pb, Some(&q), None, h);
             });
         }
@@ -1237,7 +1249,7 @@ mod tests {
                 let a = Rect { width, ..a };
                 radio_masthead(f, a, &r, Note::Show, Some(true), None, h);
                 radio_status(f, Rect { height: 1, ..a }, &r);
-                radio_transport(f, Rect { height: 1, ..a }, &r, None, h);
+                radio_transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
                 radio_context_row(f, Rect { height: 1, ..a }, &r, h);
             });
         }
