@@ -218,10 +218,6 @@ pub fn masthead(
     if meta.width == 0 {
         return;
     }
-    // `fit` pads to exactly the width; trim it back so a link's hit rect
-    // stops at the text rather than running to the volume slider.
-    let clip = |s: &str| fit(s, meta.width as usize).trim_end().to_string();
-
     let mut spans = Vec::new();
     let mut x = meta.x;
     hit.now_artist = link(
@@ -229,31 +225,16 @@ pub fn masthead(
         &mut x,
         meta,
         mouse,
-        clip(&pb.artists),
+        clip(&pb.artists, meta),
         theme::text(),
         pb.artist_id.is_some(),
     );
-    // A segment is dropped whole rather than clipped: the row is cut off at
-    // the volume slider, and half an album name followed by a dangling " · "
-    // reads as a bug rather than as a truncation. Measured in cells, so a
-    // CJK name is not read as half its true width.
-    let sep = |spans: &mut Vec<Span<'static>>, x: &mut u16, next: &str| {
-        let run = if spans.is_empty() { 0 } else { 3 } + width(next) as u16;
-        if *x + run > meta.right() {
-            return false;
-        }
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", dim));
-            *x += 3;
-        }
-        true
-    };
     // The album is printed even when it only repeats the artist or the track.
     // A self-titled single does read as "Abeichizoku · Abeichizoku", but the
     // two names are links to two different pages, and dropping one leaves the
     // record with no way to be opened.
-    let album = clip(&pb.album);
-    if sep(&mut spans, &mut x, &album) {
+    let album = clip(&pb.album, meta);
+    if sep(&mut spans, &mut x, &album, meta) {
         hit.now_album = link(
             &mut spans,
             &mut x,
@@ -264,28 +245,67 @@ pub fn masthead(
             pb.album_id.is_some(),
         );
     }
-    if !pb.release_year.is_empty() && sep(&mut spans, &mut x, &pb.release_year) {
+    if !pb.release_year.is_empty() && sep(&mut spans, &mut x, &pb.release_year, meta) {
         spans.push(Span::styled(pb.release_year.clone(), dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), meta);
 }
 
-/// The radio deck's masthead: the station, then what it is playing.
+/// Clip a metadata segment to the row.
 ///
-/// The same two rows and the same volume slider as [`masthead`], saying the
-/// two things a broadcast has to say. There is no liked control, because
-/// keeping a *station* is done on its row in the directory — the deck's `★`
-/// means "save this track", and a station has no track to save.
+/// `fit` pads to exactly the width; this trims that padding back so a link's
+/// hit rect stops at the text rather than running on to the volume slider.
+fn clip(s: &str, meta: Rect) -> String {
+    fit(s, meta.width as usize).trim_end().to_string()
+}
+
+/// Make room for the next metadata segment, or say there is none.
 ///
-/// Row 1 is the announced title where the server sends one, and the station's
-/// tags and country where it does not. Something like six popular stations in
-/// ten announce; the rest would leave the row empty, and a blank line under a
-/// name is worse than a quieter fact.
+/// A segment is dropped whole rather than clipped: the row is cut off at the
+/// volume slider, and half an album name followed by a dangling " · " reads as
+/// a bug rather than as a truncation. Measured in cells, so a CJK name is not
+/// read as half its true width.
+///
+/// Shared by both mastheads. It was a closure inside [`masthead`] until the
+/// radio deck grew a metadata row of its own; two copies of this rule would
+/// drift the first time either row changed.
+fn sep(spans: &mut Vec<Span<'static>>, x: &mut u16, next: &str, meta: Rect) -> bool {
+    let run = if spans.is_empty() { 0 } else { 3 } + width(next) as u16;
+    if *x + run > meta.right() {
+        return false;
+    }
+    if !spans.is_empty() {
+        spans.push(Span::styled(" · ", theme::dim()));
+        *x += 3;
+    }
+    true
+}
+
+/// The radio deck's masthead: what the station is playing, and what is known
+/// about it.
+///
+/// The same two rows and the same volume slider as [`masthead`], and — once
+/// spot has found the announced record on Spotify — the same *content*: the
+/// record's name on row 0 and its artist, album and year on row 1, both names
+/// clickable. Nothing about a broadcast makes those facts different facts, so
+/// the deck should not make them look different.
+///
+/// Row 0 falls back through what is actually known: the matched record's name,
+/// else the station's own words, else the station's name. Something like six
+/// popular stations in ten announce anything at all; the station's name is what
+/// the row says for the rest, and [`radio_context_row`] carries the name in the
+/// other two cases so it is never off the screen.
+///
+/// The `★` is drawn only against a matched record, and only once its saved
+/// state is known — the same rule [`masthead`] follows. Keeping a *station* is
+/// still done on its row in the directory: the deck's `★` has always meant
+/// "save this track", and when there is one it now means it here too.
 pub fn radio_masthead(
     frame: &mut Frame,
     area: Rect,
     radio: &RadioPlayback,
     note: Note,
+    liked: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -293,18 +313,48 @@ pub fn radio_masthead(
         return;
     }
     let dim = theme::dim();
+    let matched = radio.matched_track();
+    let announced = radio.now_title();
 
+    // The liked control, on the title row, exactly as `masthead` places it —
+    // and only where that row names a record rather than a station.
     let title_row = Rect { height: 1, ..area };
+    if let (Some(_), Some(liked)) = (matched, liked) {
+        let style = if liked { theme::accent() } else { dim };
+        hit.like_btn = right_row(
+            frame,
+            title_row,
+            mouse,
+            vec![vec![Span::styled(like_label(liked), style)]],
+        )[0];
+    }
+
+    let name = match (matched, &announced) {
+        (Some(t), _) => t.name.clone(),
+        (None, Some(said)) => said.clone(),
+        (None, None) => radio.station.name.clone(),
+    };
     let title = match note {
-        Note::Show => format!("♫ {}", radio.station.name),
-        Note::Hide => radio.station.name.clone(),
+        Note::Show => format!("♫ {name}"),
+        Note::Hide => name,
+    };
+    // One cell of daylight between the title and the control, as on the
+    // Spotify deck, so a long name ends in an ellipsis rather than against
+    // the pill.
+    let title_w = if hit.like_btn.is_empty() {
+        title_row.width
+    } else {
+        title_row.width.saturating_sub(hit.like_btn.width + 1)
     };
     frame.render_widget(
         Paragraph::new(Line::styled(
-            fit(&title, title_row.width as usize),
+            fit(&title, title_w as usize),
             theme::accent().add_modifier(Modifier::BOLD),
         )),
-        title_row,
+        Rect {
+            width: title_w,
+            ..title_row
+        },
     );
 
     if area.height < MASTHEAD_H {
@@ -324,12 +374,51 @@ pub fn radio_masthead(
         return;
     }
 
-    let (text, style) = match radio.now_title() {
-        Some(title) => (title, theme::text()),
-        None => (station_subtitle(radio), dim),
-    };
+    // Matched: the Spotify deck's row, built by the same helpers, so the two
+    // cannot drift on how a segment is clipped or dropped.
+    if let Some(t) = matched {
+        let mut spans = Vec::new();
+        let mut x = meta.x;
+        hit.now_artist = link(
+            &mut spans,
+            &mut x,
+            meta,
+            mouse,
+            clip(&t.artists, meta),
+            theme::text(),
+            t.artist_id.is_some(),
+        );
+        let album = clip(&t.album, meta);
+        if sep(&mut spans, &mut x, &album, meta) {
+            hit.now_album = link(
+                &mut spans,
+                &mut x,
+                meta,
+                mouse,
+                album,
+                dim,
+                t.album_id.is_some(),
+            );
+        }
+        if !t.release_year.is_empty() && sep(&mut spans, &mut x, &t.release_year, meta) {
+            spans.push(Span::styled(t.release_year.clone(), dim));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), meta);
+        return;
+    }
+
+    // Not matched. Row 0 already said whatever there was to say, so this row
+    // is the station describing itself — a quieter fact, but a fact, and
+    // better than a blank line under a name.
+    //
+    // No links and no `★`: `hit` is cleared at the top of every frame
+    // (`super::clear_hits`), so the rects simply stay empty and unhittable
+    // rather than having to be cleared here.
     frame.render_widget(
-        Paragraph::new(Line::styled(fit(&text, meta.width as usize), style)),
+        Paragraph::new(Line::styled(
+            fit(&station_subtitle(radio), meta.width as usize),
+            dim,
+        )),
         meta,
     );
 }
@@ -401,8 +490,15 @@ pub fn radio_transport(
     frame.render_widget(Paragraph::new(Line::from(spans)), seg);
 }
 
-/// The radio deck's bottom row: where the station comes from, and how it
-/// sounds. Shuffle is not here — there is one stream and no order to put it in.
+/// The radio deck's bottom row: what is playing this, and how it sounds.
+/// Shuffle is not here — there is one stream and no order to put it in.
+///
+/// The Spotify deck names the queue here, because that is what the record on
+/// its masthead is coming out of. The station is exactly that for a broadcast,
+/// so it is named here whenever the masthead is busy saying what is *on* the
+/// station. Where the masthead has fallen back to the station's own name there
+/// is nothing to add, and the row says what kind of thing it is instead — which
+/// is what it always said.
 pub fn radio_context_row(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hit: &mut HitAreas) {
     hit.shuffle_btn = Rect::default();
     hit.queue_name = Rect::default();
@@ -425,11 +521,17 @@ pub fn radio_context_row(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hi
     if left.width == 0 {
         return;
     }
+    // The masthead is naming a record, so this row names what is playing it.
+    // Where the masthead has fallen back to the station's own name, repeating
+    // it here would say nothing twice.
+    let names_a_track = radio.matched_track().is_some() || radio.now_title().is_some();
+    let label = if names_a_track {
+        radio.station.name.as_str()
+    } else {
+        "internet radio"
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            fit("internet radio", left.width as usize),
-            theme::dim(),
-        )),
+        Paragraph::new(Line::styled(fit(label, left.width as usize), theme::dim())),
         left,
     );
 }
@@ -991,6 +1093,152 @@ mod tests {
                 progress(f, Rect { height: 1, ..a }, &pb, h);
                 transport(f, Rect { height: 1, ..a }, &pb, false, None, h);
                 context_row(f, Rect { height: 1, ..a }, &pb, Some(&q), None, h);
+            });
+        }
+    }
+
+    /// A station announcing nothing, matched to nothing — the state most of
+    /// the directory is in.
+    fn radio(name: &str) -> RadioPlayback {
+        let mut r = RadioPlayback::new(
+            crate::app::state::Station {
+                uuid: "s1".into(),
+                name: name.into(),
+                url: "http://stream/s1".into(),
+                homepage: String::new(),
+                tags: "jazz".into(),
+                country: "Germany".into(),
+                countrycode: "DE".into(),
+                language: String::new(),
+                codec: "MP3".into(),
+                bitrate: 128,
+                votes: 0,
+                hls: false,
+            },
+            56,
+            Default::default(),
+        );
+        r.is_playing = true;
+        r
+    }
+
+    /// The record spot found for what the station said.
+    fn matched() -> Track {
+        Track {
+            uri: "spotify:track:m1".into(),
+            name: "Frenesi".into(),
+            artists: "Peter Appleyard".into(),
+            album: "The Lost 1974 Sessions".into(),
+            release_year: "1974".into(),
+            duration_ms: 180_000,
+            track_number: 3,
+            album_id: Some("alb1".into()),
+            artist_id: Some("art1".into()),
+            cover_url: None,
+        }
+    }
+
+    /// The whole point of the feature: once the announced record is found, the
+    /// radio deck says what the Spotify deck says, in the same places.
+    #[test]
+    fn a_matched_record_gives_the_radio_deck_the_spotify_decks_rows() {
+        let mut r = radio("Adroit Jazz");
+        *r.title.lock() = Some("Peter Appleyard - Frenesi".into());
+        r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
+
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            radio_masthead(f, a, &r, Note::Show, Some(false), None, h)
+        });
+        // Row 0 names the record, not the station.
+        assert!(lines[0].starts_with("♫ Frenesi"), "{:?}", lines[0]);
+        assert!(
+            lines[1].starts_with("Peter Appleyard · The Lost 1974 Sessions · 1974"),
+            "{:?}",
+            lines[1]
+        );
+        // Laid out exactly as `masthead` lays the same row out.
+        assert_eq!(hit.now_artist.y, 1);
+        assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
+        assert!(
+            !hit.like_btn.is_empty(),
+            "a matched record must be likeable"
+        );
+        assert_eq!(hit.like_btn.y, 0);
+        assert!(lines[1].contains("vol ") && lines[1].contains(" 56%"));
+    }
+
+    /// The saved state is not in yet, so there is no honest way to draw a
+    /// control that has to say which way it would go. Same rule as `masthead`.
+    #[test]
+    fn the_liked_control_waits_until_the_saved_state_is_known() {
+        let mut r = radio("Adroit Jazz");
+        r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
+        let (_, hit, _) = render(80, 2, |f, a, h| {
+            radio_masthead(f, a, &r, Note::Show, None, None, h)
+        });
+        assert!(hit.like_btn.is_empty(), "{:?}", hit.like_btn);
+    }
+
+    /// Announced, but spot could not place it. The station's own words stand,
+    /// and nothing on the row pretends to lead anywhere.
+    #[test]
+    fn an_unmatched_announcement_is_drawn_with_no_links_and_no_star() {
+        let mut r = radio("Adroit Jazz");
+        *r.title.lock() = Some("Some Band - A Song".into());
+        r.matched = crate::app::state::RadioMatch::Unmatched;
+
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            radio_masthead(f, a, &r, Note::Show, Some(true), None, h)
+        });
+        assert!(
+            lines[0].starts_with("♫ Some Band - A Song"),
+            "{:?}",
+            lines[0]
+        );
+        // Row 1 falls back to what the station says about itself.
+        assert!(lines[1].starts_with("jazz · Germany"), "{:?}", lines[1]);
+        assert!(hit.now_artist.is_empty());
+        assert!(hit.now_album.is_empty());
+        assert!(hit.like_btn.is_empty(), "nothing to save");
+    }
+
+    /// Six popular stations in ten announce; this is the other four.
+    #[test]
+    fn a_station_that_says_nothing_still_names_itself() {
+        let r = radio("Adroit Jazz");
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            radio_masthead(f, a, &r, Note::Show, Some(true), None, h)
+        });
+        assert!(lines[0].starts_with("♫ Adroit Jazz"), "{:?}", lines[0]);
+        assert!(lines[1].starts_with("jazz · Germany"), "{:?}", lines[1]);
+        assert!(hit.like_btn.is_empty());
+    }
+
+    /// The station moves to the context row exactly when a record takes its
+    /// place on the masthead, so it is never drawn twice and never missing.
+    #[test]
+    fn the_context_row_names_the_station_once_the_masthead_names_a_record() {
+        let quiet = radio("Adroit Jazz");
+        let (lines, _, _) = render(80, 1, |f, a, h| radio_context_row(f, a, &quiet, h));
+        assert!(lines[0].starts_with("internet radio"), "{:?}", lines[0]);
+
+        let playing = radio("Adroit Jazz");
+        *playing.title.lock() = Some("Peter Appleyard - Frenesi".into());
+        let (lines, _, _) = render(80, 1, |f, a, h| radio_context_row(f, a, &playing, h));
+        assert!(lines[0].starts_with("Adroit Jazz"), "{:?}", lines[0]);
+    }
+
+    #[test]
+    fn every_radio_row_degrades_without_panicking() {
+        let mut r = radio("Adroit Jazz");
+        r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
+        for width in 0..40u16 {
+            render(width.max(1), 2, |f, a, h| {
+                let a = Rect { width, ..a };
+                radio_masthead(f, a, &r, Note::Show, Some(true), None, h);
+                radio_status(f, Rect { height: 1, ..a }, &r);
+                radio_transport(f, Rect { height: 1, ..a }, &r, None, h);
+                radio_context_row(f, Rect { height: 1, ..a }, &r, h);
             });
         }
     }

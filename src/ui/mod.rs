@@ -667,6 +667,7 @@ mod tests {
                 "Steve Cobby — The Unvarnished Truth".into(),
             ))),
             volume_percent: 40,
+            matched: Default::default(),
         });
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
@@ -719,6 +720,7 @@ mod tests {
                 "Steve Cobby — The Unvarnished Truth".into(),
             ))),
             volume_percent: 40,
+            matched: Default::default(),
         });
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");

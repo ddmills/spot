@@ -735,6 +735,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             volume_percent: 50,
+            matched: Default::default(),
         });
         audible(&st);
         st

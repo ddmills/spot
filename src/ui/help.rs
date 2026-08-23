@@ -58,6 +58,7 @@ const MOUSE_HINTS: &[&str] = &[
     "click the ★ column, or the ★ on the bar, to like a track",
     "on a radio page, click a tab to change what it lists",
     "click an artist or album name to open its page",
+    "on a station, spot looks the announced track up on Spotify",
     "on an album card: the name opens it, ▶ play starts it",
     "click a step of the path, beside the mark in either view, to go there",
     "opening a page already on the path walks back to it",

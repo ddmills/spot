@@ -196,6 +196,22 @@ impl Api {
         Ok(results)
     }
 
+    /// Track results for one query, as [`Track`]s.
+    ///
+    /// For the radio deck's lookup, which asks a narrow question and wants the
+    /// answer in the shape the deck draws. A result that is somehow not a track
+    /// page comes back empty rather than as an error: this is a best-effort
+    /// lookup on the side, and there is nothing the caller could do about a
+    /// shape the endpoint cannot return anyway.
+    pub async fn search_tracks(&self, query: &str) -> Result<Vec<Track>> {
+        match self.search_one(query, SearchType::Track).await? {
+            SearchResult::Tracks(page) => {
+                Ok(page.items.iter().filter_map(track_from_full).collect())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
     async fn search_one(&self, query: &str, kind: SearchType) -> Result<SearchResult> {
         Ok(self
             .client

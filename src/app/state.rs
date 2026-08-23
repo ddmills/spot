@@ -611,12 +611,154 @@ pub struct RadioPlayback {
     /// which is why it is behind its own lock rather than a plain field.
     pub title: Arc<parking_lot::Mutex<Option<String>>>,
     pub volume_percent: u8,
+    /// What Spotify has for [`Self::title`], once the client has looked.
+    ///
+    /// A plain field rather than something behind the title's lock: the decoder
+    /// thread owns `title` and writes nothing else, while this is written by
+    /// the client task under the state lock like everything else. Keeping them
+    /// apart is what lets `Client::resolve_radio_track` ask whether an answer
+    /// is still about the announcement it was for.
+    pub matched: RadioMatch,
+}
+
+/// The record a deck control acts on, whichever engine is playing.
+///
+/// The two engines describe what they are playing in different shapes — a
+/// [`PlaybackSnapshot`] is a poll of Spotify's player, a [`Track`] is a
+/// catalogue row — and every deck control needs the same four facts out of
+/// either. Borrowing rather than copying them keeps this free to build on the
+/// click path, where it is built and dropped inside one match arm.
+#[derive(Debug, Clone, Copy)]
+pub enum DeckTrack<'a> {
+    Spotify(&'a PlaybackSnapshot),
+    Radio(&'a Track),
+}
+
+impl DeckTrack<'_> {
+    /// `None` for a Spotify item with no track id — an episode, or a play
+    /// still in flight that named nothing.
+    pub fn uri(&self) -> Option<&str> {
+        match self {
+            Self::Spotify(pb) => pb.track_uri.as_deref(),
+            Self::Radio(t) => Some(&t.uri),
+        }
+    }
+
+    pub fn artists(&self) -> &str {
+        match self {
+            Self::Spotify(pb) => &pb.artists,
+            Self::Radio(t) => &t.artists,
+        }
+    }
+
+    pub fn artist_id(&self) -> Option<&str> {
+        match self {
+            Self::Spotify(pb) => pb.artist_id.as_deref(),
+            Self::Radio(t) => t.artist_id.as_deref(),
+        }
+    }
+
+    /// The `OpenAlbum` this record's album name leads to, when it has one.
+    pub fn open_album(&self) -> Option<crate::app::command::AppCommand> {
+        let (id, name, artists, year, cover_url) = match self {
+            Self::Spotify(pb) => (
+                pb.album_id.as_ref()?,
+                &pb.album,
+                &pb.artists,
+                &pb.release_year,
+                pb.cover_url.clone(),
+            ),
+            Self::Radio(t) => (
+                t.album_id.as_ref()?,
+                &t.album,
+                &t.artists,
+                &t.release_year,
+                t.cover_url.clone(),
+            ),
+        };
+        Some(crate::app::command::AppCommand::OpenAlbum {
+            id: id.clone(),
+            name: name.clone(),
+            artists: artists.clone(),
+            year: year.clone(),
+            cover_url,
+        })
+    }
+
+    /// The `OpenArtist` this record's artist name leads to, when it has one.
+    pub fn open_artist(&self) -> Option<crate::app::command::AppCommand> {
+        let id = self.artist_id()?;
+        Some(crate::app::command::AppCommand::OpenArtist {
+            id: id.to_string(),
+            uri: format!("spotify:artist:{id}"),
+            name: first_artist(self.artists()),
+        })
+    }
+}
+
+/// The first name in a comma-joined credit list.
+///
+/// Spotify credits several artists on one string and only the first has an id
+/// on the rows we hold, so it is the only one a page can be opened for.
+pub fn first_artist(artists: &str) -> String {
+    artists
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// What Spotify has for the track a station just announced.
+///
+/// A state machine rather than an `Option<Track>` so the deck can say which of
+/// four things is true, instead of drawing the same blank row for "the server
+/// said nothing", "we are looking", and "we looked and it is not there". Only
+/// the last of them may draw a `★`.
+#[derive(Debug, Clone, Default)]
+pub enum RadioMatch {
+    /// No usable announcement: the server sends none, or what it sends is not
+    /// a track — a station ident, a promo, a URL. A lookup that errored lands
+    /// here too; see `Client::resolve_radio_track`.
+    #[default]
+    None,
+    /// Parsed, and a search is out for it.
+    Searching,
+    /// Searched, and nothing on Spotify was close enough. What the station said
+    /// is still drawn — it is what is playing — it just has no page behind it.
+    Unmatched,
+    /// Boxed: a `Track` is ten strings and `RadioPlayback` is cloned per frame.
+    Matched(Box<Track>),
 }
 
 impl RadioPlayback {
+    /// A station that has just started: playing, announcing nothing yet.
+    pub fn new(
+        station: Station,
+        volume_percent: u8,
+        title: Arc<parking_lot::Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            station,
+            is_playing: true,
+            started_at: Instant::now(),
+            title,
+            volume_percent,
+            matched: RadioMatch::None,
+        }
+    }
+
     /// The announced track, if there is one worth drawing.
     pub fn now_title(&self) -> Option<String> {
         self.title.lock().clone()
+    }
+
+    /// The Spotify record behind the announcement, if one was found.
+    pub fn matched_track(&self) -> Option<&Track> {
+        match &self.matched {
+            RadioMatch::Matched(t) => Some(t),
+            _ => None,
+        }
     }
 
     pub fn elapsed(&self) -> std::time::Duration {
@@ -1099,9 +1241,15 @@ pub struct AppState {
     /// matches, so the column says "these are the ones you follow".
     pub me_id: Option<String>,
 
-    /// The station playing, when one is. Mutually exclusive with
-    /// [`Self::playback`] by construction: `client` stops one engine before it
-    /// starts the other, so the deck never has two things to draw.
+    /// The station playing, when one is.
+    ///
+    /// The two engines never *play* at once — `client` stops one before it
+    /// starts the other — but this is not the same as the two fields being
+    /// mutually exclusive, and reading it that way is a trap. While a station
+    /// is on, [`Self::playback`] still holds the last Spotify track, kept on
+    /// purpose so stopping the stream puts it straight back rather than after
+    /// the next poll. Anything asking "what is the deck about?" must therefore
+    /// go through [`Self::deck_track`] and not reach for `playback` directly.
     pub radio: Option<RadioPlayback>,
     /// Stations you kept, loaded from disk at startup. The directory has no
     /// accounts, so this list is the whole of "saved".
@@ -1433,6 +1581,22 @@ impl AppState {
         false
     }
 
+    /// The record the deck is currently about.
+    ///
+    /// Radio first, and radio *exclusively* while a station is playing. The
+    /// kept Spotify snapshot behind it is not making any sound (see
+    /// [`Self::radio`]), so a deck control that fell through to it would like,
+    /// or open, a record the user last heard half an hour ago. That is why a
+    /// station with no match answers `None` here rather than deferring: the
+    /// honest answer is that the deck is about something Spotify has no page
+    /// for, and every caller renders that better than it renders a lie.
+    pub fn deck_track(&self) -> Option<DeckTrack<'_>> {
+        if let Some(r) = &self.radio {
+            return r.matched_track().map(DeckTrack::Radio);
+        }
+        self.playback.as_ref().map(DeckTrack::Spotify)
+    }
+
     /// Reset main-pane selection and scroll to the top (new content).
     pub fn main_to_top(&mut self) {
         self.main_index = 0;
@@ -1491,11 +1655,8 @@ impl AppState {
         }
         list.tracks.iter().find_map(|t| {
             let id = t.artist_id.clone()?;
-            let name = t.artists.split(',').next().unwrap_or_default().trim();
-            (!name.is_empty()).then(|| BackTarget::Artist {
-                id,
-                name: name.to_string(),
-            })
+            let name = first_artist(&t.artists);
+            (!name.is_empty()).then_some(BackTarget::Artist { id, name })
         })
     }
 
@@ -1615,6 +1776,24 @@ mod tests {
             album_id: None,
             artist_id: None,
             cover_url: None,
+        }
+    }
+
+    /// A minimal directory row, for the deck-subject tests.
+    fn a_station() -> Station {
+        Station {
+            uuid: "s1".into(),
+            name: "A Station".into(),
+            url: "http://stream/s1".into(),
+            homepage: String::new(),
+            tags: String::new(),
+            country: String::new(),
+            countrycode: String::new(),
+            language: String::new(),
+            codec: "MP3".into(),
+            bitrate: 128,
+            votes: 0,
+            hls: false,
         }
     }
 
@@ -1751,6 +1930,74 @@ mod tests {
         st
     }
 
+    /// The trap this whole accessor exists for.
+    ///
+    /// While a station plays, `playback` still holds the last Spotify track —
+    /// kept on purpose, so stopping the stream puts it straight back. Every
+    /// deck control used to read it directly, which meant `★` on the radio deck
+    /// would have liked whatever the user last heard on Spotify.
+    #[test]
+    fn the_deck_ignores_the_kept_snapshot_while_a_station_plays() {
+        let mut st = AppState::new();
+        st.playback = Some(polled("kept"));
+        assert_eq!(
+            st.deck_track().and_then(|t| t.uri().map(str::to_string)),
+            Some("spotify:track:kept".to_string())
+        );
+
+        st.radio = Some(RadioPlayback::new(a_station(), 40, Default::default()));
+        // Announcing nothing: the honest answer is that the deck is about no
+        // record at all, *not* the one behind the stream.
+        assert!(
+            st.deck_track().is_none(),
+            "the kept Spotify track leaked through a live station"
+        );
+
+        let mut found = track("announced", 1000);
+        found.artist_id = Some("art1".into());
+        found.album_id = Some("alb1".into());
+        if let Some(r) = st.radio.as_mut() {
+            r.matched = RadioMatch::Matched(Box::new(found));
+        }
+        let deck = st.deck_track().expect("a matched station has a record");
+        assert_eq!(deck.uri(), Some("spotify:track:announced"));
+        assert!(matches!(
+            deck.open_album(),
+            Some(crate::app::command::AppCommand::OpenAlbum { ref id, .. }) if id == "alb1"
+        ));
+        assert!(matches!(
+            deck.open_artist(),
+            Some(crate::app::command::AppCommand::OpenArtist { ref id, .. }) if id == "art1"
+        ));
+
+        // Stopping the station hands the deck back to the record that was
+        // waiting behind it.
+        st.radio = None;
+        assert_eq!(
+            st.deck_track().and_then(|t| t.uri().map(str::to_string)),
+            Some("spotify:track:kept".to_string())
+        );
+    }
+
+    /// A station that announced something spot could not place is not the same
+    /// as one announcing nothing, but the deck acts on neither.
+    #[test]
+    fn an_unmatched_announcement_gives_the_deck_nothing_to_act_on() {
+        let mut st = AppState::new();
+        st.playback = Some(polled("kept"));
+        let mut radio = RadioPlayback::new(a_station(), 40, Default::default());
+        radio.matched = RadioMatch::Unmatched;
+        st.radio = Some(radio);
+        assert!(st.deck_track().is_none());
+    }
+
+    #[test]
+    fn the_first_credited_artist_is_the_one_with_a_page() {
+        assert_eq!(first_artist("Zedd, Alessia Cara"), "Zedd");
+        assert_eq!(first_artist("  Moby  "), "Moby");
+        assert_eq!(first_artist(""), "");
+    }
+
     #[test]
     fn beginning_a_play_paints_the_clicked_track_at_once() {
         let mut st = AppState::new();
@@ -1774,6 +2021,7 @@ mod tests {
             started_at: Instant::now(),
             title: Default::default(),
             volume_percent: 40,
+            matched: Default::default(),
         });
         let want = track("new", 240_500);
 

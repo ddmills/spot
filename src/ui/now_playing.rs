@@ -77,11 +77,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // sound.
     if let Some(r) = radio {
         hit.now_playing = area;
+        // Only for a matched record, and only once the answer is in: the deck
+        // draws no control it cannot answer for.
+        let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
         draw_radio(
             frame,
             body,
             r,
             toast.as_ref().map(|(m, _)| m.as_str()),
+            like,
             mouse,
             hit,
         );
@@ -208,10 +212,11 @@ fn draw_radio(
     body: Rect,
     radio: &crate::app::state::RadioPlayback,
     toast: Option<&str>,
+    liked: Option<bool>,
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
 ) {
-    deck::radio_masthead(frame, body, radio, deck::Note::Show, mouse, hit);
+    deck::radio_masthead(frame, body, radio, deck::Note::Show, liked, mouse, hit);
 
     if body.height < 3 {
         return;

@@ -298,7 +298,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // better than the Spotify one.
     if let Some(r) = radio.as_ref() {
         if rows.header > 0 {
-            deck::radio_masthead(frame, header_area, r, deck::Note::Hide, mouse, hit);
+            let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
+            deck::radio_masthead(frame, header_area, r, deck::Note::Hide, like, mouse, hit);
             hit.now_playing = Rect {
                 height: header_area.height.min(deck::MASTHEAD_H),
                 ..header_area
@@ -355,20 +356,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 },
                 r,
                 hit,
-            );
-        }
-        // Where the queue would be. Said once, quietly: an empty table with
-        // column headings over it would look like a list that failed to load.
-        if queue_area.height > 0 {
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    "a live stream has no queue — it is whatever the station is playing",
-                    theme::dim(),
-                )),
-                Rect {
-                    height: 1,
-                    ..queue_area
-                },
             );
         }
         return;

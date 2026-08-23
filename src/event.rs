@@ -11,7 +11,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::command::AppCommand;
 use crate::app::state::{
     self as state, AppState, ArtistRow, BackTarget, CrumbTarget, HomeItem, InputMode, MainView,
-    RadioRow, RadioScope, RadioTab, SearchTab, SortKey, Station, Track, TrackList, ViewKey,
+    RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SortKey, Station, Track, TrackList,
+    ViewKey,
 };
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -270,32 +271,11 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
 
     // Now-playing info row: artist / album names open their pages.
     if st.hit.now_artist.contains(pos) {
-        let info = st.playback.as_ref().and_then(|pb| {
-            pb.artist_id.as_ref().map(|id| {
-                (
-                    id.clone(),
-                    pb.artists
-                        .split(',')
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string(),
-                )
-            })
-        });
-        if let Some((id, name)) = info {
-            // The page opens in the main view, which the player would hide.
-            // Before `navigate`, and unconditionally: clicking this while
-            // already on the artist's page is a no-op for the path but must
-            // still get you out of the player and onto the page it names.
-            st.show_player = false;
-            let uri = format!("spotify:artist:{id}");
-            navigate(st, AppCommand::OpenArtist { id, uri, name }, tx);
-        }
+        open_deck_artist(st, tx);
         return;
     }
     if st.hit.now_album.contains(pos) {
-        open_playing_album(st, tx);
+        open_deck_album(st, tx);
         return;
     }
 
@@ -314,7 +294,7 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
     // The deck's liked control is about the playing track, which is what the
     // row it sits on is about — not the selection on the page underneath.
     if st.hit.like_btn.contains(pos) {
-        toggle_like_playing(st, tx);
+        toggle_like_deck(st, tx);
         return;
     }
 
@@ -1363,7 +1343,14 @@ fn open_album_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) 
         },
         _ => None,
     };
-    let Some(cmd) = cmd else { return };
+    let Some(cmd) = cmd else {
+        // No track row under the cursor. Under a station that means the deck,
+        // which is the one thing every screen has in common while radio plays
+        // — the same fallback `L` has always had, for the same reason. Left
+        // alone off radio: `b` deliberately does not reach for the playing
+        // track on a page that simply has no albums on it.
+        return radio_deck_fallback(st, tx, open_deck_album);
+    };
     // An album page still shows an Album column, which names the album you are
     // already on, so this is one of the places re-opening a page you are
     // standing on used to stack a duplicate. `navigate` now catches that
@@ -1372,25 +1359,71 @@ fn open_album_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) 
     navigate(st, cmd, tx);
 }
 
-/// Open the playing track's album, from the sleeve or from the album name in
-/// the now-playing bar / player masthead. One resolution for both, so the two
-/// controls that mean the same thing cannot drift apart.
-fn open_playing_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    let cmd = st.playback.as_ref().and_then(|pb| {
-        pb.album_id.as_ref().map(|id| AppCommand::OpenAlbum {
-            id: id.clone(),
-            name: pb.album.clone(),
-            artists: pb.artists.clone(),
-            year: pb.release_year.clone(),
-            cover_url: pb.cover_url.clone(),
-        })
-    });
-    let Some(cmd) = cmd else { return };
+/// Run a deck control in place of a selection key, but only under a station.
+///
+/// `b` and `B` mean "the row under the cursor" everywhere they have something
+/// to point at. A radio page has no track rows at all, so under a station they
+/// would otherwise be dead keys on the one screen where the deck is the only
+/// thing naming a record.
+fn radio_deck_fallback(
+    st: &mut AppState,
+    tx: &UnboundedSender<AppCommand>,
+    open: fn(&mut AppState, &UnboundedSender<AppCommand>),
+) {
+    if st.radio.is_some() {
+        open(st, tx);
+    }
+}
+
+/// Open the album of whatever the deck is about, from the sleeve or from the
+/// album name in the now-playing bar / player masthead. One resolution for
+/// both, so the two controls that mean the same thing cannot drift apart.
+///
+/// "Whatever the deck is about" and not "the playing track": while a station is
+/// on, `playback` still holds the last Spotify track and it is not what is
+/// making any sound. [`AppState::deck_track`] is what keeps every deck control
+/// pointing at the same record.
+fn open_deck_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(cmd) = st.deck_track().and_then(|t| t.open_album()) else {
+        return radio_has_no_track(st, "album");
+    };
     // The page opens in the main view, which the player would hide. Before
     // `navigate`, and unconditionally: clicking the sleeve while already on
     // that album's page leaves the path alone but must still close the player.
     st.show_player = false;
     navigate(st, cmd, tx);
+}
+
+/// Open the artist of whatever the deck is about. Same rule as
+/// [`open_deck_album`], and the same reason it does not read `playback`.
+fn open_deck_artist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(cmd) = st.deck_track().and_then(|t| t.open_artist()) else {
+        return radio_has_no_track(st, "artist");
+    };
+    // Before `navigate`, and unconditionally: clicking this while already on
+    // the artist's page is a no-op for the path but must still get you out of
+    // the player and onto the page it names.
+    st.show_player = false;
+    navigate(st, cmd, tx);
+}
+
+/// Say why a deck control did nothing, when the reason is radio.
+///
+/// Silence on a keypress is out of character here — `n`, `p`, `s`, `h` and `l`
+/// all explain themselves under radio rather than appearing broken. Off radio
+/// there is nothing to say: a Spotify track always has an album and an artist,
+/// so the only way to arrive with nothing is to have nothing playing at all,
+/// which the deck is already saying in as many words.
+fn radio_has_no_track(st: &mut AppState, what: &str) {
+    let Some(r) = st.radio.as_ref() else { return };
+    let msg = match &r.matched {
+        RadioMatch::Searching => "still looking that one up".to_string(),
+        RadioMatch::Unmatched => format!("that track is not on Spotify — no {what} to open"),
+        RadioMatch::None | RadioMatch::Matched(_) => {
+            "radio is live — this station is not saying what it is playing".to_string()
+        }
+    };
+    st.toast(msg);
 }
 
 /// The command that opens an album row's page, artwork and all.
@@ -1411,13 +1444,7 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
         t.artist_id.as_ref().map(|id| AppCommand::OpenArtist {
             id: id.clone(),
             uri: format!("spotify:artist:{id}"),
-            name: t
-                .artists
-                .split(',')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
+            name: crate::app::state::first_artist(&t.artists),
         })
     };
     let cmd = match &st.main {
@@ -1449,8 +1476,11 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
     // name credited on a top track is the artist whose page it is — so `B`
     // there used to stack a copy per press and go nowhere. `navigate` sees
     // the target is the page on screen and does nothing.
-    if let Some(cmd) = cmd {
-        navigate(st, cmd, tx);
+    match cmd {
+        Some(cmd) => navigate(st, cmd, tx),
+        // See `open_album_of_selection`: the deck is the fallback, under a
+        // station only.
+        None => radio_deck_fallback(st, tx, open_deck_artist),
     }
 }
 
@@ -1486,7 +1516,7 @@ fn queue_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// all of them).
 fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     if st.show_player {
-        return toggle_like_playing(st, tx);
+        return toggle_like_deck(st, tx);
     }
     // On a station row `L` keeps the station. Same key, same gesture — the
     // difference is only that a station is kept in a file of spot's own,
@@ -1519,14 +1549,18 @@ fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     };
     match uri {
         Some(uri) => send_like(st, uri, tx),
-        None => toggle_like_playing(st, tx),
+        None => toggle_like_deck(st, tx),
     }
 }
 
 /// The deck's liked control, and `L` wherever there is no track row to mean.
-fn toggle_like_playing(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    let Some(uri) = st.playback.as_ref().and_then(|pb| pb.track_uri.clone()) else {
-        return;
+///
+/// Reads the deck's subject rather than `playback` for the reason given on
+/// [`open_deck_album`]: under a station, `playback` is a record that stopped
+/// playing when the stream started.
+fn toggle_like_deck(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(uri) = st.deck_track().and_then(|t| t.uri().map(str::to_string)) else {
+        return radio_has_no_track(st, "track");
     };
     send_like(st, uri, tx);
 }
@@ -1696,6 +1730,7 @@ mod tests {
             started_at: Instant::now(),
             title: Default::default(),
             volume_percent: 40,
+            matched: Default::default(),
         });
 
         activate_selection(&mut st, &tx);
@@ -2463,6 +2498,7 @@ mod tests {
             started_at: Instant::now(),
             title: Arc::new(parking_lot::Mutex::new(None)),
             volume_percent: 50,
+            matched: Default::default(),
         }
     }
 
@@ -2897,5 +2933,140 @@ mod tests {
         // A click that misses it leaves the view where it was.
         handle_click(&mut st, Position { x: 40, y: 0 }, &tx);
         assert!(st.show_player);
+    }
+
+    /// A station with a Spotify record found for what it announced.
+    fn matched_radio() -> crate::app::state::RadioPlayback {
+        let mut r = live_radio(test_station("s1", "Adroit Jazz"));
+        *r.title.lock() = Some("Peter Appleyard - Frenesi".into());
+        let mut t = track("Frenesi", Some("alb1"));
+        t.uri = "spotify:track:Frenesi".into();
+        r.matched = RadioMatch::Matched(Box::new(t));
+        r
+    }
+
+    /// The bug the deck-subject accessor exists to stop. While a station
+    /// plays, `playback` still names the last Spotify track — so `★` used to
+    /// like a record that stopped playing when the stream started.
+    #[test]
+    fn the_decks_control_likes_the_matched_track_not_the_kept_snapshot() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.playback = Some(playing("spotify:album:a1"));
+        st.radio = Some(matched_radio());
+        st.hit.like_btn = Rect::new(70, 20, 9, 1);
+
+        handle_click(&mut st, Position { x: 72, y: 20 }, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
+                if uri == "spotify:track:Frenesi" && liked),
+            "the kept Spotify track was liked instead of the station's record"
+        );
+    }
+
+    /// A station spot could not place has nothing to save, and says so rather
+    /// than falling through to the record behind the stream.
+    #[test]
+    fn the_decks_control_says_why_it_did_nothing_without_a_match() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.playback = Some(playing("spotify:album:a1"));
+        let mut r = live_radio(test_station("s1", "Adroit Jazz"));
+        r.matched = RadioMatch::Unmatched;
+        st.radio = Some(r);
+        st.hit.like_btn = Rect::new(70, 20, 9, 1);
+
+        handle_click(&mut st, Position { x: 72, y: 20 }, &tx);
+        assert!(rx.try_recv().is_err(), "liked something while radio played");
+        assert!(st.toast.is_some(), "a dead control must explain itself");
+    }
+
+    #[test]
+    fn clicking_the_radio_decks_artist_opens_the_matched_artist() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.playback = Some(playing("spotify:album:a1"));
+        st.radio = Some(matched_radio());
+        st.show_player = true;
+        st.hit.now_artist = Rect::new(4, 9, 6, 1);
+
+        handle_click(&mut st, Position { x: 5, y: 9 }, &tx);
+        assert!(
+            !st.show_player,
+            "the page opens in the view the player hides"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::OpenArtist { ref id, .. }) if id == "r1"
+        ));
+    }
+
+    #[test]
+    fn clicking_the_radio_decks_album_opens_the_matched_album() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.playback = Some(playing("spotify:album:a1"));
+        st.radio = Some(matched_radio());
+        st.hit.now_album = Rect::new(20, 9, 6, 1);
+
+        handle_click(&mut st, Position { x: 21, y: 9 }, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::OpenAlbum { ref id, .. }) if id == "alb1"
+        ));
+    }
+
+    /// A radio page has no track rows, so `b` and `B` mean the deck there.
+    #[test]
+    fn b_and_shift_b_on_a_radio_page_open_the_matched_tracks_pages() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = radio_page(RadioScope::Popular, Vec::new());
+        st.radio = Some(matched_radio());
+
+        open_album_of_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::OpenAlbum { ref id, .. }) if id == "alb1"
+        ));
+
+        open_artist_of_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::OpenArtist { ref id, .. }) if id == "r1"
+        ));
+    }
+
+    /// Off radio the fallback must not fire: `b` on a page with no albums on
+    /// it has always been a no-op, and reaching for the playing track there
+    /// would be a new behaviour nobody asked for.
+    #[test]
+    fn b_still_does_nothing_on_a_spotify_page_with_no_album_row() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.playback = Some(playing("spotify:album:a1"));
+        open_album_of_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// `L` on a station row keeps the *station*, even while that very station
+    /// is the one playing and has a matched record on the deck. Same key, two
+    /// subjects, and the row under the cursor is what decides.
+    #[test]
+    fn shift_l_on_a_station_row_still_saves_the_station_while_it_plays() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        let station = test_station("s1", "Adroit Jazz");
+        st.main = radio_page(
+            RadioScope::Popular,
+            vec![RadioRow::Station(station.clone())],
+        );
+        st.radio = Some(matched_radio());
+
+        toggle_like_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::ToggleSavedStation(s)) if s.uuid == station.uuid
+        ));
     }
 }

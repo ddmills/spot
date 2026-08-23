@@ -3374,6 +3374,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             volume_percent: 50,
+            matched: Default::default(),
         });
         let playing = render(&mut st, 90, 18).join("\n");
         assert!(playing.contains("♫ Radio Paradise"), "{playing}");

@@ -93,6 +93,14 @@ pub struct Client {
     /// (a 429, say) must not turn into one request per poll for as long as the
     /// record is on.
     liked_probe: Option<String>,
+    /// The announcement we last ran a Spotify lookup for.
+    ///
+    /// The radio twin of [`Self::liked_probe`], and set *before* the search
+    /// goes out rather than when it answers: a lookup that fails must cost one
+    /// request per announced title, not one per poll for as long as the record
+    /// is on. Cleared when the station changes or stops, so the same string
+    /// announced by a different station is asked about again.
+    radio_probe: Option<String>,
     /// The radio directory. Shares [`Self::http`], which already carries the
     /// user agent Radio Browser asks for.
     radio_api: RadioApi,
@@ -136,6 +144,7 @@ impl Client {
             http,
             covers: Arc::new(Mutex::new(CoverCache::default())),
             liked_probe: None,
+            radio_probe: None,
         }
     }
 
@@ -166,7 +175,15 @@ impl Client {
                     self.repoll_at = None;
                     self.refresh_playback().await;
                 }
-                _ = poll.tick() => self.refresh_playback().await,
+                _ = poll.tick() => {
+                    self.refresh_playback().await;
+                    // Not on the `repoll_at` arm above: that one exists to
+                    // catch up with a transport command, and what a station is
+                    // announcing has nothing to do with one. Three seconds of
+                    // lag on the metadata row is invisible anyway — ICY blocks
+                    // do not arrive faster than that.
+                    self.resolve_radio_track();
+                }
             }
         }
     }
@@ -553,13 +570,16 @@ impl Client {
 
         {
             let mut st = self.state.write();
-            st.radio = Some(state::RadioPlayback {
-                station: station.clone(),
-                is_playing: true,
-                started_at: Instant::now(),
-                title: self.radio_player.title(),
-                volume_percent: volume,
-            });
+            st.radio = Some(state::RadioPlayback::new(
+                station.clone(),
+                volume,
+                self.radio_player.title(),
+            ));
+            // Whatever the last station was announcing is not this station's
+            // business. Without this, moving to a station that happens to be
+            // playing the same record would find the probe already set and
+            // never look it up.
+            self.radio_probe = None;
             // The Spotify bar must not keep claiming to be playing behind the
             // station; the snapshot itself is kept so stopping radio puts the
             // last track straight back rather than after the next poll.
@@ -602,6 +622,102 @@ impl Client {
     fn stop_radio(&self) {
         self.radio_player.stop();
         self.state.write().radio = None;
+    }
+
+    /// Look up what the station just announced, once per announcement.
+    ///
+    /// The ICY callback runs on the decoder thread, which has neither a runtime
+    /// nor an `Api`, so a new announcement is *noticed* here rather than
+    /// reacted to there. [`Self::radio_probe`] is what stops a three-second
+    /// poll re-asking the same question for the length of a record.
+    ///
+    /// Deliberately outside [`Self::refresh_playback`]: that method is gated by
+    /// a backoff about `/me/player`'s rate limit, which has nothing to say
+    /// about search, and folding the two together would couple them silently.
+    fn resolve_radio_track(&mut self) {
+        // Scoped: parking_lot's lock is not reentrant and the arms below take
+        // it for writing.
+        let announced = self.state.read().radio.as_ref().and_then(|r| r.now_title());
+
+        let Some(raw) = announced else {
+            // No station, or a station that has stopped saying anything.
+            // Forget the probe, so the same title announced again after a gap
+            // is looked up again — and drop the match with it, or the deck
+            // would go on naming a record the station is no longer claiming to
+            // be playing.
+            self.radio_probe = None;
+            if let Some(r) = self.state.write().radio.as_mut() {
+                r.matched = state::RadioMatch::None;
+            }
+            return;
+        };
+        if !needs_lookup(&raw, self.radio_probe.as_deref()) {
+            return;
+        }
+        self.radio_probe = Some(raw.clone());
+
+        let station = {
+            let st = self.state.read();
+            let Some(r) = st.radio.as_ref() else { return };
+            r.station.clone()
+        };
+
+        let Some(want) = crate::radio::track::parse(&raw, &station.name) else {
+            // Not a track: a promo, a jingle, the station's own ident. The row
+            // still says what the server said; there is simply nothing behind
+            // it, and no request is spent finding that out.
+            if let Some(r) = self.state.write().radio.as_mut() {
+                r.matched = state::RadioMatch::None;
+            }
+            return;
+        };
+
+        if let Some(r) = self.state.write().radio.as_mut() {
+            r.matched = state::RadioMatch::Searching;
+        }
+
+        let api = self.api.clone();
+        let state = self.state.clone();
+        let uuid = station.uuid.clone();
+        // Spawned rather than awaited: rspotify is built from a bare token with
+        // no HTTP timeout, so an inline await could stall the command loop on
+        // one hung connection. The cost is that a lookup which errors cannot
+        // reset `radio_probe` and so is not retried until the next
+        // announcement — which is the right trade during a 429.
+        tokio::spawn(async move {
+            let found = lookup(&api, &want).await;
+
+            let uri = {
+                let mut st = state.write();
+                let Some(r) = st.radio.as_mut() else { return };
+                // Two ways this answer can be stale and one check for both: the
+                // user changed station, or the station moved on while we were
+                // asking. A uuid alone would only catch the first.
+                let current = r.now_title();
+                if r.station.uuid != uuid || current.as_deref() != Some(raw.as_str()) {
+                    return;
+                }
+                match found {
+                    Some(track) => {
+                        let uri = track.uri.clone();
+                        r.matched = state::RadioMatch::Matched(Box::new(track));
+                        Some(uri)
+                    }
+                    None => {
+                        r.matched = state::RadioMatch::Unmatched;
+                        None
+                    }
+                }
+            };
+
+            // The deck draws a `★` for the matched track, which is in no loaded
+            // list, so its saved state has to be asked for on its own — the
+            // same reason the playing track's is. Guarded on the map, so a
+            // station looping a playlist asks once per record, not per play.
+            if let Some(uri) = uri.filter(|u| !state.read().liked.contains_key(u)) {
+                spawn_liked_check(api, state, vec![uri]);
+            }
+        });
     }
 
     /// Silence what is playing and start the new sleeve, before asking Spotify
@@ -1509,6 +1625,47 @@ fn spawn_page_art(
     });
 }
 
+/// Whether an announcement is one we have not already asked about.
+///
+/// A free function so the rule can be tested: `Client` needs a `Spirc` to
+/// build and cannot be constructed in a unit test.
+fn needs_lookup(announced: &str, probe: Option<&str>) -> bool {
+    !announced.trim().is_empty() && probe != Some(announced)
+}
+
+/// Ask Spotify for the announced record, narrowest query first.
+///
+/// Three queries at worst, and only because each is a different question. The
+/// field-scoped form is what stops a one-word title coming back as thirty
+/// unrelated records that happen to contain the word; the trimmed form covers
+/// an annotation that belongs to the pressing rather than the record; the loose
+/// form is for the announcements the scoping is too strict for. Each answer is
+/// still put through `best_match`, so a wider query cannot buy a worse match.
+async fn lookup(api: &Api, want: &crate::radio::track::Announcement) -> Option<state::Track> {
+    let queries = [
+        Some(want.scoped_query()),
+        want.trimmed_query(),
+        Some(want.loose_query()),
+    ];
+    for query in queries.into_iter().flatten() {
+        match api.search_tracks(&query).await {
+            Ok(cands) => {
+                if let Some(hit) = crate::radio::track::best_match(&cands, want) {
+                    return Some(hit);
+                }
+            }
+            // Logged, not toasted. A lookup nobody asked for should not throw a
+            // message over whatever the user is reading; the row simply says
+            // the station's own words instead.
+            Err(e) => {
+                log::warn!("radio track lookup failed: {e:#}");
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// Fetch saved-state for `uris` in the background and merge it in.
 fn spawn_liked_check(api: Api, state: Arc<RwLock<AppState>>, uris: Vec<String>) {
     if uris.is_empty() {
@@ -1683,5 +1840,20 @@ mod tests {
         assert_eq!(raw_to_pct(u16::MAX), 100);
         // Out-of-range input is clamped rather than wrapped.
         assert_eq!(pct_to_raw(200), u16::MAX);
+    }
+
+    /// The guard that keeps a three-second poll from re-asking Spotify the
+    /// same question for the length of a record.
+    #[test]
+    fn a_lookup_runs_once_per_announcement() {
+        // Nothing asked yet.
+        assert!(needs_lookup("Aspen - Seasick", None));
+        // Asked, and the station has not moved on.
+        assert!(!needs_lookup("Aspen - Seasick", Some("Aspen - Seasick")));
+        // The next record.
+        assert!(needs_lookup("Moby - Porcelain", Some("Aspen - Seasick")));
+        // An empty announcement is not a question.
+        assert!(!needs_lookup("", None));
+        assert!(!needs_lookup("   ", None));
     }
 }

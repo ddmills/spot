@@ -140,8 +140,23 @@ chart on every screen of this feature.
 Radio and Spotify never play at once: starting a station pauses Spotify, and starting a
 Spotify track stops the station. The bottom bar and the player view (`v`) both switch to
 the station, and the spectrum analyzer keeps working, because both engines feed the same
-PCM tap. About six popular stations in ten announce their current track over ICY metadata;
-where one does, it's the line under the station name and it's what the window title says.
+PCM tap. About six popular stations in ten announce their current track over ICY metadata.
+
+Where one does, spot looks it up on Spotify. On a confident match the deck stops showing
+the station's raw text and shows the record instead — its own name, artist, album and year,
+with the artist and album clickable exactly as they are for a Spotify track, `★` and `L`
+saving it to your library, and `b` / `B` opening its album or artist page. The stream keeps
+playing throughout; none of those touch the audio device. The station's name moves to the
+bottom row of the deck, where the queue is named for a Spotify track.
+
+spot will not guess. Stations spell their announcements every which way — `Artist - Title`
+mostly, but also `Title by Artist`, with the station's own branding glued on after a dash or
+a pipe — and an ident like `BBC World Service Online` is not a song at all. What can't be
+read as a record is shown as the station wrote it, and no search is spent on it. What can be
+read but not confidently matched is also shown as-is: it simply has nothing behind it. Only
+an announcement that agrees with a Spotify record on *both* the title and the artist becomes
+a link you can act on, because the cost of getting that wrong is a stranger's song saved to
+your library.
 
 Stations that stream over **HLS** are listed and marked, but spot can't play them yet —
 that is around 6% of the directory, and it does include most BBC and national-broadcaster

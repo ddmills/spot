@@ -240,9 +240,13 @@ fn window_title(
     // is on, the Spotify snapshot is kept but paused, and naming it in the
     // taskbar would point at the wrong sound.
     let full = match (radio, playback) {
-        (Some(r), _) => match r.now_title() {
-            Some(title) => format!("♫ {title} — {}", r.station.name),
-            None => format!("♫ {}", r.station.name),
+        // Spotify's spelling of the record where there is one, so the title
+        // bar and the deck say the same thing; the station's own words where
+        // there is not.
+        (Some(r), _) => match (r.matched_track(), r.now_title()) {
+            (Some(t), _) => format!("♫ {} — {} · {}", t.name, t.artists, r.station.name),
+            (None, Some(title)) => format!("♫ {title} — {}", r.station.name),
+            (None, None) => format!("♫ {}", r.station.name),
         },
         (None, Some(pb)) => format!("♫ {} — {}", pb.track_name, pb.artists),
         (None, None) => return "spot".to_string(),
