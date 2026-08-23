@@ -258,6 +258,14 @@ impl Client {
                 self.set_radio_volume((i16::from(current) + i16::from(delta)).clamp(0, 100) as u8);
             }
             SetVolume(pct) if self.radio_live() => self.set_radio_volume(pct.min(100)),
+            // A broadcast has no track either side of it and no position to
+            // seek to, so these four have nothing to do while a station is on
+            // — and reaching Spirc with them does not merely do nothing, it
+            // starts Spotify playing underneath the stream. The key handler
+            // already turns them into a toast, but it is not the only way in:
+            // a mouse click, a media key, or a hit rect left over from the
+            // Spotify deck all arrive here directly.
+            Next | Prev | SeekRel(_) | SeekTo(_) | ToggleShuffle if self.radio_live() => {}
             Next => self.spirc.next()?,
             Prev => self.spirc.prev()?,
             SeekRel(delta_ms) => {
@@ -420,6 +428,7 @@ impl Client {
             PlayStation(station) => self.play_station(*station).await,
             StopRadio => self.stop_radio(),
             ToggleSavedStation(station) => self.toggle_saved_station(*station),
+            YieldToRadio => self.yield_to_radio(),
             // Intercepted by `run`, which is the only place that can end the
             // loop. Listed rather than swept into a catch-all so a new command
             // still has to be handled deliberately.
@@ -634,6 +643,14 @@ impl Client {
             st.radio = None;
             st.toast(format!("could not play {}: {e}", station.name));
             return;
+        }
+        // And once more now the station is audible. `play` above spends several
+        // seconds connecting and prefetching, and the pause before it can only
+        // catch a Spotify play that had already arrived — one that lands during
+        // the prefetch would start with nothing left to stop it. This is the
+        // pause that is on the far side of that window.
+        if let Err(e) = self.spirc.pause() {
+            log::warn!("could not pause Spotify after starting radio: {e}");
         }
         self.state
             .write()
@@ -874,8 +891,61 @@ impl Client {
         }
     }
 
+    /// Whether radio owns the output device, for the transport arms that must
+    /// not reach Spirc while it does.
+    ///
+    /// Either source counts, because the two are true over different windows
+    /// and both windows are ones where touching Spirc would start Spotify
+    /// under a station:
+    ///
+    /// * `AppState.radio` is set the moment a station is chosen and stays set
+    ///   while it connects — seconds during which the engine is not live yet.
+    /// * The engine is live from the hand-off until [`Self::stop_radio`], which
+    ///   includes the turn of the command channel after the event layer has
+    ///   cleared `AppState.radio` on a click. See [`Self::yield_to_spotify`].
+    ///
+    /// Deliberately the permissive direction: the cost of a false positive is
+    /// a transport key that does nothing for one turn, and the cost of a false
+    /// negative is both engines playing at once.
     fn radio_live(&self) -> bool {
-        self.state.read().radio.is_some()
+        self.radio_player.is_live() || self.state.read().radio.is_some()
+    }
+
+    /// Pause Spotify if a station owns the device.
+    ///
+    /// The backstop under every "pause Spirc first" in this file. Those all
+    /// fire *before* the thing that would make sound, and a Connect device
+    /// does not take orders in that order: a `load` asked for over the Web API
+    /// arrives back over the dealer whenever the backend gets to it, and a
+    /// phone can resume our device at any time at all. Both land after the
+    /// pause that was meant to prevent them, and until this existed both were
+    /// simply audible.
+    ///
+    /// This runs off `PlayerEvent::Playing` instead — librespot saying it has
+    /// started, whoever asked — so the question is settled by what is actually
+    /// making sound rather than by what we last asked for.
+    fn yield_to_radio(&self) {
+        if !self.radio_player.is_live() {
+            return;
+        }
+        log::warn!("Spotify started under a live station; pausing it");
+        if let Err(e) = self.spirc.pause() {
+            log::warn!("could not pause Spotify under the station: {e}");
+        }
+        // The Spotify bar must not claim to be playing behind the station —
+        // the `Playing` event that got us here has just set it. Only on our own
+        // device, matching the filter the event loop applies before it writes:
+        // a snapshot describing someone else's speaker is not about the pause
+        // we just sent.
+        if let Some(pb) = self
+            .state
+            .write()
+            .playback
+            .as_mut()
+            .filter(|pb| pb.is_local_device)
+        {
+            pb.is_playing = false;
+        }
     }
 
     fn set_radio_volume(&self, percent: u8) {
@@ -1818,6 +1888,17 @@ mod tests {
             is_local_device,
             fetched_at: Instant::now(),
         }
+    }
+
+    /// `YieldToRadio` rides on every `Playing` event, which means every track
+    /// change. Arming the 400 ms re-poll on it would spend a `/me/player` call
+    /// per track to learn what the event that sent it already said.
+    #[test]
+    fn yielding_to_radio_does_not_arm_a_repoll() {
+        assert!(!command_touches_playback(&AppCommand::YieldToRadio));
+        // The commands that do still do — the guard above is about this one
+        // command, not a loosening of the rule.
+        assert!(command_touches_playback(&AppCommand::Next));
     }
 
     /// The poll that lands ~400 ms after a pause still says "playing"; taking

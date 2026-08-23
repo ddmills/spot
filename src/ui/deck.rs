@@ -438,10 +438,16 @@ fn station_subtitle(radio: &RadioPlayback) -> String {
 ///
 /// A broadcast has no length, so there is no ratio to draw and nothing to
 /// seek to — the track is drawn full rather than empty, because the stream is
-/// arriving, not stalled. `hit.gauge` is deliberately left unset: a bar that
-/// looks like the one above a Spotify track but silently ignores clicks would
-/// be worse than one that plainly is not a control.
-pub fn radio_status(frame: &mut Frame, row: Rect, radio: &RadioPlayback) {
+/// arriving, not stalled.
+///
+/// Clears `hit.gauge`, for the reason its neighbours clear theirs: this row is
+/// where the Spotify deck draws its progress track, so a station started over a
+/// track left last frame's seek rect lying under the `LIVE` bar. Clicking it
+/// sent a `SeekTo` to Spirc — a transport command aimed at the engine that is
+/// not playing, and the client refuses those now, but a control that is not a
+/// control should not be reachable in the first place.
+pub fn radio_status(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hit: &mut HitAreas) {
+    hit.gauge = Rect::default();
     if row.width <= TIME_W {
         return;
     }
@@ -1114,6 +1120,30 @@ mod tests {
         assert!(hit.play_btn.is_empty());
     }
 
+    /// The `LIVE` bar is a readout, and the row it sits on is where the Spotify
+    /// deck draws a track you can seek by clicking. Starting a station over a
+    /// track used to leave the Spotify gauge's rect lying under it, so a click
+    /// on `LIVE` sent a `SeekTo` to Spirc — a transport command aimed at the
+    /// engine that was not playing, which is one of the ways Spotify ended up
+    /// making sound underneath a station.
+    #[test]
+    fn the_live_bar_does_not_inherit_the_seek_rect() {
+        let pb = snapshot();
+        let r = radio("Adroit Jazz");
+        let mut hit = HitAreas::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        // Frame one: a Spotify track, which arms the gauge.
+        terminal
+            .draw(|f| progress(f, f.area(), &pb, &mut hit))
+            .unwrap();
+        assert!(!hit.gauge.is_empty(), "the Spotify deck arms the gauge");
+        // Frame two: a station on the same row.
+        terminal
+            .draw(|f| radio_status(f, f.area(), &r, &mut hit))
+            .unwrap();
+        assert!(hit.gauge.is_empty(), "{:?}", hit.gauge);
+    }
+
     /// Too narrow for both, previous keeps the row — `right_row` would
     /// otherwise paint next straight over it — and the pill goes first, rather
     /// than colliding with the buttons it sits between.
@@ -1413,7 +1443,7 @@ mod tests {
                 render(width.max(1), 2, |f, a, h| {
                     let a = Rect { width, ..a };
                     radio_masthead(f, a, &r, Note::Show, Some(true), None, h);
-                    radio_status(f, Rect { height: 1, ..a }, &r);
+                    radio_status(f, Rect { height: 1, ..a }, &r, h);
                     radio_transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
                     radio_station_row(f, Rect { height: 1, ..a }, &r, saved, None, h);
                 });

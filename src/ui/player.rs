@@ -337,6 +337,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     ..progress_area
                 },
                 r,
+                hit,
             );
         }
         if rows.transport > 0 {

@@ -233,7 +233,7 @@ fn draw_radio(
     if body.height < 4 {
         return;
     }
-    deck::radio_status(frame, row_at(body, 3), radio);
+    deck::radio_status(frame, row_at(body, 3), radio, hit);
 
     if body.height < 5 {
         return;

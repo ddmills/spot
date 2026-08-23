@@ -408,6 +408,20 @@ async fn player_event_loop(
             continue;
         }
 
+        // The only place spot hears librespot start making sound regardless of
+        // who asked it to — our own play, a `load` that arrived over the dealer
+        // after we had paused, or another Connect client resuming our device.
+        // The client decides what to do about it; this loop only reports it,
+        // because it cannot see the radio engine. See
+        // [`AppCommand::YieldToRadio`].
+        //
+        // Above the filter below, not under it: that one drops events about a
+        // track being left, and a station playing over one is exactly a case
+        // where the deck has moved on and the audio has not.
+        if matches!(event, PlayerEvent::Playing { .. }) {
+            let _ = tx.send(AppCommand::YieldToRadio);
+        }
+
         // Across a switch, events about the track being left are still in
         // flight — starting with the `Paused` our own pause caused, carrying
         // that track's position. Applying those would undo the deck the click

@@ -96,6 +96,20 @@ pub enum AppCommand {
     /// `L` on a station row: keep it, or stop keeping it.
     ToggleSavedStation(Box<Station>),
 
+    /// librespot has started making sound. Pause it again if a station owns
+    /// the device.
+    ///
+    /// Sent from the player event loop on every `Playing`, because that loop
+    /// hears librespot start *whoever* asked it to — our own play, a `load`
+    /// arriving late over the dealer, or a phone resuming our Connect device —
+    /// and it is the only signal that covers all three. The client answers it,
+    /// because only the client knows whether the radio engine is streaming.
+    ///
+    /// A no-op in the ordinary case, which is why it is not listed in
+    /// `command_touches_playback`: nothing here changes what is playing unless
+    /// two things already are.
+    YieldToRadio,
+
     /// Quit: silence both engines and end the client loop.
     ///
     /// The only command whose completion the sender waits for — see
