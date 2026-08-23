@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::System::Console::{
-    CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     SetConsoleCtrlHandler,
 };
 use windows_sys::core::BOOL;
