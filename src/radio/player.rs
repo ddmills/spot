@@ -15,10 +15,15 @@
 //! The two engines are mutually exclusive by construction — `client` stops one
 //! before starting the other — so they never contend for the output device.
 //!
-//! Everything from the decoder down runs on a dedicated OS thread: rodio's
-//! `OutputStream` wraps a cpal stream that is not `Send` on Windows, and the
-//! decoder's `Read` calls block on the network. The tokio side does the
-//! connecting and hands the finished reader across.
+//! The output device lives on a dedicated OS thread: rodio's `OutputStream`
+//! wraps a cpal stream that is not `Send` on Windows. That thread does nothing
+//! else. The tokio side connects the stream and builds the decoder — both of
+//! which read the network, and neither of which has an upper bound but the
+//! timeouts on the HTTP client — and hands the finished source across.
+//!
+//! The division is the point. The audio thread is the only thing that can
+//! silence the radio, so it must never wait on the network: a read that never
+//! returns there is a pause key, a stop key and a quit that never work again.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -59,9 +64,33 @@ const ASSUMED_KBPS: u64 = 128;
 /// the music, long enough that the tap's lock is taken rarely.
 const TAP_FLUSH: usize = 512;
 
+/// How long the station has to answer the GET.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connected station may go without sending a byte before it counts
+/// as dead.
+///
+/// This is the timeout that matters. A `Read` on the stream blocks on a
+/// condvar that only a byte or the end of the download can release, so a server
+/// that accepts the connection and then goes quiet — which happens often
+/// enough in a directory of ten thousand stations — used to block whichever
+/// thread was reading, for ever. That thread is the decoder's, and a decoder
+/// thread that never returns is a radio that cannot be paused, stopped, or
+/// changed. Per-read rather than a total timeout: a broadcast never ends, so
+/// `Client::timeout` would cut off a healthy station mid-song.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The concrete reader the decoder gets. Spelled out because rodio's decoder
 /// wants a `Read + Seek` type, not a trait object.
 type RadioReader = IcyMetadataReader<StreamDownload<BoundedStorageProvider<MemoryStorageProvider>>>;
+
+/// What the audio thread is handed: a decoder, already built, with the
+/// visualizer's tap around it.
+///
+/// The decoder is built before the hand-off and not by the audio thread,
+/// because building one reads the first frames off the network and so takes as
+/// long as the station makes it take. See [`AudioCmd`].
+type RadioSource = TapSource<rodio::Decoder<RadioReader>>;
 
 /// How long a shutdown waits for the audio thread to confirm the device is
 /// closed. Long enough for a thread that is mid-command, short enough that a
@@ -75,12 +104,19 @@ const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// reach the one the client owns.
 static SHUTDOWN_HOOK: OnceLock<Sender<AudioCmd>> = OnceLock::new();
 
+/// A command for the audio thread.
+///
+/// Every one of these must be cheap to carry out. The thread that handles them
+/// is the only thing that can silence the radio, so anything it blocks on is
+/// time in which pause, stop and quit do nothing — which is why the decoder is
+/// built before [`AudioCmd::Play`] is sent, and why nothing here reads from the
+/// network.
 enum AudioCmd {
-    /// Play a connected stream. Carries the generation it was opened for, so a
-    /// station the user has already moved on from is dropped rather than
-    /// played over the one they chose instead.
+    /// Play a stream that is connected and decoding. Carries the generation it
+    /// was opened for, so a station the user has already moved on from is
+    /// dropped rather than played over the one they chose instead.
     Play {
-        reader: Box<RadioReader>,
+        source: Box<RadioSource>,
         generation: u64,
         volume: f32,
     },
@@ -94,6 +130,11 @@ enum AudioCmd {
 }
 
 /// Handle on the radio audio thread.
+///
+/// Cloneable, and every clone is the same thread: the client hands one to each
+/// station task it spawns, so connecting a station never holds up the command
+/// loop that has to be free to stop it.
+#[derive(Clone)]
 pub struct RadioPlayer {
     tx: Sender<AudioCmd>,
     /// The station's current track, as the server last announced it. Written
@@ -113,6 +154,15 @@ pub struct RadioPlayer {
     /// station" while this thread is still streaming one. Asking the UI whether
     /// to stop the audio is what let both engines play at once.
     live: Arc<AtomicBool>,
+    /// Whether the user has asked for silence, shared with the audio thread.
+    ///
+    /// A station takes seconds to connect, and the pause key works throughout
+    /// them — the deck is already drawn and already says the station is on. The
+    /// audio thread has no sink to pause over that window, so the intent is
+    /// recorded here instead and read when the stream finally arrives.
+    /// Without it, pausing a station that is still connecting was ignored and
+    /// the station started playing under a deck that said it was paused.
+    paused: Arc<AtomicBool>,
 }
 
 impl RadioPlayer {
@@ -124,9 +174,11 @@ impl RadioPlayer {
         let thread_tap = Arc::clone(&tap);
         let generation = Arc::new(AtomicU64::new(0));
         let thread_generation = Arc::clone(&generation);
+        let paused = Arc::new(AtomicBool::new(false));
+        let thread_paused = Arc::clone(&paused);
         std::thread::Builder::new()
             .name("spot-radio".to_string())
-            .spawn(move || audio_thread(rx, thread_tap, thread_generation))
+            .spawn(move || audio_thread(rx, thread_tap, thread_generation, thread_paused))
             .expect("failed to spawn the radio audio thread");
         // Only the first player ever registers, which is the only one there
         // is: `Client` builds exactly one and holds it for the session.
@@ -137,6 +189,7 @@ impl RadioPlayer {
             tap,
             generation,
             live: Arc::new(AtomicBool::new(false)),
+            paused,
         }
     }
 
@@ -155,15 +208,26 @@ impl RadioPlayer {
         Arc::clone(&self.title)
     }
 
-    /// Connect to `url` and start playing it.
+    /// Connect to `url`, decode it, and start playing it.
     ///
-    /// Returns once the stream is connected and prefetched, which is also when
-    /// the first audio is heard — so the caller can report a failure to the
-    /// user instead of leaving them looking at a station that is silently not
-    /// playing.
+    /// Returns once the first audio is heard — so the caller can report a
+    /// failure to the user instead of leaving them looking at a station that
+    /// is silently not playing. That takes seconds, so the caller must be a
+    /// task of its own and never a loop that has to answer a key in the
+    /// meantime.
+    ///
+    /// The connect and the decoder are both built here, on the caller's task
+    /// and on a blocking-pool thread, and only the finished source goes to the
+    /// audio thread. Building the decoder reads the station's first frames, so
+    /// doing it on the audio thread — which is what spot used to do — put a
+    /// network read in the middle of the loop that answers pause and stop.
     pub async fn play(&self, url: &str, volume_percent: u8) -> Result<()> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.title.lock() = None;
+        // A new station starts playing. Cleared here rather than on the
+        // hand-off so that a pause pressed while this one connects is still
+        // seen — the audio thread reads the flag when the stream arrives.
+        self.paused.store(false, Ordering::SeqCst);
         self.tap.clear();
 
         let reader = self.open(url).await?;
@@ -172,11 +236,24 @@ impl RadioPlayer {
         if self.generation.load(Ordering::SeqCst) != generation {
             return Ok(());
         }
-        // Marked live with the hand-off, not with the request: until the reader
-        // reaches the thread there is nothing playing to stop.
+
+        // `spawn_blocking`, because this reads the network and symphonia's
+        // probe gives no promise about how much it reads. On the worst kind of
+        // station it stops only when [`READ_TIMEOUT`] fires; a blocking-pool
+        // thread can wait that out, the audio thread cannot.
+        let tap = Arc::clone(&self.tap);
+        let source = tokio::task::spawn_blocking(move || decode(reader, tap))
+            .await
+            .context("the radio decoder thread panicked")??;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Ok(());
+        }
+
+        // Marked live with the hand-off, not with the request: until the
+        // source reaches the thread there is nothing playing to stop.
         self.live.store(true, Ordering::SeqCst);
         self.send(AudioCmd::Play {
-            reader: Box::new(reader),
+            source: Box::new(source),
             generation,
             volume: amplitude(volume_percent),
         });
@@ -191,8 +268,14 @@ impl RadioPlayer {
         // the server interleave track titles into the audio. It has to be on
         // the GET: many Icecast servers answer HEAD with an HTML page and no
         // icy headers at all, so probing separately would learn nothing.
+        //
+        // The timeouts are what keep a bad station from being permanent. See
+        // [`READ_TIMEOUT`]: without one, a server that goes quiet leaves a
+        // reader blocked with nothing to wake it.
         let client = IcyClient::builder()
             .request_icy_metadata()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .context("could not build the radio HTTP client")?;
         let stream = HttpStream::new(client, url)
@@ -229,11 +312,17 @@ impl RadioPlayer {
         ))
     }
 
+    /// Silence the stream, keeping the station.
+    ///
+    /// The flag is set as well as the command sent, because a station that is
+    /// still connecting has no sink to pause — see [`Self::paused`].
     pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
         self.send(AudioCmd::Pause);
     }
 
     pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
         self.send(AudioCmd::Resume);
     }
 
@@ -309,7 +398,17 @@ fn amplitude(percent: u8) -> f32 {
 }
 
 /// Owns the output device and the sink for as long as a station is playing.
-fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<AtomicU64>) {
+///
+/// Nothing in this loop may block on the network. It is the only thread that
+/// can silence the radio, and every command behind a blocked one is a control
+/// that does nothing until the block clears — which, before the timeouts and
+/// the move of the decoder off this thread, could be never.
+fn audio_thread(
+    rx: Receiver<AudioCmd>,
+    tap: Arc<AudioTap>,
+    generation: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
+) {
     // Opened on the first Play and dropped on Stop, so the device is held only
     // while it is in use.
     let mut out: Option<(OutputStream, Sink)> = None;
@@ -317,7 +416,7 @@ fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<Atom
     while let Ok(cmd) = rx.recv() {
         match cmd {
             AudioCmd::Play {
-                reader,
+                source,
                 generation: sent_at,
                 volume,
             } => {
@@ -328,9 +427,9 @@ fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<Atom
                 if generation.load(Ordering::SeqCst) != sent_at {
                     continue;
                 }
-                if let Err(e) = start(&mut out, *reader, volume, &tap) {
+                if let Err(e) = start(&mut out, *source, volume, &paused) {
                     log::error!("radio playback failed: {e:#}");
-                    out = None;
+                    silence(&mut out);
                     tap.clear();
                 }
             }
@@ -349,7 +448,7 @@ fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<Atom
                 }
             }
             AudioCmd::Stop => {
-                out = None;
+                silence(&mut out);
                 tap.clear();
             }
             AudioCmd::SetVolume(v) => {
@@ -360,7 +459,7 @@ fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<Atom
             AudioCmd::Shutdown(ack) => {
                 // Dropped before the ack, not after: the sender's contract is
                 // that the device is closed by the time it hears back.
-                drop(out);
+                silence(&mut out);
                 tap.clear();
                 let _ = ack.send(());
                 return;
@@ -369,14 +468,12 @@ fn audio_thread(rx: Receiver<AudioCmd>, tap: Arc<AudioTap>, generation: Arc<Atom
     }
 }
 
-fn start(
-    out: &mut Option<(OutputStream, Sink)>,
-    reader: RadioReader,
-    volume: f32,
-    tap: &Arc<AudioTap>,
-) -> Result<()> {
-    // Building the decoder reads the first frames to identify the codec, which
-    // is why the reader was prefetched before it got here.
+/// Build the decoder for a connected station.
+///
+/// Blocking, and unbounded but for [`READ_TIMEOUT`]: identifying the codec
+/// means reading the first frames, and how long that takes is the station's
+/// business. Runs on a blocking-pool thread — never on the audio thread.
+fn decode(reader: RadioReader, tap: Arc<AudioTap>) -> Result<RadioSource> {
     let decoder = rodio::Decoder::builder()
         .with_data(reader)
         // A broadcast has no beginning to seek back to. Saying so stops
@@ -384,7 +481,29 @@ fn start(
         .with_seekable(false)
         .build()
         .context("could not decode the station's audio")?;
+    Ok(TapSource::new(decoder, tap))
+}
 
+/// Silence the output and release the device.
+///
+/// The sink goes first and the stream second. Dropping the sink only sets a
+/// flag, so it always returns at once; closing the device waits on the audio
+/// backend, which is the slower of the two. In that order the radio is silent
+/// before anything that can wait, so a stalled backend cannot keep the sound
+/// on.
+fn silence(out: &mut Option<(OutputStream, Sink)>) {
+    if let Some((stream, sink)) = out.take() {
+        drop(sink);
+        drop(stream);
+    }
+}
+
+fn start(
+    out: &mut Option<(OutputStream, Sink)>,
+    source: RadioSource,
+    volume: f32,
+    paused: &Arc<AtomicBool>,
+) -> Result<()> {
     if out.is_none() {
         let mut stream = OutputStreamBuilder::open_default_stream()
             .context("could not open an audio output device")?;
@@ -395,13 +514,24 @@ fn start(
         let sink = Sink::connect_new(stream.mixer());
         *out = Some((stream, sink));
     }
-    let (_, sink) = out.as_ref().expect("the output was just opened");
+    let (stream, sink) = out.as_mut().expect("the output was just opened");
 
-    // Whatever was playing goes now, not when the new source runs out.
-    sink.clear();
+    // Whatever was playing goes now, not when the new source runs out — and it
+    // goes by being replaced rather than by `Sink::clear`. `clear` waits for
+    // the source it is discarding to end, and ending it means the mixer
+    // polling it once more; a station whose reads have stalled is never polled
+    // again and the wait never returns. Dropping the old sink asks nothing of
+    // the mixer: the source is marked stopped and collected in its own time.
+    *sink = Sink::connect_new(stream.mixer());
     sink.set_volume(volume);
-    sink.append(TapSource::new(decoder, Arc::clone(tap)));
-    sink.play();
+    sink.append(source);
+    // A pause pressed while this station was connecting had no sink to act on;
+    // this is where it lands.
+    if paused.load(Ordering::SeqCst) {
+        sink.pause();
+    } else {
+        sink.play();
+    }
     Ok(())
 }
 
@@ -504,6 +634,25 @@ mod tests {
 
         player.stop();
         assert!(!player.is_live(), "stop is what ends it");
+    }
+
+    /// A station takes seconds to connect, and the pause key works throughout
+    /// them. The audio thread has no sink to pause over that window, so the
+    /// intent has to be kept somewhere it can read when the stream lands —
+    /// otherwise the station starts playing under a deck that says paused.
+    #[test]
+    fn a_pause_before_the_stream_lands_is_remembered() {
+        let player = RadioPlayer::new(Arc::new(AudioTap::new()));
+        assert!(
+            !player.paused.load(Ordering::SeqCst),
+            "a fresh player plays"
+        );
+
+        player.pause();
+        assert!(player.paused.load(Ordering::SeqCst));
+
+        player.resume();
+        assert!(!player.paused.load(Ordering::SeqCst));
     }
 
     #[test]

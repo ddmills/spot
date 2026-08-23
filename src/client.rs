@@ -186,14 +186,23 @@ impl Client {
             // is on, the Spotify player is paused and driving it would start
             // Spotify playing underneath the stream.
             PlayPause if self.radio_live() => {
-                let mut st = self.state.write();
-                if let Some(r) = st.radio.as_mut() {
-                    r.is_playing = !r.is_playing;
-                    if r.is_playing {
-                        self.radio_player.resume();
-                    } else {
-                        self.radio_player.pause();
-                    }
+                let toggled = {
+                    let mut st = self.state.write();
+                    st.radio.as_mut().map(|r| {
+                        r.is_playing = !r.is_playing;
+                        r.is_playing
+                    })
+                };
+                match toggled {
+                    Some(true) => self.radio_player.resume(),
+                    Some(false) => self.radio_player.pause(),
+                    // A live engine with no deck to pause. A station change
+                    // that failed after an earlier station was playing leaves
+                    // exactly this, and the arm used to do nothing at all in
+                    // it — the play key stopped working and the stream could
+                    // only be ended by killing spot. There is no station on
+                    // screen to pause, so the key means stop.
+                    None => self.stop_radio(),
                 }
             }
             PlayPause => {
@@ -398,7 +407,7 @@ impl Client {
                 }
             }
             LoadRadio { scope } => self.load_radio(scope),
-            PlayStation(station) => self.play_station(*station).await,
+            PlayStation(station) => self.play_station(*station),
             StopRadio => self.stop_radio(),
             ToggleSavedStation(station) => self.toggle_saved_station(*station),
             YieldToRadio => self.yield_to_radio(),
@@ -849,7 +858,15 @@ impl Client {
     /// may decide which of them owns it. The player is paused rather than
     /// stopped: pausing is instant and local, and the queue stays where it
     /// was so stopping the stream puts the last track straight back.
-    async fn play_station(&mut self, station: state::Station) {
+    ///
+    /// The connecting is done on a task of its own, and this returns as soon as
+    /// the deck is drawn. Connecting takes seconds — a directory address to
+    /// resolve, a stream to reach and prefetch, a codec to identify — and
+    /// awaiting it here held the command loop for all of them. Pause, stop and
+    /// the next station all arrive on that loop, so a station that connected
+    /// slowly was a player that answered nothing, and one that never connected
+    /// was a player that never answered again.
+    fn play_station(&mut self, station: state::Station) {
         self.player.pause();
         let volume = self.playback_volume();
 
@@ -873,33 +890,57 @@ impl Client {
             }
         }
 
-        // The directory's ranking runs on these, and it also hands back the
-        // stream URL it believes in, which is fresher than the one in the row.
-        let url = self
-            .radio_api
-            .click(&station.uuid)
-            .await
-            .unwrap_or_else(|| station.url.clone());
+        let player = Arc::clone(&self.player);
+        let radio = self.radio_player.clone();
+        let api = self.radio_api.clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            // The directory's ranking runs on these, and it also hands back
+            // the stream URL it believes in, which is fresher than the one in
+            // the row.
+            let url = api
+                .click(&station.uuid)
+                .await
+                .unwrap_or_else(|| station.url.clone());
 
-        // Again, right before the stream starts: a load the player was still
-        // working through can start making sound after the pause above, and
-        // this is the last point before the stream at which to catch it.
-        self.player.pause();
-        if let Err(e) = self.radio_player.play(&url, volume).await {
-            log::error!("could not play {}: {e:#}", station.name);
-            let mut st = self.state.write();
-            st.radio = None;
-            st.toast(format!("could not play {}: {e}", station.name));
-            return;
-        }
-        // And once more now the station is audible. `play` above spends
-        // several seconds connecting and prefetching; anything that started
-        // during that window is caught on the far side of it — with
-        // `YieldToRadio` behind it as the backstop for anything later still.
-        self.player.pause();
-        self.state
-            .write()
-            .toast(format!("playing {}", station.name));
+            // Again, right before the stream starts: a load the player was
+            // still working through can start making sound after the pause
+            // above, and this is the last point before the stream at which to
+            // catch it.
+            player.pause();
+            let outcome = radio.play(&url, volume).await;
+            // Whether this task still speaks for the deck. Clicks can overlap
+            // now that this runs off the command loop, and an older one must
+            // not clear a newer one's station or stop its stream.
+            let ours = state
+                .read()
+                .radio
+                .as_ref()
+                .is_some_and(|r| r.station.uuid == station.uuid);
+            if let Err(e) = outcome {
+                log::error!("could not play {}: {e:#}", station.name);
+                if ours {
+                    // An earlier station may still be streaming: this one
+                    // never reached the audio thread, so nothing has replaced
+                    // it. Left alone it plays on under a deck that no longer
+                    // draws it, which is a stream with no control over it.
+                    radio.stop();
+                    let mut st = state.write();
+                    st.radio = None;
+                    st.toast(format!("could not play {}: {e}", station.name));
+                }
+                return;
+            }
+            // And once more now the station is audible. `play` above spends
+            // several seconds connecting and prefetching; anything that
+            // started during that window is caught on the far side of it —
+            // with `YieldToRadio` behind it as the backstop for anything later
+            // still.
+            player.pause();
+            if ours {
+                state.write().toast(format!("playing {}", station.name));
+            }
+        });
     }
 
     fn stop_radio(&self) {
@@ -1024,12 +1065,18 @@ impl Client {
     /// Every Spotify play path calls this, which is what keeps "only one engine
     /// at a time" true rather than merely intended.
     ///
-    /// The question is put to the radio player, not to `AppState.radio`. That
-    /// field is what the deck draws, and it can be cleared before the audio
-    /// thread has actually stopped streaming — reading it here is what once
-    /// let a station and a track play over each other.
+    /// The question goes to [`Self::radio_live`], which takes either sense of
+    /// "a station is on". `AppState.radio` alone is not enough: it can be
+    /// cleared before the audio thread has stopped streaming, and reading only
+    /// it here is what once let a station and a track play over each other.
     fn yield_to_spotify(&self) {
-        if self.radio_player.is_live() {
+        // Either sense of "on" counts, and a station that is only connecting
+        // counts most of all: stopping it is what cancels the connect. Asking
+        // the engine alone let a station the user had left behind finish
+        // connecting and start playing over the track they had just chosen —
+        // and `YieldToRadio`, seeing a live station, would then pause that
+        // track rather than the stream.
+        if self.radio_live() {
             self.stop_radio();
         }
     }
