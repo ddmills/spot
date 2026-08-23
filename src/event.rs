@@ -146,6 +146,7 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         {
             v.set_tab(tab);
             st.main_to_top();
+            let _ = tx.send(AppCommand::LoadArtistArt);
         }
         return;
     }
@@ -941,6 +942,7 @@ fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand
             let tab = tabs[((pos + delta).rem_euclid(n)) as usize];
             v.set_tab(tab);
             st.main_to_top();
+            let _ = tx.send(AppCommand::LoadArtistArt);
         }
         return;
     }
@@ -2891,9 +2893,12 @@ mod tests {
         let depth = st.view_stack.len();
 
         cycle_view_tab(&mut st, 1, &tx);
+        // Sleeves, and nothing else: the records are already in hand, and
+        // only the art of a group nobody opened was left unfetched.
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::LoadArtistArt)));
         assert!(
             rx.try_recv().is_err(),
-            "switching a group asked the network"
+            "switching a group asked for the records again"
         );
         assert_eq!(
             st.view_stack.len(),
@@ -2952,7 +2957,11 @@ mod tests {
         )];
 
         handle_click(&mut st, Position { x: 12, y: 18 }, &tx);
-        assert!(rx.try_recv().is_err(), "a group click asked the network");
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::LoadArtistArt)));
+        assert!(
+            rx.try_recv().is_err(),
+            "a group click asked for the records again"
+        );
         assert_eq!(
             st.main_index, 0,
             "the list stayed where the last tab left it"

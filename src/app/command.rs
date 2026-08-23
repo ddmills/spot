@@ -78,6 +78,18 @@ pub enum AppCommand {
         uri: String,
         name: String,
     },
+    /// Fetch the sleeves of the artist page's open album group.
+    ///
+    /// Sent when the group is switched. Opening the page fetches the art of
+    /// every group except **Appears On**, which is the one group that is not
+    /// the artist's own work, is often the longest, and is usually never
+    /// looked at — so its sleeves are asked for only once you open it.
+    ///
+    /// Carries nothing: the client reads the open group off the view it is
+    /// about to draw, so a page swapped out from under the command cannot be
+    /// fetched for.
+    LoadArtistArt,
+
     /// `R`: evict the current view from the track cache, re-fetch it, and
     /// reload your playlists.
     Refresh,

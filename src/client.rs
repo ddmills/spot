@@ -371,6 +371,7 @@ impl Client {
                 }
             }
             OpenArtist { id, uri, name } => self.load_artist_view(id, uri, name, false),
+            LoadArtistArt => self.load_artist_art(),
             Refresh => {
                 // Fresh playlists first: snapshot_ids are how playlist changes
                 // are detected.
@@ -1318,9 +1319,16 @@ impl Client {
                         v.retab();
                         // The photo first: it is the one image already on
                         // screen when the page lands, and the fetches run in
-                        // order. Then the tab you are looking at, then the
-                        // rest — every group came back in one pass, and the
-                        // sleeves of a tab nobody opened can wait.
+                        // order. Then the group you are looking at, then the
+                        // other groups — every one of them came back in the
+                        // same pass, so their sleeves cost nothing but time.
+                        //
+                        // Except Appears On. It is not the artist's own work,
+                        // it is often longer than everything else together,
+                        // and most of it is never looked at; fetching it here
+                        // would put a queue of other people's records in front
+                        // of the ones you came for. `LoadArtistArt` asks for
+                        // those sleeves if and when you open that group.
                         let open = v
                             .display
                             .iter()
@@ -1329,7 +1337,9 @@ impl Client {
                             .albums
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| !v.display.contains(i))
+                            .filter(|(i, a)| {
+                                !v.display.contains(i) && !ArtistTab::AppearsOn.holds(a)
+                            })
                             .filter_map(|(_, a)| a.cover_url.clone());
                         let art: Vec<String> = v
                             .image_url
@@ -1349,6 +1359,28 @@ impl Client {
             spawn_page_art(http, state.clone(), art, generation);
             spawn_liked_check(api, state, uris);
         });
+    }
+
+    /// Fetch the sleeves of the artist page's open album group.
+    ///
+    /// Every group but Appears On was fetched when the page loaded, so this is
+    /// a no-op for them — `spawn_page_art` drops the URLs it already holds.
+    /// Switching to Appears On is what finally asks for its sleeves, and
+    /// switching back into it later costs nothing.
+    fn load_artist_art(&self) {
+        let (urls, generation) = {
+            let st = self.state.read();
+            let MainView::Artist(v) = &st.main else {
+                return;
+            };
+            let urls: Vec<String> = v
+                .display
+                .iter()
+                .filter_map(|&i| v.albums[i].cover_url.clone())
+                .collect();
+            (urls, st.load_generation)
+        };
+        spawn_page_art(self.http.clone(), self.state.clone(), urls, generation);
     }
 
     /// Install `list` as the main view, serving it from the cache when the
