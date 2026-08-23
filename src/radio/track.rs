@@ -1,25 +1,44 @@
 //! Turning a station's ICY announcement into a Spotify track.
 //!
 //! A broadcast tells you what it is playing in one free-text field, and every
-//! broadcaster spells it differently. These are real `StreamTitle` values,
-//! sampled from the directory's top-voted stations:
+//! broadcaster spells it differently. These are real `StreamTitle` values, from
+//! a sweep of 384 stations in the directory:
 //!
 //! ```text
 //! Aspen - Seasick And Beer Drinking
 //! Zedd, Alessia Cara - Stay
 //! ERIC CLAPTON  -  Worried life blues
-//! Moby - Precious Mind (feat. India Carney)
+//! Craft Spells - Our Park By Night
 //! That Old Black Magic by The Hamburg Philharmonia Orchestra - Classic Vinyl on walmradio.com
-//! BING CROSBY, Georgie Stoll and His Orchestra - SAILOR BEWARE (78 RPM) | OTR on walmradio.com
+//! My Weapon (Sacred Version) by Natalie Grant - walmradio.com
+//! Glenn Miller - Chattanooga Choo Choo (78 RPM) | OTR on walmradio.com
+//! Jazz Lounge - Santana - Give Me Love
+//! Big R Radio - We’ll Be Right Back After This Message
 //! BBC World Service Online
 //! ```
 //!
-//! So splitting on the first `" - "` is wrong three times over: WALM appends
-//! its own branding after a dash on one channel and after a pipe on another,
-//! two of its channels write `Title by Artist` while a third writes the usual
-//! order, and the World Service announces no track at all. [`parse`] handles
-//! those and refuses the rest — a wrong guess here would go on to like the
-//! wrong record.
+//! So splitting on the first `" - "` is wrong many times over. WALM alone
+//! writes `Title by Artist` on three channels and the usual order on a fourth,
+//! and signs each off differently — after a dash, after a pipe, with or without
+//! an `on` in front of the address. Some stations put their own name in front
+//! of the record, some announce adverts and station idents in the same field,
+//! and `By` turns up inside perfectly ordinary song titles.
+//!
+//! [`parse`] reads what it can and refuses the rest. Refusing is the important
+//! half: a wrong guess here goes on to save a stranger's record to the user's
+//! library, so every rule below is written to fail closed. The rows that drove
+//! each one are pinned in this module's `parses_the_corpus` test.
+//!
+//! Two grammars in that sweep are deliberately **not** read, because failing to
+//! place them is harmless and the shapes are rare:
+//!
+//! ```text
+//! Highway To Hell~AC/DC~~1979~~206~2026-08-23T04:22:37~…   (2 stations)
+//! billy+oceanbilly+ocean+-+loverboy                        (3 stations)
+//! ```
+//!
+//! Both fall out as "no separator", so the deck shows the station's own words
+//! and no request is spent. They are seen and passed over, not missed.
 //!
 //! [`best_match`] is the second half of the job. Spotify will answer almost
 //! any query with something, so a returned track is not yet a match: it is
@@ -117,19 +136,29 @@ pub fn parse(raw: &str, station: &str) -> Option<Announcement> {
     if text.is_empty() {
         return None;
     }
+    let text = strip_station_prefix(&text, station);
 
-    // `Title by Artist`, as two of WALM's three channels write it. Tested per
-    // string rather than per station: their Old Time Radio channel writes the
-    // usual order, so the broadcaster is no guide.
-    let announced = match split_once_ci(&text, " by ") {
-        Some((title, artist)) => Announcement {
+    // The dash is tried *first*, and the order is load-bearing.
+    //
+    // `by` used to win, which tore apart every song whose title happens to
+    // contain the word: SomaFM's `Craft Spells - Our Park By Night` came out as
+    // artist "Night", title "Craft Spells - Our Park". Five songs in the sampled
+    // corpus hit that.
+    //
+    // Reading the dash first costs WALM nothing, which is the only broadcaster
+    // the `by` form was added for: its branding tail is stripped above, and
+    // what is left — `77 Sunset Strip by Skip Martin` — has no dash by the time
+    // the fallback is reached.
+    let announced = match first_split(&text) {
+        Some((artist, title)) => Announcement {
             artist: artist.trim().to_string(),
             title: title.trim().to_string(),
         },
-        // The usual order. Split on the *first* separator: a title with a dash
-        // in it is far more common than an artist with one.
+        // `Title by Artist`, as three of WALM's channels write it. Tested per
+        // string rather than per station: their Old Time Radio channel writes
+        // the usual order, so the broadcaster is no guide.
         None => {
-            let (artist, title) = first_split(&text)?;
+            let (title, artist) = split_once_ci(&text, " by ")?;
             Announcement {
                 artist: artist.trim().to_string(),
                 title: title.trim().to_string(),
@@ -201,10 +230,16 @@ fn strip_station_tail(text: &str, station: &str) -> String {
 /// the word in it.
 fn is_branding(segment: &str, station: &str) -> bool {
     let lower = segment.to_lowercase();
+    let trimmed = lower.trim();
     // `... on walmradio.com`.
-    if let Some((_, host)) = split_once_ci(&lower, " on ")
+    if let Some((_, host)) = split_once_ci(trimmed, " on ")
         && is_hostname(host.trim())
     {
+        return true;
+    }
+    // The bare address on its own, which is how WALM's other two channels sign
+    // off: `My Weapon (Sacred Version) by Natalie Grant - walmradio.com`.
+    if is_hostname(trimmed) {
         return true;
     }
     if lower.contains("http") || lower.contains("www.") {
@@ -212,8 +247,70 @@ fn is_branding(segment: &str, station: &str) -> bool {
     }
     // Exactly the station's name, and nothing more. `contains` here would take
     // `Smooth Jazz Nights` off a station called `Jazz`.
-    let station = station.trim().to_lowercase();
-    !station.is_empty() && lower.trim() == station
+    let station_lower = station.trim().to_lowercase();
+    if !station_lower.is_empty() && trimmed == station_lower {
+        return true;
+    }
+    // A short abbreviation of it — `| WALM2` on a station called `WALM 2 HD`.
+    // Length-capped because the folded prefix test alone is loose enough to
+    // swallow a real title if the station's name happens to start it.
+    trimmed.len() <= ABBREV_MAX && folds_alike(trimmed, station)
+}
+
+/// Longest tail segment still credible as a station abbreviation.
+const ABBREV_MAX: usize = 20;
+
+/// Fewest folded characters a name must have before a prefix test on it means
+/// anything. Two or three characters match far too much.
+const FOLD_MIN: usize = 4;
+
+/// Whether two names are the same name once spelling and spacing are set aside,
+/// allowing one to be a prefix of the other.
+///
+/// `WALM2` and `WALM 2 HD` fold to `walm2` and `walm2hd`; `Big R Radio` and
+/// `Big R Radio - 80s Metal FM` to `bigrradio` and `bigrradio80smetalfm`.
+fn folds_alike(a: &str, b: &str) -> bool {
+    let (a, b) = (fold_tight(a), fold_tight(b));
+    if a.len() < FOLD_MIN || b.len() < FOLD_MIN {
+        return false;
+    }
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
+/// Lowercase, and drop everything that is not alphanumeric — spaces included.
+fn fold_tight(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+/// Drop a leading `<station> - ` prefix, but only when a record survives it.
+///
+/// Some stations put their own name in front of the record: `Jazz Lounge` sends
+/// `Jazz Lounge - Santana - Give Me Love`, which otherwise parses as an artist
+/// called Jazz Lounge.
+///
+/// The "another separator remains" guard is the whole point of this function
+/// and must not be dropped as redundant. Stations named after the act they play
+/// exist — the sampled corpus contains one called `Michael Jackson music star` —
+/// and without the guard its perfectly good `Michael Jackson - Bad` would be cut
+/// down to a bare `Bad` with the artist thrown away. Requiring a second
+/// separator means the prefix is only removed when there is still a whole
+/// `Artist - Title` behind it.
+fn strip_station_prefix(text: &str, station: &str) -> String {
+    let Some((head, rest)) = first_split(text) else {
+        return text.to_string();
+    };
+    if !folds_alike(head.trim(), station) {
+        return text.to_string();
+    }
+    // Nothing but an artist would be left. Leave it alone; `is_plausible` is
+    // what refuses an ident, and it can tell more about one than this can.
+    if first_split(rest).is_none() {
+        return text.to_string();
+    }
+    rest.trim().to_string()
 }
 
 /// Whether `s` looks like a bare hostname.
@@ -262,12 +359,38 @@ fn is_plausible(a: &Announcement, station: &str) -> bool {
     if a.artist.is_empty() || a.title.is_empty() {
         return false;
     }
+    // `ANTENA 1 - ANTENA 1`: a station saying its own name twice, not a record
+    // that happens to be self-titled — those are announced once as the artist
+    // and once as a real title, and fold differently.
+    if fold_tight(&a.artist) == fold_tight(&a.title) {
+        return false;
+    }
+    // An advert, announced in the artist's place:
+    // `shionogi.com - ... schon fast die Hälfte geschafft ...`
+    if is_hostname(a.artist.trim()) {
+        return false;
+    }
     for field in [&a.artist, &a.title] {
         let lower = field.to_lowercase();
         if lower.contains("http") || lower.contains("://") || lower.contains("www.") {
             return false;
         }
+        // Whole-string only, deliberately: a record called "Unknown" exists,
+        // and refusing it because a substring matched would be worse than the
+        // occasional wasted search. Phrases that can only be the station
+        // talking go in `AD_PHRASES` below instead.
         if JUNK.contains(&lower.as_str()) {
+            return false;
+        }
+        if AD_PHRASES.iter().any(|p| lower.contains(p)) {
+            return false;
+        }
+        // Nothing in it a search could match on: `STUDIA AIR - @@`.
+        if !field.chars().any(char::is_alphanumeric) {
+            return false;
+        }
+        // A stream that has dropped, not a record: `Shonan Beach FM - offline`.
+        if lower.trim() == "offline" {
             return false;
         }
         let station = station.trim().to_lowercase();
@@ -275,8 +398,32 @@ fn is_plausible(a: &Announcement, station: &str) -> bool {
             return false;
         }
     }
+    // A production cue billed as the performer — `Jingle 6 - Siempre en tu
+    // corazon`, `i JINGLE – Уверенный – …`. Tested on the artist only, and as a
+    // whole word: "Jingle Bells" is a real record every December, but nobody is
+    // credited as its artist.
+    if a.artist
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == "jingle")
+    {
+        return false;
+    }
     true
 }
+
+/// Phrases that can only be the station talking over itself.
+///
+/// Matched as substrings, unlike [`JUNK`], so each one has to be long enough
+/// that no record could carry it by accident.
+const AD_PHRASES: &[&str] = &[
+    "we'll be right back",
+    "we’ll be right back",
+    "right back after",
+    "this station will continue",
+    "commercial break",
+    "advertisement",
+];
 
 /// Drop a trailing `(...)` or `[...]` annotation.
 fn strip_annotation(title: &str) -> String {
@@ -514,46 +661,117 @@ mod tests {
         }
     }
 
-    /// Every one of these is a real `StreamTitle`, sampled from the
-    /// directory's top-voted stations. They are the whole reason this module
-    /// is not a call to `split_once(" - ")`.
+    /// The corpus.
+    ///
+    /// Every `raw` below is a real `StreamTitle`, captured from a sweep of 384
+    /// stations in the Radio Browser directory — 290 announcements from the 199
+    /// of them that announce at all. They are the whole reason this module is
+    /// not a call to `split_once(" - ")`, and they are kept as a table so the
+    /// next format surprise arrives as a failing test rather than as a record
+    /// quietly liked under the wrong name.
+    ///
+    /// One row is marked SYNTHETIC: a real station, but an announcement written
+    /// by hand, because the shape it guards was not playing during the sweep.
     #[test]
-    fn parses_what_real_stations_actually_send() {
+    fn parses_the_corpus() {
         let cases: &[(&str, &str, Option<Announcement>)] = &[
+            // -- the ordinary case, across scripts and credit styles --------
             (
                 "Aspen - Seasick And Beer Drinking",
-                "Groove Salad",
+                "SomaFM Groove Salad (128k MP3)",
                 ann("Aspen", "Seasick And Beer Drinking"),
-            ),
-            (
-                "Human League - Do Or Die",
-                "Underground 80s",
-                ann("Human League", "Do Or Die"),
             ),
             (
                 "Zedd, Alessia Cara - Stay",
                 "MANGORADIO",
                 ann("Zedd, Alessia Cara", "Stay"),
             ),
-            // Doubled spaces around the dash: not a separator until the string
-            // has been normalized.
+            (
+                "Justin Bieber feat. Nicki Minaj - Beauty And A Beat",
+                "Capital FM London",
+                ann("Justin Bieber feat. Nicki Minaj", "Beauty And A Beat"),
+            ),
+            (
+                "Ella Fitzgerald & Louis Armstrong - Moonlight In Vermont",
+                "Abaco Libros y Cafe Jazz",
+                ann("Ella Fitzgerald & Louis Armstrong", "Moonlight In Vermont"),
+            ),
+            (
+                "Браво - Держись, Пижон",
+                "Наше Радио",
+                ann("Браво", "Держись, Пижон"),
+            ),
+            (
+                "Hitsujibungaku - Eien no Blue",
+                "J-Rock Powerplay(Asia DREAM Radio)",
+                ann("Hitsujibungaku", "Eien no Blue"),
+            ),
+            (
+                "Alena Omargalieva - Зійшла зоря",
+                "Хіт FM Сучасні хіти",
+                ann("Alena Omargalieva", "Зійшла зоря"),
+            ),
+            // Doubled spaces around the dash: not a separator until normalized.
             (
                 "ERIC CLAPTON  -  Worried life blues",
                 "Jazz Radio Blues",
                 ann("ERIC CLAPTON", "Worried life blues"),
+            ),
+            // Trailing space, and a backtick doing an apostrophe's job.
+            (
+                "Fat Joe - What`s Luv? (Extra Clean) ",
+                "181.FM - Old School HipHop/RnB",
+                ann("Fat Joe", "What`s Luv? (Extra Clean)"),
             ),
             (
                 "Steve Cole - With You All The Way ",
                 "101 SMOOTH JAZZ",
                 ann("Steve Cole", "With You All The Way"),
             ),
-            // The credit is kept: Spotify names it the same way.
+            // Annotations are kept — Spotify usually names them the same way,
+            // and `trimmed_query` is what tries it without them.
             (
                 "Moby - Precious Mind (feat. India Carney)",
-                "Radio Paradise",
+                "Radio Paradise Main Mix (EU) 320k AAC",
                 ann("Moby", "Precious Mind (feat. India Carney)"),
             ),
-            // `Title by Artist`, with the branding after a dash.
+            (
+                "Rick Astley - Take Me to Your Heart [Xq]",
+                "Bons Tempos FM",
+                ann("Rick Astley", "Take Me to Your Heart [Xq]"),
+            ),
+            // -- ` by ` must not beat the dash ------------------------------
+            //
+            // The defect this table exists for. "By" inside a title used to
+            // split the string on the wrong word: this row came out as artist
+            // "Night", title "Craft Spells - Our Park".
+            (
+                "Craft Spells - Our Park By Night",
+                "SomaFM PopTron (128k MP3)",
+                ann("Craft Spells", "Our Park By Night"),
+            ),
+            (
+                "Nocturnal Animals Music - Nocturnal Animals 004 \
+                 (mixed by Andrea Ribeca & RAM) [Repeat]",
+                "DiscoverTranceRadio (MP3 HQ stereo 192kBit/s)",
+                ann(
+                    "Nocturnal Animals Music",
+                    "Nocturnal Animals 004 (mixed by Andrea Ribeca & RAM) [Repeat]",
+                ),
+            ),
+            (
+                "Ken  Sekiguchi - MOON MISSION RECORDINGS SHOW  VOL.34 by Ken Sekiguchi for MMR",
+                "Moon Mission Recordings",
+                ann(
+                    "Ken Sekiguchi",
+                    "MOON MISSION RECORDINGS SHOW VOL.34 by Ken Sekiguchi for MMR",
+                ),
+            ),
+            // -- WALM, whose four channels exercise every tail rule ---------
+            //
+            // `Title by Artist` with branding after a dash. The dash is gone by
+            // the time the `by` fallback runs, which is what lets the two rules
+            // coexist in that order.
             (
                 "That Old Black Magic by The Hamburg Philharmonia Orchestra \
                  - Classic Vinyl on walmradio.com",
@@ -561,11 +779,22 @@ mod tests {
                 ann("The Hamburg Philharmonia Orchestra", "That Old Black Magic"),
             ),
             (
-                "GBT by Harald Haerter - Adroit Jazz Underground on walmradio.com",
+                "Ron Jack by Jacques Schwarz-Bart - Adroit Jazz Underground on walmradio.com",
                 "Adroit Jazz Underground",
-                ann("Harald Haerter", "GBT"),
+                ann("Jacques Schwarz-Bart", "Ron Jack"),
             ),
-            // Same broadcaster, usual order, branding after a pipe.
+            // A bare address as the tail, with no `on` in front of it.
+            (
+                "My Weapon (Sacred Version) by Natalie Grant - walmradio.com",
+                "WALM HD",
+                ann("Natalie Grant", "My Weapon (Sacred Version)"),
+            ),
+            // Usual order, branding after a pipe.
+            (
+                "Glenn Miller - Chattanooga Choo Choo (78 RPM) | OTR on walmradio.com",
+                "WALM - Old Time Radio",
+                ann("Glenn Miller", "Chattanooga Choo Choo (78 RPM)"),
+            ),
             (
                 "BING CROSBY, Georgie Stoll and His Orchestra - SAILOR BEWARE (78 RPM) \
                  | OTR on walmradio.com",
@@ -575,10 +804,120 @@ mod tests {
                     "SAILOR BEWARE (78 RPM)",
                 ),
             ),
-            // An ident, not a song. No separator anywhere in it.
+            // -- a leading station name -------------------------------------
+            //
+            // Dropped, because a whole `Artist - Title` survives it.
+            (
+                "Jazz Lounge - Santana - Give Me Love",
+                "Jazz Lounge",
+                ann("Santana", "Give Me Love"),
+            ),
+            // SYNTHETIC, and the guard on the rule above. Stations named after
+            // the act they play exist, and the sweep found one. Dropping the
+            // prefix here would throw the artist away and leave a bare "Bad",
+            // so the rule must not fire when nothing but a title would remain.
+            (
+                "Michael Jackson - Bad",
+                "Michael Jackson music star",
+                ann("Michael Jackson", "Bad"),
+            ),
+            // The same station as the advert row below, announcing a real
+            // record: the prefix rule must not fire on every row of a station
+            // whose name it happens to match.
+            (
+                "Junkyard - Hollywood ",
+                "Big R Radio - 80s Metal FM",
+                ann("Junkyard", "Hollywood"),
+            ),
+            // -- separators --------------------------------------------------
+            //
+            // A hyphen inside a name is not one; the forms carry their spaces.
+            ("Jay-Z - Big Pimpin'", "Hot 97", ann("Jay-Z", "Big Pimpin'")),
+            ("Björk – Jóga", "Rás 2", ann("Björk", "Jóga")),
+            // The first separator splits it, so a dash in a title survives.
+            (
+                "Ishq - Orchid - Arc",
+                "Cryosleep",
+                ann("Ishq", "Orchid - Arc"),
+            ),
+            // `on <something>` is branding only when the something is a host.
+            (
+                "Duke Ellington - Live on N.Y.C.",
+                "Adroit Jazz Underground",
+                ann("Duke Ellington", "Live on N.Y.C."),
+            ),
+            // A short station name must not swallow every tail containing it.
+            (
+                "Norah Jones - Smooth Jazz Nights",
+                "Jazz",
+                ann("Norah Jones", "Smooth Jazz Nights"),
+            ),
+            // A tail that really is only the station's name still goes.
+            (
+                "Norah Jones - Come Away With Me - Adroit Jazz",
+                "Adroit Jazz",
+                ann("Norah Jones", "Come Away With Me"),
+            ),
+            // -- rejected: none of these is a record -------------------------
+            //
+            // Idents. Well-formed, and not songs.
             ("BBC World Service Online", "BBC World Service", None),
+            ("Leading Britain", "LBC Radio", None),
+            ("Radio 105", "Radio 105 Network", None),
+            ("radiovanya.ru", "РАДИО ВАНЯ", None),
+            ("Unknown", "Super Radio Tupi 96.5", None),
             ("", "Dance Wave!", None),
             ("   ", "Dance Wave!", None),
+            // The station saying its own name twice.
+            ("ANTENA 1 - ANTENA 1", "Antena 1 FM 94.7 São Paulo", None),
+            // An advert, with the advertiser billed as the artist.
+            (
+                "shionogi.com - ...  schon fast die Hälfte geschafft ...",
+                "MANGORADIO",
+                None,
+            ),
+            // The station talking over itself.
+            (
+                "Big R Radio - We’ll Be Right Back After This Message",
+                "Big R Radio - 80s Metal FM",
+                None,
+            ),
+            (
+                "THIS STATION WILL CONTINUE AFTER THIS BREAK",
+                "Hard Rock Heaven",
+                None,
+            ),
+            // A production cue billed as the performer.
+            (
+                "Jingle 6 - Siempre en tu corazon",
+                "Súper Tokio Radio",
+                None,
+            ),
+            (
+                "i JINGLE – Уверенный – ПРОВЕРЕНО ВРЕМЕНЕМ – 2 - 125 Bpm Gm",
+                "Наше Радио",
+                None,
+            ),
+            // A dropped stream.
+            ("Airtime - offline", "FM世田谷", None),
+            ("Shonan Beach FM - offline", "Shonan Beach FM 78.9", None),
+            // Nothing a search could match on.
+            ("STUDIA AIR - @@", "Люкс FМ 103.1", None),
+            (" - ", "Дорожное радио", None),
+            // Grammars this module deliberately does not read — see the module
+            // doc. They fail safe: the deck shows the station's own words and
+            // no request is spent. Pinned so the decision stays visible.
+            (
+                "Highway To Hell~AC/DC~~1979~~206~2026-08-23T04:22:37\
+                 ~2026-08-23T04:23:08~Virgin Radio Classic Rock~31.51~97ca811b",
+                "Virgin Radio Classic Rock",
+                None,
+            ),
+            (
+                "billy+oceanbilly+ocean+-+loverboy",
+                "Free FM 80 Tokyo",
+                None,
+            ),
         ];
         for (raw, station, want) in cases {
             assert_eq!(parse(raw, station).as_ref(), want.as_ref(), "{raw:?}");
@@ -600,30 +939,6 @@ mod tests {
         ] {
             assert_eq!(parse(raw, station), None, "{raw:?}");
         }
-    }
-
-    /// A hyphen inside a name is not a separator — the separators carry their
-    /// spaces for exactly this reason.
-    #[test]
-    fn a_hyphenated_name_is_not_a_separator() {
-        assert_eq!(
-            parse("Jay-Z - Big Pimpin'", "Hot 97"),
-            ann("Jay-Z", "Big Pimpin'")
-        );
-    }
-
-    /// The first separator wins, so a title containing a dash survives whole.
-    #[test]
-    fn the_first_separator_splits_it() {
-        assert_eq!(
-            parse("Emerson, Lake & Palmer - Fanfare - Reprise", "Prog FM"),
-            ann("Emerson, Lake & Palmer", "Fanfare - Reprise")
-        );
-    }
-
-    #[test]
-    fn an_en_dash_separates_too() {
-        assert_eq!(parse("Björk – Jóga", "Rás 2"), ann("Björk", "Jóga"));
     }
 
     #[test]
@@ -843,10 +1158,14 @@ mod tests {
                 "https://ice1.somafm.com/groovesalad-128-mp3",
                 "Groove Salad",
             ),
+            // Two WALM channels, because they sign off differently: this one
+            // with `- Classic Vinyl on walmradio.com`, the next with a bare
+            // `- walmradio.com`. Between them they exercise both tail rules.
             (
                 "https://icecast.walmradio.com:8443/classic",
                 "Classic Vinyl HD",
             ),
+            ("https://icecast.walmradio.com:8443/walm", "WALM HD"),
         ] {
             let player = RadioPlayer::new(Arc::new(AudioTap::new()));
             player.play(url, 0).await.expect("the station should play");
@@ -859,33 +1178,6 @@ mod tests {
             println!("{station}: {raw:?} -> {parsed:?}");
             assert!(parsed.is_some(), "{station} announced {raw:?}, unparsed");
         }
-    }
-
-    /// The tail stripper must not eat part of a song. Both of these look like
-    /// branding at a glance and are not.
-    #[test]
-    fn a_title_is_not_mistaken_for_the_stations_branding() {
-        assert_eq!(
-            parse("Duke Ellington - Live on N.Y.C.", "Adroit Jazz"),
-            ann("Duke Ellington", "Live on N.Y.C.")
-        );
-        // A short station name must not swallow every tail containing it.
-        assert_eq!(
-            parse("Norah Jones - Smooth Jazz Nights", "Jazz"),
-            ann("Norah Jones", "Smooth Jazz Nights")
-        );
-    }
-
-    /// But a tail that really is only the station's name still goes.
-    #[test]
-    fn a_tail_that_is_only_the_station_name_is_stripped() {
-        assert_eq!(
-            parse(
-                "Norah Jones - Come Away With Me - Adroit Jazz",
-                "Adroit Jazz"
-            ),
-            ann("Norah Jones", "Come Away With Me")
-        );
     }
 
     #[test]

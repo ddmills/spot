@@ -149,14 +149,21 @@ saving it to your library, and `b` / `B` opening its album or artist page. The s
 playing throughout; none of those touch the audio device. The station's name moves to the
 bottom row of the deck, where the queue is named for a Spotify track.
 
-spot will not guess. Stations spell their announcements every which way — `Artist - Title`
-mostly, but also `Title by Artist`, with the station's own branding glued on after a dash or
-a pipe — and an ident like `BBC World Service Online` is not a song at all. What can't be
-read as a record is shown as the station wrote it, and no search is spent on it. What can be
-read but not confidently matched is also shown as-is: it simply has nothing behind it. Only
-an announcement that agrees with a Spotify record on *both* the title and the artist becomes
-a link you can act on, because the cost of getting that wrong is a stranger's song saved to
-your library.
+spot will not guess. The rules come from a sweep of 384 stations, because announcements are
+spelled every which way: `Artist - Title` mostly, but also `Title by Artist`, with the
+station's branding glued on after a dash or a pipe, or its name put in front of the record.
+Plenty of what arrives in that field isn't music at all — station idents, adverts with the
+advertiser billed as the artist, jingles, ad-break messages, `offline` markers.
+
+What can't be read as a record is shown exactly as the station wrote it, and no search is
+spent on it. What can be read but not confidently matched is also shown as-is: it simply has
+nothing behind it. Only an announcement that agrees with a Spotify record on *both* the
+title and the artist becomes a link you can act on, because the cost of getting that wrong
+is a stranger's song saved to your library.
+
+A couple of stations use formats spot doesn't read — a tilde-delimited record, a
+plus-encoded one. Those fall through to "shown as the station wrote it", which is the same
+place an unmatched announcement lands.
 
 Stations that stream over **HLS** are listed and marked, but spot can't play them yet —
 that is around 6% of the directory, and it does include most BBC and national-broadcaster
