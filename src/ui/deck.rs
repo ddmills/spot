@@ -23,7 +23,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::table::{
-    art_w, draw_art, draw_volume, fit, link, meter, right_row, segment, state_spans, width,
+    art_w, draw_art, draw_volume, fit, link, loading_spans, meter, right_row, segment, state_spans,
+    width,
 };
 use super::theme;
 use crate::app::state::{HitAreas, PlaybackSnapshot, RadioPlayback, TrackList, format_duration};
@@ -163,9 +164,17 @@ pub fn masthead(
             vec![vec![Span::styled(label, style)]],
         )[0];
     }
-    let title = match note {
-        Note::Show => format!("♫ {}", pb.track_name),
-        Note::Hide => pb.track_name.clone(),
+    // A play in flight that named no track — the header's ▶ on a context, where
+    // Spotify picks which record starts. There is nothing honest to put here
+    // until the poll answers, and a bare `♫` with nothing after it reads as a
+    // rendering fault rather than as a title that has not arrived. The poll is
+    // the only other thing that writes the name, and it always writes one, so
+    // an empty one can only mean this.
+    let loading = pb.track_name.is_empty();
+    let title = match (loading, note) {
+        (true, _) => "loading…".to_string(),
+        (false, Note::Show) => format!("♫ {}", pb.track_name),
+        (false, Note::Hide) => pb.track_name.clone(),
     };
     // One cell of daylight between the title and the control, so a title that
     // runs the full width ends in an ellipsis rather than against the pill.
@@ -174,11 +183,15 @@ pub fn masthead(
     } else {
         title_row.width.saturating_sub(hit.like_btn.width + 1)
     };
+    // A placeholder is not a title: dim and unbolded, so it recedes rather than
+    // sitting where a record's name will be in the loudest weight on the deck.
+    let title_style = if loading {
+        theme::dim()
+    } else {
+        theme::accent().add_modifier(Modifier::BOLD)
+    };
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            fit(&title, title_w as usize),
-            theme::accent().add_modifier(Modifier::BOLD),
-        )),
+        Paragraph::new(Line::styled(fit(&title, title_w as usize), title_style)),
         Rect {
             width: title_w,
             ..title_row
@@ -481,10 +494,15 @@ pub fn progress(frame: &mut Frame, row: Rect, pb: &PlaybackSnapshot, hit: &mut H
 /// otherwise paint next over it — and one too narrow to clear them both drops
 /// the pill rather than colliding with it. Records `hit.prev_btn`,
 /// `hit.play_btn` and `hit.next_btn`.
+///
+/// `pending` is a play that has been asked for and not started; the pill says
+/// so and stops being a control for as long as it lasts — see
+/// [`super::table::loading_spans`].
 pub fn transport(
     frame: &mut Frame,
     row: Rect,
     pb: &PlaybackSnapshot,
+    pending: bool,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -503,7 +521,11 @@ pub fn transport(
     // Centred on the row rather than between the two buttons: they are of
     // different widths, and a pill centred between them would not line up with
     // the middle of the progress track above it.
-    let pill = state_spans(pb.is_playing);
+    let pill = if pending {
+        loading_spans()
+    } else {
+        state_spans(pb.is_playing)
+    };
     let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
     let edges = (width(PREV_LABEL) + width(NEXT_LABEL)) as u16;
     if row.width >= edges + pill_w + 2 {
@@ -514,7 +536,14 @@ pub fn transport(
         };
         let mut spans = Vec::new();
         let mut x = seg.x;
-        hit.play_btn = segment(&mut spans, &mut x, row, mouse, pill);
+        // Drawn without `segment` while loading: it is a word, not a button,
+        // and it must not light up under the pointer or take a click meant for
+        // the play it is already doing. `hit.play_btn` stays empty.
+        if pending {
+            spans.extend(pill);
+        } else {
+            hit.play_btn = segment(&mut spans, &mut x, row, mouse, pill);
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), seg);
     }
 
@@ -700,6 +729,23 @@ mod tests {
         assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
     }
 
+    /// A play that named no track — the header's ▶ on a context, where Spotify
+    /// picks the record. A bare `♫` with nothing after it would read as a
+    /// rendering fault rather than as a name that has not arrived.
+    #[test]
+    fn a_nameless_play_says_loading_rather_than_a_stray_note() {
+        let mut pb = snapshot();
+        pb.track_name = String::new();
+        let (lines, _, buffer) = render(80, 2, |f, a, h| {
+            masthead(f, a, &pb, Note::Show, None, None, h)
+        });
+        assert!(lines[0].starts_with("loading…"), "{:?}", lines[0]);
+        assert!(!lines[0].contains('♫'), "{:?}", lines[0]);
+        // Dim, so a placeholder does not sit where a title will be in the
+        // loudest weight on the deck.
+        assert_eq!(buffer.cell(Position { x: 0, y: 0 }).unwrap().fg, theme::DIM);
+    }
+
     /// The control holds the right end of the title row, says which way it would
     /// go, and keeps one width in both states so nothing under the cursor
     /// moves when it flips.
@@ -836,7 +882,7 @@ mod tests {
     #[test]
     fn the_transport_pushes_its_buttons_to_the_edges() {
         let pb = snapshot();
-        let (lines, hit, buffer) = render(60, 1, |f, a, h| transport(f, a, &pb, None, h));
+        let (lines, hit, buffer) = render(60, 1, |f, a, h| transport(f, a, &pb, false, None, h));
         assert!(lines[0].contains("◂◂ previous") && lines[0].contains("▸▸ next"));
         assert_eq!(hit.prev_btn.x, 0);
         assert_eq!(hit.next_btn.right(), 60);
@@ -854,13 +900,39 @@ mod tests {
         assert_ne!(fg(hit.play_btn.x + 1), theme::TEXT);
     }
 
+    /// A play asked for and not started. The pill names what a click does, so
+    /// left alone it would offer `▶ play` on a track that is already starting,
+    /// under a `● LOADING` in the corner saying exactly that. It says what is
+    /// happening instead, and stops being a control while it does.
+    #[test]
+    fn the_pill_says_loading_while_a_play_is_in_flight() {
+        let mut pb = snapshot();
+        pb.is_playing = false;
+        let (lines, hit, buffer) = render(60, 1, |f, a, h| transport(f, a, &pb, true, None, h));
+        assert!(lines[0].contains("⋯ load"), "{:?}", lines[0]);
+        assert!(!lines[0].contains("play"), "{:?}", lines[0]);
+        assert!(
+            hit.play_btn.is_empty(),
+            "a click must not land on a play already happening"
+        );
+        // The buttons either side are untouched — only the middle is waiting.
+        assert_eq!(hit.prev_btn.x, 0);
+        assert_eq!(hit.next_btn.right(), 60);
+        // In the same colour the status pill uses for something in flight.
+        let at = lines[0].find('⋯').expect("the mark is on the row") as u16;
+        assert_eq!(
+            buffer.cell(Position { x: at, y: 0 }).unwrap().fg,
+            theme::WARN
+        );
+    }
+
     /// Too narrow for both, previous keeps the row — `right_row` would
     /// otherwise paint next straight over it — and the pill goes first, rather
     /// than colliding with the buttons it sits between.
     #[test]
     fn a_narrow_transport_keeps_previous_alone() {
         let pb = snapshot();
-        let (lines, hit, _) = render(18, 1, |f, a, h| transport(f, a, &pb, None, h));
+        let (lines, hit, _) = render(18, 1, |f, a, h| transport(f, a, &pb, false, None, h));
         assert!(lines[0].contains("◂◂ previous"), "{:?}", lines[0]);
         assert!(!lines[0].contains("next"), "{:?}", lines[0]);
         assert!(!lines[0].contains("playing"), "{:?}", lines[0]);
@@ -917,7 +989,7 @@ mod tests {
                 let a = Rect { width, ..a };
                 masthead(f, a, &pb, Note::Show, Some(true), None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, h);
-                transport(f, Rect { height: 1, ..a }, &pb, None, h);
+                transport(f, Rect { height: 1, ..a }, &pb, false, None, h);
                 context_row(f, Rect { height: 1, ..a }, &pb, Some(&q), None, h);
             });
         }

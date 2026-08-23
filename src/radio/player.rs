@@ -22,7 +22,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -89,6 +89,15 @@ pub struct RadioPlayer {
     /// Bumped on every play and stop. A connection that completes after its
     /// generation has passed is discarded.
     generation: Arc<AtomicU64>,
+    /// Whether a stream has been handed to the audio thread and not stopped.
+    ///
+    /// The engine's own liveness, deliberately not read off
+    /// `AppState.radio`. That field is a UI fact — the event layer clears it on
+    /// the click that starts a track, so the deck stops drawing a station that
+    /// is going away — and for one turn of the command channel it says "no
+    /// station" while this thread is still streaming one. Asking the UI whether
+    /// to stop the audio is what let both engines play at once.
+    live: Arc<AtomicBool>,
 }
 
 impl RadioPlayer {
@@ -109,7 +118,17 @@ impl RadioPlayer {
             title: Arc::new(Mutex::new(None)),
             tap,
             generation,
+            live: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether this thread is streaming a station.
+    ///
+    /// True from the moment a connected stream is handed to the audio thread
+    /// until [`Self::stop`]. See [`Self::live`] for why the caller must ask
+    /// here rather than looking at `AppState.radio`.
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
     }
 
     /// The shared now-playing slot. Cloned into `AppState` so the deck can read
@@ -135,6 +154,9 @@ impl RadioPlayer {
         if self.generation.load(Ordering::SeqCst) != generation {
             return Ok(());
         }
+        // Marked live with the hand-off, not with the request: until the reader
+        // reaches the thread there is nothing playing to stop.
+        self.live.store(true, Ordering::SeqCst);
         self.send(AudioCmd::Play {
             reader: Box::new(reader),
             generation,
@@ -203,6 +225,7 @@ impl RadioPlayer {
     /// never reaches the sink.
     pub fn stop(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.live.store(false, Ordering::SeqCst);
         *self.title.lock() = None;
         self.send(AudioCmd::Stop);
     }
@@ -400,6 +423,27 @@ impl<S: Source> Source for TapSource<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Liveness is the engine's own, not a reading of `AppState.radio`.
+    ///
+    /// The two say different things for the turn of the command channel between
+    /// a track being clicked — where the event layer clears `AppState.radio` so
+    /// the deck stops drawing the station at once — and the client getting to
+    /// the play. `yield_to_spotify` asked the UI over that window and so never
+    /// stopped the stream, and both engines played at once.
+    #[test]
+    fn liveness_follows_the_stream_not_the_ui() {
+        let player = RadioPlayer::new(Arc::new(AudioTap::new()));
+        assert!(!player.is_live(), "nothing has been handed to the thread");
+
+        // Stand in for a connected stream reaching the audio thread; `play`
+        // itself needs a network and a device.
+        player.live.store(true, Ordering::SeqCst);
+        assert!(player.is_live());
+
+        player.stop();
+        assert!(!player.is_live(), "stop is what ends it");
+    }
 
     #[test]
     fn volume_is_cubic_and_clamped() {

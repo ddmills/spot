@@ -37,6 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // written.
     let AppState {
         playback,
+        pending_play,
         radio,
         queue,
         toast,
@@ -47,6 +48,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..
     } = state;
     let mouse = *mouse_pos;
+    let pending = pending_play.is_some();
     let cover = cover.as_deref();
     if area.height == 0 || area.width == 0 {
         return;
@@ -168,6 +170,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ..text
         },
         pb,
+        pending,
         mouse,
         hit,
     );

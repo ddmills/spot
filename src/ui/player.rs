@@ -254,6 +254,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // and the visualizer's smoothing state are written.
     let AppState {
         playback,
+        pending_play,
         radio,
         queue,
         queue_index,
@@ -267,6 +268,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..
     } = state;
     let mouse = *mouse_pos;
+    let pending = pending_play.is_some();
     let state_cover = state_cover.as_deref();
 
     let rows = Rows::new(inner.width, inner.height);
@@ -437,6 +439,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 ..transport_area
             },
             pb,
+            pending,
             mouse,
             hit,
         );

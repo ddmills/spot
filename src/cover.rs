@@ -67,13 +67,32 @@ impl Cover {
 /// decode than the 640, and still a genuine downscale into the 64 px grid.
 /// Falls back to the largest available when nothing is big enough.
 pub fn pick_url(images: &[rspotify::model::Image]) -> Option<String> {
-    let short = |i: &rspotify::model::Image| i.width.unwrap_or(0).min(i.height.unwrap_or(0));
+    let sized: Vec<(&str, u32)> = images
+        .iter()
+        .map(|i| {
+            (
+                i.url.as_str(),
+                i.width.unwrap_or(0).min(i.height.unwrap_or(0)),
+            )
+        })
+        .collect();
+    pick_sized(&sized)
+}
+
+/// [`pick_url`]'s rule, over `(url, short side in pixels)` pairs.
+///
+/// Spelled separately because the same choice has to be made about two
+/// unrelated types: rspotify's `Image`, off the Web API, and librespot's
+/// `CoverImage`, which rides along with the `TrackChanged` its player emits the
+/// moment a record starts. The two must land on the same file or a track change
+/// fetches one sleeve and the poll behind it fetches another.
+pub fn pick_sized(images: &[(&str, u32)]) -> Option<String> {
     images
         .iter()
-        .filter(|i| short(i) as usize >= 2 * COVER_PX)
-        .min_by_key(|i| short(i))
-        .or_else(|| images.iter().max_by_key(|i| short(i)))
-        .map(|i| i.url.clone())
+        .filter(|(_, short)| *short as usize >= 2 * COVER_PX)
+        .min_by_key(|(_, short)| *short)
+        .or_else(|| images.iter().max_by_key(|(_, short)| *short))
+        .map(|(url, _)| (*url).to_string())
 }
 
 /// Whether `url` points at Spotify's image CDN over TLS.

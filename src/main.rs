@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, EventStream};
 use crossterm::terminal::SetTitle;
 use futures::StreamExt;
+use librespot_metadata::audio::{AudioItem, UniqueFields};
 use librespot_playback::player::{PlayerEvent, PlayerEventChannel};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -113,6 +114,7 @@ async fn run() -> Result<()> {
         player_events,
         Arc::clone(&state),
         Arc::clone(&local),
+        tx.clone(),
     ));
     // The radio player writes into the same tap librespot's sink does, so the
     // visualizer follows whichever engine is playing.
@@ -268,12 +270,21 @@ fn window_title(
 /// keypress, not a second later, and a snapshot that arrives mid-flight would
 /// otherwise flip the pill back.
 ///
+/// It also knows *what* is playing, which is the other half of the same
+/// problem: two tracks of one album run into each other with no command in
+/// between, so nothing arms the four-hundred-millisecond re-poll and the deck
+/// keeps the finished record's title and sleeve until the next three-second
+/// tick. `TrackChanged` carries the whole item — name, artists, album, length
+/// and artwork — and arrives as the audio does. See
+/// [`AppState::track_changed`].
+///
 /// Only our own device is followed. When something else is playing, librespot
 /// is idle and has nothing to say about it.
 async fn player_event_loop(
     mut events: PlayerEventChannel,
     state: Arc<RwLock<AppState>>,
     local: Arc<LocalPlayback>,
+    tx: UnboundedSender<AppCommand>,
 ) {
     /// Re-anchor progress on a snapshot, but only if it describes our device.
     fn anchor(pb: &mut state::PlaybackSnapshot, position_ms: u32) {
@@ -281,7 +292,96 @@ async fn player_event_loop(
         pb.fetched_at = Instant::now();
     }
 
+    /// The track an event is about, as the URI spot spells track ids in.
+    ///
+    /// `None` for the events that are about the player rather than a track —
+    /// a volume change, say, which applies whatever is on.
+    fn subject(event: &PlayerEvent) -> Option<String> {
+        use PlayerEvent::*;
+        match event {
+            Stopped { track_id, .. }
+            | Loading { track_id, .. }
+            | Preloading { track_id }
+            | Playing { track_id, .. }
+            | Paused { track_id, .. }
+            | TimeToPreloadNextTrack { track_id, .. }
+            | EndOfTrack { track_id, .. }
+            | Unavailable { track_id, .. }
+            | PositionCorrection { track_id, .. }
+            | PositionChanged { track_id, .. }
+            | Seeked { track_id, .. } => track_id.to_uri().ok(),
+            _ => None,
+        }
+    }
+
+    /// The deck's view of a librespot `AudioItem`.
+    ///
+    /// Episodes and local files go through `UniqueFields` variants that carry
+    /// no artist list or album, so those read blank rather than being made up.
+    fn now_playing(item: &AudioItem) -> state::NowPlaying {
+        let (artists, album, artist_id) = match &item.unique_fields {
+            UniqueFields::Track { artists, album, .. } => (
+                artists
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                album.clone(),
+                // The first credited artist, matching what the poll puts here
+                // and what the deck's artist link opens. A bare id, not a URI:
+                // the click site builds `spotify:artist:{id}` from it.
+                artists.first().and_then(|a| a.id.to_id().ok()),
+            ),
+            _ => (String::new(), String::new(), None),
+        };
+        let covers: Vec<(&str, u32)> = item
+            .covers
+            .iter()
+            .map(|c| (c.url.as_str(), c.width.max(0).min(c.height.max(0)) as u32))
+            .collect();
+        state::NowPlaying {
+            track_uri: item.uri.clone(),
+            track_name: item.name.clone(),
+            artists,
+            album,
+            artist_id,
+            duration_ms: u64::from(item.duration_ms),
+            cover_url: cover::pick_sized(&covers),
+        }
+    }
+
     while let Some(event) = events.recv().await {
+        // librespot is the authority on what is playing, and this is it saying
+        // so — including when it is not what was asked for, which is what
+        // shuffle does to a play that named a track.
+        if let PlayerEvent::TrackChanged { audio_item } = &event {
+            let now = now_playing(audio_item);
+            let art = now.cover_url.clone();
+            state.write().track_changed(now);
+            // The client owns the fetch and its cache; it skips the work when
+            // the sleeve is already up, which two tracks of one album is.
+            let _ = tx.send(AppCommand::LoadPlayingCover { cover_url: art });
+            continue;
+        }
+
+        // Across a switch, events about the track being left are still in
+        // flight — starting with the `Paused` our own pause caused, carrying
+        // that track's position. Applying those would undo the deck the click
+        // just painted. Only those are dropped: anything else is news, and an
+        // earlier version of this dropped everything that was not the track we
+        // had asked for, which left the deck describing our guess while
+        // something else played.
+        {
+            let st = state.read();
+            if let (Some(pending), Some(about)) = (&st.pending_play, subject(&event)) {
+                let leaving = pending.prev_uri.as_deref() == Some(about.as_str());
+                let expected = pending.expect_uri.as_deref() == Some(about.as_str());
+                if leaving && !expected {
+                    continue;
+                }
+            }
+        }
+
         let playing = match &event {
             PlayerEvent::Playing { .. } => Some(true),
             PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. } => Some(false),

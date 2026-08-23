@@ -235,17 +235,26 @@ fn path_row(frame: &mut Frame, row: Rect, state: &mut AppState, page: PageHeader
 /// mutually exclusive by construction, and while a station is on the Spotify
 /// snapshot is kept only so stopping the stream puts the last track back.
 fn status_spans(state: &mut AppState) -> Vec<Span<'static>> {
+    // A play asked for and not heard yet. Its snapshot says it is not playing,
+    // because it is not — nothing has come out of the sink. But it is on its
+    // way, and that is what this row is for: without the extra term the whole
+    // gap read as a dim `STREAMING`, which is the opposite of the truth. It
+    // also covers the ordinary track boundary, where librespot's `Stopped`
+    // clears `is_playing` for the moment the next track takes to load.
+    let switching = state.pending_play.is_some();
     let (word, is_playing) = match (&state.radio, &state.playback) {
         (Some(r), _) => ("RADIO", r.is_playing),
-        (None, Some(pb)) => ("STREAMING", pb.is_playing),
+        (None, Some(pb)) => ("STREAMING", pb.is_playing || switching),
         (None, None) => return Vec::new(),
     };
 
     // Whether the audio is ours to judge. Playing on a phone, librespot is
     // idle and the tap will never fill — reading that as "loading" would
-    // leave the word stuck yellow for the length of the record.
-    let ours =
-        state.radio.is_some() || state.playback.as_ref().is_some_and(|pb| pb.is_local_device);
+    // leave the word stuck yellow for the length of the record. A play we
+    // asked for is ours by definition, whatever the last poll was describing.
+    let ours = switching
+        || state.radio.is_some()
+        || state.playback.as_ref().is_some_and(|pb| pb.is_local_device);
     let fresh = state.audio_tap.is_fresh(LOAD_WITHIN);
     // Claims to be playing, but nothing has come out of it yet: a station
     // still connecting and prefetching, or a track still being fetched. The
@@ -843,6 +852,40 @@ mod tests {
         let mut st = streaming();
         st.audio_tap.clear();
         st.playback.as_mut().unwrap().is_local_device = false;
+        let lines = render(&mut st, 80);
+        assert!(
+            lines[PROMPT_ROW].trim_end().ends_with("● STREAMING"),
+            "{:?}",
+            lines[PROMPT_ROW]
+        );
+    }
+
+    /// A track that has been clicked but not started yet. Its snapshot says it
+    /// is not playing — because it is not — so before the pending state existed
+    /// the whole switch read as a dim `STREAMING`, which is the opposite of
+    /// what was happening.
+    #[test]
+    fn a_track_asked_for_but_not_started_reads_as_loading() {
+        let mut st = streaming();
+        st.audio_tap.clear();
+        st.playback.as_mut().unwrap().is_playing = false;
+        st.pending_play = Some(crate::app::state::PendingPlay {
+            expect_uri: Some("spotify:track:new".into()),
+            prev_uri: Some("spotify:track:old".into()),
+            since: std::time::Instant::now(),
+        });
+        let lines = render(&mut st, 80);
+        assert!(
+            lines[PROMPT_ROW].trim_end().ends_with("● LOADING"),
+            "{:?}",
+            lines[PROMPT_ROW]
+        );
+        let dot = st.hit.status.x;
+        assert_eq!(fg(&mut st, 80, dot), theme::WARN);
+
+        // And the moment audio arrives it is streaming, whatever the poll has
+        // or has not confirmed by then.
+        st.audio_tap.push(&[0.5, 0.5], 1.0);
         let lines = render(&mut st, 80);
         assert!(
             lines[PROMPT_ROW].trim_end().ends_with("● STREAMING"),

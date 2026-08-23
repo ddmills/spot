@@ -17,6 +17,9 @@ winresource = "0.1"
 librespot-core = "0.8.0"
 librespot-playback = "0.8.0"
 librespot-connect = "0.8.0"
+# Already in the tree under librespot-playback, which does not re-export it —
+# `PlayerEvent::TrackChanged` carries an `AudioItem` and the deck reads it.
+librespot-metadata = "0.8.0"
 librespot-oauth = "0.8.0"
 rspotify = "0.16.1"
 ratatui = "0.30.2"

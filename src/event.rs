@@ -635,10 +635,12 @@ fn play_from_queue(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let Some(&ti) = q.display.get(st.queue_index) else {
         return;
     };
+    let track = q.tracks[ti].clone();
+    let cover = pending_cover(&track, q.header.cover_url.as_ref());
     let cmd = if let Some(ctx) = &q.context_uri {
         AppCommand::PlayContext {
             context_uri: ctx.clone(),
-            offset_uri: Some(q.tracks[ti].uri.clone()),
+            offset_uri: Some(track.uri.clone()),
         }
     } else {
         AppCommand::PlayTracks {
@@ -646,7 +648,7 @@ fn play_from_queue(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             offset: st.queue_index,
         }
     };
-    let _ = tx.send(cmd);
+    send_play(st, tx, cmd, Some(&track), cover);
 }
 
 /// Playback started from an ad-hoc URI list has no context the client could
@@ -1032,6 +1034,9 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     // Playing an ad-hoc list also snapshots it for the player view's queue
     // (there is no context to re-fetch it from).
     let mut adhoc: Option<(String, Vec<Track>)> = None;
+    // The row a play names, so the deck can wear it before Spotify confirms
+    // it — cloned out here because the match below holds `st` borrowed.
+    let mut expect: Option<(Track, Option<String>)> = None;
     let cmd = match &st.main {
         // Handled above; the match must still be total.
         MainView::Home | MainView::Playlists | MainView::Radio(_) => None,
@@ -1040,6 +1045,10 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 return;
             };
             let track = &list.tracks[ti];
+            expect = Some((
+                track.clone(),
+                pending_cover(track, list.header.cover_url.as_ref()),
+            ));
             Some(if let Some(ctx) = &list.context_uri {
                 AppCommand::PlayContext {
                     context_uri: ctx.clone(),
@@ -1061,8 +1070,9 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         MainView::Artist(v) => match v.row(index) {
             // Ad-hoc top-tracks queue: artist contexts ignore offsets, so play
             // the visible list directly.
-            Some(ArtistRow::Track(_)) => {
+            Some(ArtistRow::Track(t)) => {
                 adhoc = Some((v.name.clone(), display_tracks(&v.top)));
+                expect = Some((t.clone(), pending_cover(t, v.top.header.cover_url.as_ref())));
                 Some(AppCommand::PlayTracks {
                     uris: v
                         .top
@@ -1079,8 +1089,9 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             None => None,
         },
         MainView::Search(results) => match st.search_tab {
-            SearchTab::Tracks => results.tracks.get(index).map(|_| {
+            SearchTab::Tracks => results.tracks.get(index).map(|t| {
                 adhoc = Some(("Search results".to_string(), results.tracks.clone()));
+                expect = Some((t.clone(), t.cover_url.clone()));
                 AppCommand::PlayTracks {
                     uris: results.tracks.iter().map(|t| t.uri.clone()).collect(),
                     offset: index,
@@ -1115,8 +1126,46 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     ) {
         navigate(st, cmd, tx);
     } else {
-        let _ = tx.send(cmd);
+        let (track, cover) = match &expect {
+            Some((t, c)) => (Some(t), c.clone()),
+            None => (None, None),
+        };
+        send_play(st, tx, cmd, track, cover);
     }
+}
+
+/// Send a play command, and paint what it is going to play now rather than a
+/// round trip later.
+///
+/// Every Spotify play goes through here. Playback is started over the Web API
+/// and heard back from a three-second `/me/player` poll, so without this the
+/// deck kept the previous record's title, sleeve and progress — over the
+/// previous record's audio — for as long as the two took. See
+/// [`AppState::begin_pending_play`], which does the painting, and
+/// [`AppState::resolve_pending`], which keeps a poll that has not caught up
+/// from undoing it.
+///
+/// `expect` is the row the click named, when it named one; `x` and the header's
+/// ▶ play a whole context from the top and let Spotify choose, so they pass
+/// `None` and get a blank item until the poll fills it in.
+fn send_play(
+    st: &mut AppState,
+    tx: &UnboundedSender<AppCommand>,
+    cmd: AppCommand,
+    expect: Option<&Track>,
+    cover_url: Option<String>,
+) {
+    st.begin_pending_play(expect, cover_url);
+    let _ = tx.send(cmd);
+}
+
+/// The sleeve to draw for a track while its play is in flight.
+///
+/// [`Track::cover_url`] is `None` for rows read off an album's own track list —
+/// that endpoint does not repeat the album object per row — and on that page
+/// the header is holding the very sleeve those rows want.
+fn pending_cover(track: &Track, header_cover: Option<&String>) -> Option<String> {
+    track.cover_url.clone().or_else(|| header_cover.cloned())
 }
 
 /// The tracks of a list in display order, cloned.
@@ -1224,7 +1273,10 @@ fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         if let Some((name, tracks)) = adhoc {
             install_adhoc_queue(st, name, tracks);
         }
-        let _ = tx.send(cmd);
+        // No expected track: this plays the whole thing from the top, and with
+        // shuffle on Spotify picks which. The deck goes title-less and says
+        // LOADING until the poll names it.
+        send_play(st, tx, cmd, None, None);
     }
 }
 
@@ -1267,10 +1319,16 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         }
     };
     if let Some(context_uri) = uri {
-        let _ = tx.send(AppCommand::PlayContext {
-            context_uri,
-            offset_uri: None,
-        });
+        send_play(
+            st,
+            tx,
+            AppCommand::PlayContext {
+                context_uri,
+                offset_uri: None,
+            },
+            None,
+            None,
+        );
     }
 }
 
@@ -1492,10 +1550,15 @@ fn play_selected_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let Some(ArtistRow::Album(a)) = v.row(st.main_index) else {
         return;
     };
-    let _ = tx.send(AppCommand::PlayContext {
+    // No track — the record plays from the top and Spotify picks — but the card
+    // knows the sleeve, so the deck gets the artwork straight away even though
+    // it has nothing to title it with yet.
+    let cmd = AppCommand::PlayContext {
         context_uri: format!("spotify:album:{}", a.id),
         offset_uri: None,
-    });
+    };
+    let cover = a.cover_url.clone();
+    send_play(st, tx, cmd, None, cover);
 }
 
 #[cfg(test)]
@@ -1587,6 +1650,80 @@ mod tests {
         st.main = MainView::Tracks(list);
         st.liked.insert("spotify:track:Starlight".into(), true);
         st
+    }
+
+    /// Playback is started over the Web API and heard back from a three-second
+    /// poll, so the deck has to be painted here or it wears the previous record
+    /// — over the previous record's audio — for the whole round trip.
+    #[test]
+    fn activating_a_row_paints_it_before_the_command_leaves() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.main_index = 1; // Hysteria
+
+        activate_selection(&mut st, &tx);
+
+        let pb = st
+            .playback
+            .as_ref()
+            .expect("the deck has something to draw");
+        assert_eq!(pb.track_name, "Hysteria");
+        assert_eq!(pb.artists, "Muse");
+        assert_eq!(pb.album, "Black Holes");
+        assert_eq!(pb.cover_url.as_deref(), Some("https://i.scdn.co/image/abc"));
+        assert_eq!(pb.interpolated_progress_ms(), 0);
+        assert_eq!(
+            st.pending_play
+                .as_ref()
+                .and_then(|p| p.expect_uri.as_deref()),
+            Some("spotify:track:Hysteria")
+        );
+        // And the play still goes out.
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayTracks { .. })));
+    }
+
+    /// A station is playing and a track is clicked. Every deck checks radio
+    /// before Spotify, so a station left set would keep drawing over the track
+    /// that is starting — and it must go on the click, not when the client
+    /// gets round to the command.
+    #[test]
+    fn playing_a_track_drops_the_station_on_the_click() {
+        let (tx, _rx) = channel();
+        let mut st = liked_state();
+        st.radio = Some(crate::app::state::RadioPlayback {
+            station: test_station("s", "A Station"),
+            is_playing: true,
+            started_at: Instant::now(),
+            title: Default::default(),
+            volume_percent: 40,
+        });
+
+        activate_selection(&mut st, &tx);
+
+        assert!(st.radio.is_none());
+    }
+
+    /// The header's ▶ and `x` play a whole context from the top; with shuffle
+    /// on, Spotify picks which track. There is nothing honest to title the deck
+    /// with until the poll answers, but the wait still has to be recorded so
+    /// the row says LOADING and the poll cannot put the old record back.
+    #[test]
+    fn playing_a_view_from_the_top_names_no_track() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        if let MainView::Tracks(list) = &mut st.main {
+            list.context_uri = Some("spotify:album:a1".into());
+        }
+
+        play_current_view(&mut st, &tx);
+
+        let pending = st.pending_play.as_ref().expect("a play is outstanding");
+        assert!(pending.expect_uri.is_none());
+        assert_eq!(
+            st.playback.as_ref().map(|pb| pb.track_name.as_str()),
+            Some("")
+        );
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayContext { .. })));
     }
 
     /// `L` flips whatever is known about the selected row: the saved one is

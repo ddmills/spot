@@ -290,16 +290,17 @@ impl Client {
                 context_uri,
                 offset_uri,
             } => {
-                self.yield_to_spotify();
-                self.ensure_active();
-                self.api
+                self.begin_switch();
+                let result = self
+                    .api
                     .play_context(&context_uri, offset_uri.as_deref())
-                    .await?;
+                    .await;
+                self.settle_switch(result)?;
             }
             PlayTracks { uris, offset } => {
-                self.yield_to_spotify();
-                self.ensure_active();
-                self.api.play_uris(&uris, offset).await?;
+                self.begin_switch();
+                let result = self.api.play_uris(&uris, offset).await;
+                self.settle_switch(result)?;
             }
             AddToQueue(uri) => {
                 self.api.add_to_queue(&uri).await?;
@@ -318,6 +319,15 @@ impl Client {
                 cover_url,
             } => self.load_album_view(id, name, artists, year, cover_url, false),
             LoadViewCover { cover_url } => self.load_view_cover(cover_url),
+            LoadPlayingCover { cover_url } => {
+                // Same URL as what is already up means the same record: two
+                // tracks off one album change the title and not the sleeve, and
+                // refetching would blink the art off and back for no reason.
+                let installed = self.state.read().cover.as_ref().map(|c| c.url.clone());
+                if installed.as_deref() != cover_url.as_deref() {
+                    self.load_cover(cover_url);
+                }
+            }
             OpenArtist { id, uri, name } => self.load_artist_view(id, uri, name, false),
             Refresh => {
                 // Fresh playlists first: snapshot_ids are how playlist changes
@@ -556,6 +566,9 @@ impl Client {
             if let Some(pb) = st.playback.as_mut() {
                 pb.is_playing = false;
             }
+            // A track clicked a moment ago is not what is playing any more.
+            // Left set, its wait would go on refusing polls until it timed out.
+            st.pending_play = None;
         }
 
         // The directory's ranking runs on these, and it also hands back the
@@ -566,6 +579,14 @@ impl Client {
             .await
             .unwrap_or_else(|| station.url.clone());
 
+        // Again, right before the stream starts. A Spotify play asked for a
+        // moment ago is a round trip out to the backend and back in over the
+        // dealer, and it can land during the directory call above — after the
+        // pause at the top of this function and before there is a station to
+        // drown it out. This is the last point at which it can be caught.
+        if let Err(e) = self.spirc.pause() {
+            log::warn!("could not pause Spotify before starting radio: {e}");
+        }
         if let Err(e) = self.radio_player.play(&url, volume).await {
             log::error!("could not play {}: {e:#}", station.name);
             let mut st = self.state.write();
@@ -583,12 +604,66 @@ impl Client {
         self.state.write().radio = None;
     }
 
+    /// Silence what is playing and start the new sleeve, before asking Spotify
+    /// for anything.
+    ///
+    /// The play below is a round trip out to `api.spotify.com` and back in to
+    /// our own device over the dealer connection, and until it lands librespot
+    /// happily keeps playing the old track — so a click used to be a second or
+    /// two of the previous record with nothing on screen to say otherwise.
+    /// Pausing here is what makes it stop on the click instead.
+    /// [`crate::audio_sink::SpotSink::stop`] fades over three milliseconds and
+    /// clears the queue, so this is silent at once rather than after the
+    /// buffered half second.
+    ///
+    /// The sleeve is started here for the same reason: the event layer has
+    /// already put the clicked row's cover URL on the snapshot, and
+    /// [`Self::fetch_cover`] serves an already-decoded one out of its cache
+    /// immediately. Waiting for the poll to hand us the same URL would cost a
+    /// round trip for artwork we were holding all along.
+    fn begin_switch(&mut self) {
+        self.yield_to_spotify();
+        // Activate before pausing: on the first play of a session the device is
+        // not ours yet, and there is nothing to pause until it is.
+        self.ensure_active();
+        if let Err(e) = self.spirc.pause() {
+            log::warn!("could not pause before switching tracks: {e}");
+        }
+        // Scoped: `load_cover` takes the write lock, and parking_lot's is not
+        // reentrant — a read still open here would deadlock the client task.
+        let url = {
+            let st = self.state.read();
+            st.playback.as_ref().and_then(|pb| pb.cover_url.clone())
+        };
+        self.load_cover(url);
+    }
+
+    /// Close out a play the API has answered.
+    ///
+    /// A failed play leaves the deck wearing a track that never started, and
+    /// the wait would otherwise hold it there until it times out. Dropping the
+    /// wait lets the next poll put back whatever is actually playing, while the
+    /// error goes on up to be toasted by [`Self::run`].
+    fn settle_switch(&self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            self.state.write().pending_play = None;
+        }
+        result
+    }
+
     /// Stop the stream if one is playing, before Spotify takes the device.
     ///
     /// Every Spotify play path calls this, which is what keeps "only one engine
     /// at a time" true rather than merely intended.
+    ///
+    /// The question is put to the radio player, not to `AppState.radio`. That
+    /// field is what the deck draws, and the event layer clears it on the click
+    /// that starts a track so the station stops being drawn at once — which
+    /// leaves it saying "no station" for the turn of the command channel it
+    /// takes to get here, while the audio thread is still streaming one.
+    /// Reading it here is what let a station and a track play over each other.
     fn yield_to_spotify(&self) {
-        if self.state.read().radio.is_some() {
+        if self.radio_player.is_live() {
             self.stop_radio();
         }
     }
@@ -1167,12 +1242,21 @@ impl Client {
                 );
                 {
                     let mut st = self.state.write();
-                    // Keep the last snapshot if the API briefly reports
-                    // nothing.
-                    if snapshot.is_some() {
-                        st.playback = snapshot;
-                    } else if let Some(pb) = st.playback.as_mut() {
-                        pb.is_playing = false;
+                    // A snapshot arriving mid-switch is usually Spotify's
+                    // backend still describing the track we just left; taking
+                    // it would put that record back on the deck for a poll or
+                    // two. Both branches below sit inside the check — while a
+                    // play is outstanding, the snapshot on screen is one we
+                    // wrote ourselves, and clearing its `is_playing` would be
+                    // flipping our own answer.
+                    if st.resolve_pending(snapshot.as_ref()) {
+                        // Keep the last snapshot if the API briefly reports
+                        // nothing.
+                        if snapshot.is_some() {
+                            st.playback = snapshot;
+                        } else if let Some(pb) = st.playback.as_mut() {
+                            pb.is_playing = false;
+                        }
                     }
                 }
                 // The deck draws a liked mark for the playing track, which is not
@@ -1199,11 +1283,20 @@ impl Client {
                 // fetch anyway, and it is content-addressed.
                 let want = {
                     let st = self.state.read();
-                    let url = st.playback.as_ref().and_then(|p| p.cover_url.clone());
-                    match (&url, st.cover.as_ref()) {
-                        (Some(u), Some(c)) if c.url == *u => None,
-                        (None, None) => None,
-                        _ => Some(url),
+                    // A play in flight had its sleeve started by `begin_switch`
+                    // from the row that was clicked, and the slot is empty
+                    // while that fetch runs. Asking again from here would read
+                    // the empty slot as "not fetched yet", bump the generation
+                    // and strand the request already on its way.
+                    if st.pending_play.is_some() {
+                        None
+                    } else {
+                        let url = st.playback.as_ref().and_then(|p| p.cover_url.clone());
+                        match (&url, st.cover.as_ref()) {
+                            (Some(u), Some(c)) if c.url == *u => None,
+                            (None, None) => None,
+                            _ => Some(url),
+                        }
                     }
                 };
                 if let Some(url) = want {

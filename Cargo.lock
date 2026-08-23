@@ -3357,6 +3357,7 @@ dependencies = [
  "icy-metadata",
  "librespot-connect",
  "librespot-core",
+ "librespot-metadata",
  "librespot-oauth",
  "librespot-playback",
  "log",

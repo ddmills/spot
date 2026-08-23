@@ -62,6 +62,16 @@ pub enum AppCommand {
     LoadViewCover {
         cover_url: Option<String>,
     },
+    /// Install the sleeve for the track that has just started playing.
+    ///
+    /// The playing slot's twin of [`Self::LoadViewCover`]. Sent from the
+    /// librespot event loop, which learns of a track change the moment it
+    /// happens and carries the artwork with it — where the `/me/player` poll
+    /// that would otherwise drive this is up to three seconds behind, and does
+    /// not run at all between two tracks of one album.
+    LoadPlayingCover {
+        cover_url: Option<String>,
+    },
     /// Open a browsable artist view (top tracks + albums).
     OpenArtist {
         id: String,

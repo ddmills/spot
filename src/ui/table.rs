@@ -457,6 +457,23 @@ pub fn state_spans(is_playing: bool) -> Vec<Span<'static>> {
     ]
 }
 
+/// The pill's third face: a play asked for and not started yet.
+///
+/// [`state_spans`] names what a click *does*, so it would offer `▶ play` here —
+/// on a track that is already starting, under a `● LOADING` in the corner
+/// saying so. This says what is happening instead and offers nothing; the
+/// caller leaves the hit rect empty to match, so the click cannot land.
+///
+/// Same width and shape as the other two, because the row must not shift
+/// underneath the pointer when the state turns over.
+pub fn loading_spans() -> Vec<Span<'static>> {
+    let style = theme::warn();
+    vec![
+        Span::styled("⋯", style),
+        Span::styled(format!(" {:<5}", "load"), style),
+    ]
+}
+
 /// Width of the volume-slider track, in cells. The player view and the bottom
 /// bar draw the same control, so they share the width as well as the code.
 pub const VOL_TRACK_W: u16 = 16;
