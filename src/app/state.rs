@@ -169,22 +169,46 @@ pub struct SearchResults {
     pub albums: Vec<AlbumItem>,
     pub artists: Vec<ArtistItem>,
     pub playlists: Vec<Playlist>,
+    /// The station half of the answer. The two catalogues are two hosts and
+    /// answer at their own pace, so this fills in after the four above rather
+    /// than with them.
+    pub stations: Vec<Station>,
+    /// True from the moment the query goes out until the directory answers or
+    /// fails. Its own flag and not [`AppState::loading`], which the Spotify
+    /// half owns: an empty Stations tab means "still asking" or "nothing
+    /// there", and those read very differently.
+    pub stations_loading: bool,
+    /// Matches [`AppState::load_generation`] while a fetch owns this view, in
+    /// the same spirit as [`RadioView::generation`] and
+    /// [`TrackList::generation`]. The station half lands on its own, so it has
+    /// to prove it belongs to the results on screen and not to a query the
+    /// user has already replaced.
+    pub generation: u64,
 }
 
+/// The five cuts of one query.
+///
+/// The first four are one Spotify response read four ways; [`SearchTab::Stations`]
+/// is the radio directory, asked at the same moment over a different host. It
+/// sits last because it is the one that fills in late, and a tab that arrives
+/// after the others reads better at the end of the strip than in the middle of
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchTab {
     Tracks,
     Albums,
     Artists,
     Playlists,
+    Stations,
 }
 
 impl SearchTab {
-    pub const ALL: [SearchTab; 4] = [
+    pub const ALL: [SearchTab; 5] = [
         SearchTab::Tracks,
         SearchTab::Albums,
         SearchTab::Artists,
         SearchTab::Playlists,
+        SearchTab::Stations,
     ];
 
     pub fn title(self) -> &'static str {
@@ -193,6 +217,7 @@ impl SearchTab {
             SearchTab::Albums => "Albums",
             SearchTab::Artists => "Artists",
             SearchTab::Playlists => "Playlists",
+            SearchTab::Stations => "Stations",
         }
     }
 }
@@ -375,7 +400,6 @@ pub enum RadioScope {
     Genre(String),
     /// The stations you kept. Read from disk, not the network.
     Favorites,
-    Search(String),
 }
 
 impl RadioScope {
@@ -388,7 +412,6 @@ impl RadioScope {
             RadioScope::Country(code) => code.to_uppercase(),
             RadioScope::Genre(tag) => tag.clone(),
             RadioScope::Favorites => "saved stations".to_string(),
-            RadioScope::Search(q) => format!("“{q}”"),
         }
     }
 
@@ -396,7 +419,7 @@ impl RadioScope {
     /// leaves Countries lit.
     pub fn tab(&self) -> RadioTab {
         match self {
-            RadioScope::Popular | RadioScope::Search(_) => RadioTab::Popular,
+            RadioScope::Popular => RadioTab::Popular,
             RadioScope::Countries | RadioScope::Country(_) => RadioTab::Countries,
             RadioScope::Genres | RadioScope::Genre(_) => RadioTab::Genres,
             RadioScope::Favorites => RadioTab::Favorites,
@@ -761,10 +784,9 @@ pub enum ViewKey {
     /// beside it. The row at the top of the screen already says which query
     /// is live.
     Search,
-    /// Keyed by [`radio_key`]. A station search *does* carry its query, unlike
-    /// [`ViewKey::Search`]: the radio pages are a path you walk into — chart,
-    /// countries, one country — and a search is a stop on it rather than a
-    /// second screen laid over the app.
+    /// Keyed by [`radio_key`]. Every scope spells to something different, so
+    /// the radio pages are a path you walk into — chart, countries, one
+    /// country — rather than one screen that replaces itself.
     Radio(String),
 }
 
@@ -791,7 +813,6 @@ pub fn radio_key(scope: &RadioScope) -> String {
         RadioScope::Country(code) => format!("radio:country:{code}"),
         RadioScope::Genre(tag) => format!("radio:genre:{tag}"),
         RadioScope::Favorites => "radio:saved".to_string(),
-        RadioScope::Search(q) => format!("radio:search:{q}"),
     }
 }
 
@@ -1171,6 +1192,7 @@ impl AppState {
                 SearchTab::Albums => results.albums.len(),
                 SearchTab::Artists => results.artists.len(),
                 SearchTab::Playlists => results.playlists.len(),
+                SearchTab::Stations => results.stations.len(),
             },
             MainView::Artist(v) => v.len(),
             MainView::Radio(v) => v.rows.len(),

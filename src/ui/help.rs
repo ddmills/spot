@@ -41,7 +41,7 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
             ("L", "like the track, or save the station"),
             ("b / B", "open track's album / artist"),
             ("o / O", "cycle sort / flip direction"),
-            ("/", "search Spotify, or radio (browse pages)"),
+            ("/", "search Spotify and radio"),
             ("R", "refresh view & playlists"),
         ],
     ),

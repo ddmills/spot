@@ -306,23 +306,7 @@ impl Client {
                 self.state.write().toast("added to queue");
             }
             SetLiked { uri, liked } => self.set_liked(uri, liked).await,
-            Search(query) => {
-                self.state.write().loading = true;
-                let result = self.api.search(&query).await;
-                let mut st = self.state.write();
-                st.loading = false;
-                match result {
-                    Ok(results) => {
-                        let uris: Vec<String> =
-                            results.tracks.iter().map(|t| t.uri.clone()).collect();
-                        st.main = MainView::Search(results);
-                        st.main_to_top();
-                        drop(st);
-                        spawn_liked_check(self.api.clone(), self.state.clone(), uris);
-                    }
-                    Err(e) => st.toast(format!("search failed: {e}")),
-                }
-            }
+            Search(query) => self.search(query).await,
             LoadPlaylists => self.load_playlists().await,
             LoadLikedSongs => self.load_liked_view(false),
             LoadPlaylistTracks { playlist_id } => self.load_playlist_view(playlist_id, false),
@@ -396,6 +380,86 @@ impl Client {
         Ok(())
     }
 
+    /// Answer one query out of both catalogues.
+    ///
+    /// Spotify and the station directory are two hosts, so the two round trips
+    /// overlap rather than queue: the directory is asked from a spawned task
+    /// while this one waits on Spotify. Neither half can be allowed to hold up
+    /// the other, and in practice the directory is the slower of the two.
+    ///
+    /// The view is installed empty and loading straight away, exactly as
+    /// [`Self::load_radio`] does it, so the query and the tab strip are on
+    /// screen the instant Enter is pressed. Both halves then merge into that
+    /// view under a `load_generation` guard — a half whose query the user has
+    /// already replaced writes nothing.
+    async fn search(&mut self, query: String) {
+        let generation = {
+            let mut st = self.state.write();
+            st.load_generation += 1;
+            let generation = st.load_generation;
+            st.loading = true;
+            st.main = MainView::Search(state::SearchResults {
+                query: query.clone(),
+                stations_loading: true,
+                generation,
+                ..Default::default()
+            });
+            st.main_to_top();
+            generation
+        };
+
+        // The station half, off on its own so the Spotify await below starts
+        // immediately.
+        let radio_api = self.radio_api.clone();
+        let state = self.state.clone();
+        let station_query = query.clone();
+        tokio::spawn(async move {
+            let found = radio_api.search(&station_query).await;
+            let mut st = state.write();
+            let MainView::Search(results) = &mut st.main else {
+                return;
+            };
+            if results.generation != generation {
+                return;
+            }
+            results.stations_loading = false;
+            match found {
+                Ok(stations) => results.stations = stations,
+                // Logged, not toasted, unlike the Spotify half below. The
+                // directory being unreachable is not *this search* failing —
+                // four tabs of perfectly good results are on screen — and a
+                // toast thrown over them would say that it was. The Stations
+                // tab going from "searching…" to "no stations" is where that
+                // news belongs, and it is only news to someone looking at it.
+                Err(e) => log::error!("station search failed: {e:#}"),
+            }
+        });
+
+        let result = self.api.search(&query).await;
+        let mut st = self.state.write();
+        st.loading = false;
+        // The station half may already have landed in the view, so the Spotify
+        // vecs are moved *into* it rather than replacing it wholesale.
+        let MainView::Search(results) = &mut st.main else {
+            return;
+        };
+        if results.generation != generation {
+            return;
+        }
+        match result {
+            Ok(found) => {
+                results.tracks = found.tracks;
+                results.albums = found.albums;
+                results.artists = found.artists;
+                results.playlists = found.playlists;
+                let uris: Vec<String> = results.tracks.iter().map(|t| t.uri.clone()).collect();
+                drop(st);
+                spawn_liked_check(self.api.clone(), self.state.clone(), uris);
+            }
+            Err(e) => st.toast(format!("search failed: {e}")),
+        }
+    }
+
     /// Fill a radio page.
     ///
     /// The view is installed empty and loading straight away, so the trail and
@@ -435,7 +499,6 @@ impl Client {
         tokio::spawn(async move {
             let rows = match &scope {
                 RadioScope::Popular => api.top_voted().await.map(into_station_rows),
-                RadioScope::Search(q) => api.search(q).await.map(into_station_rows),
                 RadioScope::Country(code) => api.by_country(code).await.map(into_station_rows),
                 RadioScope::Genre(tag) => api.by_tag(tag).await.map(into_station_rows),
                 RadioScope::Countries => api.countries().await.map(into_facet_rows),

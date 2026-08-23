@@ -24,6 +24,24 @@ pub const WARN: Color = Color::Rgb(0xF0, 0xDC, 0x8A);
 /// carried by weight and brightness rather than a filled bar, so it never
 /// competes with the accent-colored "now playing" marker.
 pub const BRIGHT: Color = Color::Rgb(0xE8, 0xF0, 0xF2);
+/// The search field's resting fill, and the only region of the app that is
+/// painted rather than left transparent to the terminal's own ground.
+///
+/// The prompt used to be a bare run of dim text at the margin, which read as a
+/// stray sentence rather than as a box you could type in. A fill is what says
+/// "field" without a border — and this UI has already decided against borders
+/// everywhere else (see [`super::table::draw_scrollbar`]).
+///
+/// Sat between the terminal's ground and [`DIM`]: dark enough that the row does
+/// not read as a highlight or a selection, light enough that the field has an
+/// edge on a dark terminal. Assuming a dark terminal is a thing the palette
+/// already does — see the truecolor note above.
+pub const FIELD: Color = Color::Rgb(0x22, 0x27, 0x2B);
+/// The same field under the pointer. Brighter by about as much again, so the
+/// field lights the way every other control does without jumping to the flat
+/// [`DIM`] pill that [`super::table::hover_style`] paints — that pill is sized
+/// to a word, and the same value across a whole row would read as a selection.
+pub const FIELD_HOVER: Color = Color::Rgb(0x31, 0x38, 0x3D);
 /// The green the header's status dot pulses in while audio is running.
 const GREEN_RGB: (u8, u8, u8) = (0x5F, 0xBF, 0x62);
 pub const GREEN: Color = Color::Rgb(GREEN_RGB.0, GREEN_RGB.1, GREEN_RGB.2);
@@ -324,6 +342,12 @@ pub fn warn() -> Style {
 
 pub fn green() -> Style {
     Style::default().fg(GREEN)
+}
+
+/// The search field's ground, or its lit ground when the pointer is in it.
+/// A background alone: the runs drawn over it bring their own foregrounds.
+pub fn field(hover: bool) -> Style {
+    Style::default().bg(if hover { FIELD_HOVER } else { FIELD })
 }
 
 /// The accent in force right now at a fraction of full brightness, for the

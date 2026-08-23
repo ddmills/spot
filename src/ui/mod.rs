@@ -22,10 +22,12 @@ use crate::app::state::{AppState, HitAreas};
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
-/// Rows the identity row takes: the `♫ spot` mark and the path beside it,
-/// then a blank.
+/// Rows the identity row takes: the `♫ spot` mark, the search prompt beside
+/// it and the playback status opposite them, then a blank. Named for what the
+/// player draws, which is the same row with the path in place of the prompt.
 const NAV_H: u16 = 2;
-/// Rows the search prompt takes under it: the prompt, then a blank.
+/// Rows that row takes on the browse screen before the path under it — the
+/// prompt, then a blank — and so the path's own offset into the band.
 const SEARCH_H: u16 = 2;
 /// The header both views wear, and the line their content starts on. Neither
 /// view spells these rows out for itself: the whole point is that toggling the
@@ -61,7 +63,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             .direction(Direction::Vertical)
             .horizontal_margin(1)
             .constraints([
-                // The mark and the path, a blank, the prompt, a blank. Fixed,
+                // The mark and the prompt, a blank, the path, a blank. Fixed,
                 // so entering and leaving search mode moves nothing below it.
                 Constraint::Length(HEAD_H),
                 Constraint::Min(1),
@@ -212,8 +214,9 @@ mod tests {
         let mut searching = browse_state();
         searching.input_mode = crate::app::state::InputMode::Search;
         let after = screen(&mut searching, 100, 34);
-        // The prompt row itself is expected to differ; nothing else may move.
-        for y in (0..34).filter(|&y| y != NAV_H as usize) {
+        // The prompt row itself is expected to differ; nothing else may move —
+        // including the path, which is now a row of its own under it.
+        for y in (0..34).filter(|&y| y != 0) {
             assert_eq!(before[y], after[y], "row {y} moved when search opened");
         }
     }
@@ -229,11 +232,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 34)).unwrap();
         terminal.draw(|f| draw(f, &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        // Row 0 carries the mark and the path; the head of the path is the
-        // accent run on it, one gap past the mark.
-        let head_x = table::BRAND_W + top_row::MARK_GAP + 1;
+        // The path is a row of its own under the prompt, and it starts at the
+        // screen's margin: the head of it is the accent run in column 1.
         assert_eq!(
-            buffer.cell(Position { x: head_x, y: 0 }).unwrap().fg,
+            buffer.cell(Position { x: 1, y: SEARCH_H }).unwrap().fg,
             theme::accent_color()
         );
         // The track table reaches the far side: with the rail gone, the header
@@ -250,14 +252,16 @@ mod tests {
         );
     }
 
-    /// Both views lead with the same row: the mark, then the path.
+    /// Both views lead with the same two fixtures: the mark at the margin and
+    /// the playback status opposite it, in the same columns, so toggling the
+    /// player does not appear to move either of them.
     ///
-    /// Drawn from the same code in both — `top_row::nav_row` for the row,
-    /// `main_pane::draw_trail` for the path — so this is the test that catches
-    /// them drifting. Toggling the player must not move a cell of it.
-    ///
-    /// The prompt under it is the browse screen's alone: the player has no
-    /// list to search into, and the rows go to its queue instead.
+    /// What sits *between* them is the one thing the two rows disagree about.
+    /// The browse screen puts the prompt there and the path a row under it;
+    /// the player has no list to search into, so the path takes the row and
+    /// the rows the prompt would have cost go to the queue instead. Both are
+    /// drawn from `top_row::head_row`, which is what stops the fixtures
+    /// drifting apart.
     #[test]
     fn the_nav_row_is_the_same_in_both_views() {
         // Two pages deep, so the path has a step on it as well as a head.
@@ -287,26 +291,6 @@ mod tests {
 
         let a = screen(&mut browse, 100, 34);
         let b = screen(&mut player, 100, 34);
-        let nav = NAV_H as usize;
-        assert_eq!(&a[..nav], &b[..nav], "the nav row differs between views");
-        // Not vacuously equal: it really is the mark, the path, and the
-        // playback status opposite them — which is the point of asserting it
-        // here, since the status is drawn on both screens from the same code.
-        assert!(
-            a[0].starts_with(" ♫ spot   MUSE  ›  BLACK HOLES"),
-            "{:?}",
-            a[0]
-        );
-        assert!(a[0].trim_end().ends_with("● LOADING"), "{:?}", a[0]);
-        assert!(a[1].trim().is_empty(), "{:?}", a[1]);
-
-        // The prompt is on the browse screen only, and the player spends the
-        // rows it would have taken on what it is actually showing.
-        assert!(a[nav].contains("/  search"), "{:?}", a[nav]);
-        assert!(!b[nav].contains("/  search"), "{:?}", b[nav]);
-        assert!(!browse.hit.search_box.is_empty());
-        assert!(player.hit.search_box.is_empty(), "the player has no prompt");
-
         // Column 0 is the screen's own one-cell margin, which both views inset
         // themselves by.
         assert_eq!(browse.hit.home_btn.x, 1, "the mark sits at the margin");
@@ -315,12 +299,47 @@ mod tests {
             browse.hit.home_btn, player.hit.home_btn,
             "the mark moved when the player opened"
         );
-        // The ancestors are controls on both. Only the head disagrees: on the
-        // browse screen it is the page you are already on and leads nowhere,
-        // while in the player it closes the view.
-        let rects = |st: &AppState| -> Vec<_> { st.hit.crumbs.iter().map(|(r, _)| *r).collect() };
-        assert_eq!(rects(&browse), rects(&player));
-        assert_eq!(rects(&browse).len(), 1);
+        // Drawn on both screens from the same code, so this is what catches
+        // the two drifting apart.
+        assert_eq!(
+            browse.hit.status, player.hit.status,
+            "the status moved when the player opened"
+        );
+        assert!(a[0].trim_end().ends_with("● LOADING"), "{:?}", a[0]);
+        assert!(b[0].trim_end().ends_with("● LOADING"), "{:?}", b[0]);
+        assert!(a[1].trim().is_empty(), "{:?}", a[1]);
+
+        // Between them the rows part ways: the prompt on the browse screen,
+        // the path on the player, and the rows the prompt would have cost
+        // spent on what the player is actually showing.
+        assert!(a[0].starts_with(" ♫ spot    /  search"), "{:?}", a[0]);
+        assert!(
+            b[0].starts_with(" ♫ spot   MUSE  ›  BLACK HOLES"),
+            "{:?}",
+            b[0]
+        );
+        assert!(!browse.hit.search_box.is_empty());
+        assert!(player.hit.search_box.is_empty(), "the player has no prompt");
+
+        // The browse screen's path is a row under its prompt, at the margin
+        // rather than indented past a mark — which is what buys it the width.
+        let path = SEARCH_H as usize;
+        assert!(
+            a[path].starts_with(" MUSE  ›  BLACK HOLES"),
+            "{:?}",
+            a[path]
+        );
+
+        // The ancestors are controls on both, and there is the same one of
+        // them either way. Only the head disagrees: on the browse screen it is
+        // the page you are already on and leads nowhere, while in the player
+        // it closes the view.
+        let targets =
+            |st: &AppState| -> Vec<_> { st.hit.crumbs.iter().map(|(_, t)| t.clone()).collect() };
+        assert_eq!(targets(&browse), targets(&player));
+        assert_eq!(targets(&browse).len(), 1);
+        assert_eq!(browse.hit.crumbs[0].0.y, SEARCH_H);
+        assert_eq!(player.hit.crumbs[0].0.y, 0);
         assert!(browse.hit.close_player.is_empty());
         assert!(!player.hit.close_player.is_empty());
     }
@@ -473,20 +492,21 @@ mod tests {
         assert!(joined.contains("no saved stations yet"), "{joined}");
     }
 
-    /// The search row is one box pointed at whichever catalogue the page
-    /// below it came from, and it has to say which.
+    /// The search row is one box that asks both catalogues, so it says the
+    /// same thing on every page. It used to retarget — Spotify here, the
+    /// station directory there — which made the prompt something you had to
+    /// read before you could trust the key.
     #[test]
-    fn the_search_row_retargets_on_a_radio_page() {
+    fn the_search_row_says_the_same_thing_on_every_page() {
         use crate::app::state::{RadioScope, RadioView};
 
         let mut st = browse_state();
-        assert!(screen(&mut st, 100, 34)[NAV_H as usize].contains("search artists"));
+        let browse = screen(&mut st, 100, 34)[0].clone();
+        assert!(browse.contains("search Spotify and radio"), "{browse:?}");
 
         st.main = crate::app::state::MainView::Radio(RadioView::new(RadioScope::Popular, 0));
-        assert!(
-            screen(&mut st, 100, 34)[NAV_H as usize].contains("search radio stations"),
-            "the prompt must retarget"
-        );
+        let radio = screen(&mut st, 100, 34)[0].clone();
+        assert_eq!(browse, radio, "the prompt must not retarget");
     }
 
     #[test]

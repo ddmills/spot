@@ -96,8 +96,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             mouse,
         ),
         MainView::Search(results) => draw_search(
-            frame, list_area, results, loading, search_tab, main_index, main_list, hit, &marks,
-            mouse, liked,
+            frame,
+            list_area,
+            results,
+            loading,
+            search_tab,
+            main_index,
+            main_list,
+            hit,
+            &marks,
+            mouse,
+            liked,
+            radio_favorites,
+            playing_station.as_deref(),
         ),
         MainView::Artist(v) => draw_artist(
             frame, list_area, v, page_art, main_index, main_list, hit, &marks, mouse, liked,
@@ -389,6 +400,58 @@ fn station_row(
     ListItem::new(line)
 }
 
+/// A table of stations: the header, a spacer, the rows, and the scrollbar.
+///
+/// Two pages list stations — a radio page and a search's Stations tab — and
+/// this is the whole of what they have in common, so neither can drift away
+/// from the other's column widths or marks. In the spirit of
+/// [`render_track_table`] and [`render_album_table`].
+#[allow(clippy::too_many_arguments)]
+fn render_station_table(
+    frame: &mut Frame,
+    body: Rect,
+    stations: &[&crate::app::state::Station],
+    favorites: &[crate::app::state::Station],
+    playing_url: Option<&str>,
+    main_index: usize,
+    list_state: &mut ListState,
+    hit: &mut HitAreas,
+) {
+    let cols = StationCols::new(body.width as usize);
+    let mut rows_area = body;
+    if body.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(station_header(&cols)),
+            Rect { height: 1, ..body },
+        );
+        let skip = if body.height >= 3 { 2 } else { 1 };
+        rows_area = Rect {
+            y: body.y + skip,
+            height: body.height - skip,
+            ..body
+        };
+    }
+    hit.main_list = rows_area;
+
+    let items: Vec<ListItem> = stations
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            station_row(
+                s,
+                &cols,
+                favorites.iter().any(|f| f.uuid == s.uuid),
+                playing_url == Some(s.url.as_str()),
+                i == main_index,
+            )
+        })
+        .collect();
+    let count = items.len();
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    frame.render_stateful_widget(List::new(items), rows_area, list_state);
+    super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
+}
+
 /// One country or genre row: a name and how many stations are behind it.
 fn facet_row(label: &str, count: u32, width: usize, selected: bool) -> ListItem<'static> {
     let name_w = width.saturating_sub(STATION_SAVE_W + FACET_COUNT_W + COL_GAP.len());
@@ -461,45 +524,50 @@ fn draw_radio(
         return;
     }
 
-    let cols = StationCols::new(body.width as usize);
-    let mut rows_area = body;
-    // Facet lists get no header row: "Country / Stations" over a list of
-    // countries says only what the tab above it already said.
-    if !facets && body.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(station_header(&cols)),
-            Rect { height: 1, ..body },
+    // A station list is the same table the Stations tab of a search draws, so
+    // it goes through the same builder. Facet lists get no header row:
+    // "Country / Stations" over a list of countries says only what the tab
+    // above it already said.
+    if !facets {
+        let stations: Vec<&crate::app::state::Station> = view
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                RadioRow::Station(s) => Some(s),
+                RadioRow::Facet { .. } => None,
+            })
+            .collect();
+        render_station_table(
+            frame,
+            body,
+            &stations,
+            favorites,
+            playing_url,
+            main_index,
+            list_state,
+            hit,
         );
-        let skip = if body.height >= 3 { 2 } else { 1 };
-        rows_area = Rect {
-            y: body.y + skip,
-            height: body.height - skip,
-            ..body
-        };
+        return;
     }
-    hit.main_list = rows_area;
 
+    hit.main_list = body;
     let items: Vec<ListItem> = view
         .rows
         .iter()
         .enumerate()
         .map(|(i, row)| match row {
             RadioRow::Facet { label, count, .. } => {
-                facet_row(label, *count, rows_area.width as usize, i == main_index)
+                facet_row(label, *count, body.width as usize, i == main_index)
             }
-            RadioRow::Station(s) => station_row(
-                s,
-                &cols,
-                favorites.iter().any(|f| f.uuid == s.uuid),
-                playing_url == Some(s.url.as_str()),
-                i == main_index,
-            ),
+            // Unreachable: `facets` is read off the first row, and the
+            // directory never mixes the two kinds in one answer.
+            RadioRow::Station(s) => facet_row(&s.name, 0, body.width as usize, i == main_index),
         })
         .collect();
     let count = items.len();
-    super::clamp_offset(list_state, count, rows_area.height as usize);
-    frame.render_stateful_widget(List::new(items), rows_area, list_state);
-    super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
+    super::clamp_offset(list_state, count, body.height as usize);
+    frame.render_stateful_widget(List::new(items), body, list_state);
+    super::table::draw_scrollbar(frame, scroll_col(body), count, list_state.offset());
 }
 
 /// What to say on a radio page with nothing on it.
@@ -510,7 +578,6 @@ fn radio_empty_hint(view: &crate::app::state::RadioView) -> &'static str {
     }
     match view.scope {
         RadioScope::Favorites => "no saved stations yet — press L on one to keep it",
-        RadioScope::Search(_) => "no stations by that name",
         _ => "nothing here",
     }
 }
@@ -1246,13 +1313,8 @@ fn tab_segments<T: Copy + PartialEq>(
             // body copy, and it should sit behind the rows it labels.
             theme::dim()
         };
-        let rect = super::table::segment(
-            spans,
-            x,
-            row,
-            mouse,
-            vec![Span::styled(title(tab), style)],
-        );
+        let rect =
+            super::table::segment(spans, x, row, mouse, vec![Span::styled(title(tab), style)]);
         hits.push((rect, tab));
     }
 }
@@ -2169,6 +2231,8 @@ fn draw_search(
     marks: &PlayMarks,
     mouse: Option<Position>,
     liked: &std::collections::HashMap<String, bool>,
+    favorites: &[crate::app::state::Station],
+    playing_url: Option<&str>,
 ) {
     let inner = body_area(area);
 
@@ -2177,6 +2241,16 @@ fn draw_search(
         SearchTab::Albums => results.albums.len(),
         SearchTab::Artists => results.artists.len(),
         SearchTab::Playlists => results.playlists.len(),
+        SearchTab::Stations => results.stations.len(),
+    };
+
+    // Whether the tab you are on is still waiting on its own half of the
+    // answer. Two hosts answer this page and the directory is usually the
+    // slower, so a bare "0 results" over an empty Stations tab would report a
+    // failure that has not happened yet.
+    let pending = match search_tab {
+        SearchTab::Stations => results.stations_loading,
+        _ => loading,
     };
 
     // Header band: query bold with the result count right-aligned, then the
@@ -2184,7 +2258,14 @@ fn draw_search(
     let mut body = inner;
     if inner.height >= 8 {
         let info_area = Rect { height: 1, ..inner };
-        let totals = Span::styled(format!("{tab_len} results"), theme::dim());
+        let totals = Span::styled(
+            if pending && tab_len == 0 {
+                "searching…".to_string()
+            } else {
+                format!("{tab_len} results")
+            },
+            theme::dim(),
+        );
         let totals_w = (totals.width() as u16).min(info_area.width);
         let totals_area = Rect {
             x: info_area.right().saturating_sub(totals_w),
@@ -2248,14 +2329,38 @@ fn draw_search(
         };
     }
 
-    if tab_len == 0 && !loading {
+    if tab_len == 0 && !pending {
         hit.main_list = body;
-        let text = format!(
-            "no {} results for \"{}\"",
-            search_tab.title().to_lowercase(),
-            results.query
-        );
+        // "no stations results for" would be the generic template's answer
+        // here, so this tab spells its own.
+        let text = match search_tab {
+            SearchTab::Stations => format!("no stations for \"{}\"", results.query),
+            _ => format!(
+                "no {} results for \"{}\"",
+                search_tab.title().to_lowercase(),
+                results.query
+            ),
+        };
         empty_message(frame, body, &text);
+        return;
+    }
+
+    // The directory's own table, drawn exactly as a radio page draws it: same
+    // columns, same ★ on a station you keep, same ♫ on the one that is
+    // playing. A station is the same object wherever you found it, and a
+    // second layout for it would say it was not.
+    if search_tab == SearchTab::Stations {
+        let stations: Vec<&crate::app::state::Station> = results.stations.iter().collect();
+        render_station_table(
+            frame,
+            body,
+            &stations,
+            favorites,
+            playing_url,
+            main_index,
+            list_state,
+            hit,
+        );
         return;
     }
 
@@ -2312,7 +2417,7 @@ fn draw_search(
     hit.main_list = rows_area;
 
     let items: Vec<ListItem> = match search_tab {
-        SearchTab::Tracks | SearchTab::Albums => unreachable!(),
+        SearchTab::Tracks | SearchTab::Albums | SearchTab::Stations => unreachable!(),
         SearchTab::Artists => results
             .artists
             .iter()
@@ -2407,10 +2512,12 @@ mod tests {
     /// so these tests draw it too — the pane no longer owns that row, but
     /// [`fit_trail`] and [`draw_trail`] are still what puts a path on it.
     const HEAD: usize = super::super::HEAD_H as usize;
+    /// The row within that band the path lands on.
+    const PATH: usize = super::super::SEARCH_H as usize;
 
     /// Draw the header and the pane under it, as [`super::super::draw`] lays
-    /// them out. Row 0 is the mark and the path, row 2 the search prompt, row
-    /// [`HEAD`] the first row of the pane.
+    /// them out. Row 0 is the mark and the search prompt, row [`PATH`] the
+    /// path, row [`HEAD`] the first row of the pane.
     fn screen(state: &mut AppState, frame: &mut Frame) {
         let head = Rect {
             height: frame.area().height.min(HEAD as u16),
@@ -2491,7 +2598,7 @@ mod tests {
     fn an_album_page_draws_its_sleeve_beside_stacked_metadata() {
         let mut st = album_state();
         let lines = render(&mut st, 90, 22);
-        assert!(lines[0].contains("DANCE IN THE STREET"));
+        assert!(lines[PATH].contains("DANCE IN THE STREET"));
         // Sleeve occupies the left 12 cells of the six band rows.
         // No cover is decoded in the test, so this is the placeholder swatch:
         // half-blocks with a single ♫ in the middle.
@@ -2525,17 +2632,19 @@ mod tests {
     /// them spells the path that got it there. The playlist page used to be
     /// the exception, because it was opened from a rail that never went away.
     ///
-    /// The trail is anchored right after the mark, which is the point of it:
-    /// the `← <name>` pill this replaced sat three cells after a section label
+    /// The trail is anchored at the margin, which is the point of it: the
+    /// `← <name>` pill this replaced sat three cells after a section label
     /// whose width was the page's kind, so the one control that means "go
-    /// back" landed in a different column on every page.
+    /// back" landed in a different column on every page. It used to be
+    /// anchored after the mark for the same reason; the mark is a row above it
+    /// now and the path starts where every other line of content does.
     ///
-    /// Home contributes no crumb at either end — the mark beside the path is
+    /// Home contributes no crumb at either end — the mark above the path is
     /// already the way there.
     #[test]
     fn pages_spell_the_path_that_reached_them() {
-        // The column every path starts in: after the mark and its gap.
-        let x0 = super::super::table::BRAND_W + super::super::top_row::MARK_GAP;
+        // The column every path starts in.
+        let x0 = 0;
 
         let mut st = album_state();
         from_home(&mut st);
@@ -2546,8 +2655,12 @@ mod tests {
             "Home is the only step behind it, and it draws none: {:?}",
             st.hit.crumbs
         );
-        assert!(lines[0].contains("DANCE IN THE STREET"), "{:?}", lines[0]);
-        assert!(!lines[0].contains('›'), "{:?}", lines[0]);
+        assert!(
+            lines[PATH].contains("DANCE IN THE STREET"),
+            "{:?}",
+            lines[PATH]
+        );
+        assert!(!lines[PATH].contains('›'), "{:?}", lines[PATH]);
 
         // And the head starts in the same column whatever the page is called
         // — which the pill, drawn after a variable-width label, never did.
@@ -2555,7 +2668,7 @@ mod tests {
         // cell.
         let col =
             |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count() as u16);
-        assert_eq!(col(&lines[0], "DANCE"), Some(x0));
+        assert_eq!(col(&lines[PATH], "DANCE"), Some(x0));
 
         for (mut st, name) in [
             (artist_state(), "MUSE"),
@@ -2567,7 +2680,12 @@ mod tests {
         ] {
             from_home(&mut st);
             let lines = render(&mut st, 90, 22);
-            assert_eq!(col(&lines[0], name), Some(x0), "{name}: {:?}", lines[0]);
+            assert_eq!(
+                col(&lines[PATH], name),
+                Some(x0),
+                "{name}: {:?}",
+                lines[PATH]
+            );
         }
     }
 
@@ -2597,9 +2715,9 @@ mod tests {
         // the page you are on is what the row is about, a step behind it only
         // has to be recognizable enough to aim at.
         assert!(
-            lines[0].contains("DONNA THE BUF…  ›  DANCE IN THE STREET"),
+            lines[PATH].contains("DONNA THE BUF…  ›  DANCE IN THE STREET"),
             "{:?}",
-            lines[0]
+            lines[PATH]
         );
         // The ancestor leads somewhere, at the depth it was pushed to. Home
         // sits below it at depth 0 and draws nothing, and the page itself is
@@ -2628,11 +2746,11 @@ mod tests {
         st.main = page;
         let lines = render(&mut st, 90, 22);
         assert!(
-            lines[0].contains("…  ›  TWO  ›  THREE  ›  MY LIST"),
+            lines[PATH].contains("…  ›  TWO  ›  THREE  ›  MY LIST"),
             "{:?}",
-            lines[0]
+            lines[PATH]
         );
-        assert!(!lines[0].contains("ONE  ›"), "{:?}", lines[0]);
+        assert!(!lines[PATH].contains("ONE  ›"), "{:?}", lines[PATH]);
         // The root is a crumb like any other; the ellipsis between it and the
         // rest stands for what was shed and leads nowhere.
         assert_eq!(st.hit.crumbs.len(), 3);
@@ -2643,9 +2761,9 @@ mod tests {
         // row would hold two steps, and it holds three.
         let lines = render(&mut st, 80, 22);
         assert!(
-            lines[0].contains("…  ›  TWO  ›  THREE  ›  MY LIST"),
+            lines[PATH].contains("…  ›  TWO  ›  THREE  ›  MY LIST"),
             "{:?}",
-            lines[0]
+            lines[PATH]
         );
     }
 
@@ -2677,8 +2795,8 @@ mod tests {
             },
         ];
         let lines = render(&mut st, 90, 22);
-        assert!(lines[0].contains("PLAYLISTS"), "{:?}", lines[0]);
-        assert!(lines[0].contains("2 playlists"), "{:?}", lines[0]);
+        assert!(lines[PATH].contains("PLAYLISTS"), "{:?}", lines[PATH]);
+        assert!(lines[PATH].contains("2 playlists"), "{:?}", lines[PATH]);
         assert!(lines[4].contains("Title") && lines[4].contains("Owner"));
         // Playlists only: Liked Songs is a Home row, and is not one of these.
         assert!(!lines.iter().any(|l| l.contains("Liked Songs")));
@@ -2706,9 +2824,9 @@ mod tests {
         }
         let lines = render(&mut st, 90, 22);
         assert!(
-            lines[0].contains("DONNA  ›  DANCE IN THE STREET"),
+            lines[PATH].contains("DONNA  ›  DANCE IN THE STREET"),
             "{:?}",
-            lines[0]
+            lines[PATH]
         );
         assert_eq!(
             st.hit.crumbs[0].1,
@@ -2723,8 +2841,12 @@ mod tests {
         let mut st = album_state();
         let lines = render(&mut st, 90, 22);
         assert!(st.hit.crumbs.is_empty());
-        assert!(lines[0].contains("DANCE IN THE STREET"), "{:?}", lines[0]);
-        assert!(!lines[0].contains('›'));
+        assert!(
+            lines[PATH].contains("DANCE IN THE STREET"),
+            "{:?}",
+            lines[PATH]
+        );
+        assert!(!lines[PATH].contains('›'));
     }
 
     /// A pane too narrow for the whole path keeps the page's own name and
@@ -2737,8 +2859,8 @@ mod tests {
         from_home(&mut st);
         let lines = render(&mut st, 34, 22);
         assert!(st.hit.crumbs.is_empty(), "{:?}", st.hit.crumbs);
-        assert!(!lines[0].contains("HOME"), "{:?}", lines[0]);
-        assert!(lines[0].contains("DANCE"), "{:?}", lines[0]);
+        assert!(!lines[PATH].contains("HOME"), "{:?}", lines[PATH]);
+        assert!(lines[PATH].contains("DANCE"), "{:?}", lines[PATH]);
     }
 
     /// The decoded sleeve carries the URL it came from, and the band checks it.
@@ -2851,8 +2973,13 @@ mod tests {
             artist_state(),
             AppState::new(),
         ];
-        // Album and artist search tabs draw their own row builders.
-        for tab in [SearchTab::Albums, SearchTab::Artists, SearchTab::Playlists] {
+        // Album, artist, playlist and station tabs draw their own row builders.
+        for tab in [
+            SearchTab::Albums,
+            SearchTab::Artists,
+            SearchTab::Playlists,
+            SearchTab::Stations,
+        ] {
             let mut st = search_state();
             st.search_tab = tab;
             states.push(st);
@@ -2889,7 +3016,7 @@ mod tests {
         let lines = render(&mut st, 90, 14);
         // Trail + blank, then the band (summary, ▶ play, spacer),
         // then the column header + spacer, then the rows.
-        assert!(lines[0].contains("MY LIST"));
+        assert!(lines[PATH].contains("MY LIST"));
         assert!(lines[4].contains("My List"));
         assert!(lines[4].contains("3 tracks · 4 min"));
         assert!(lines[5].contains("▶ play"));
@@ -3121,7 +3248,7 @@ mod tests {
             list.total = Some(200);
         }
         let lines = render(&mut st, 70, 14);
-        assert!(lines[0].contains("MY LIST (LOADING…)"));
+        assert!(lines[PATH].contains("MY LIST (LOADING…)"));
         assert!(lines[4].contains("0 of 200 tracks"));
         assert!(!lines.iter().any(|l| l.contains("this playlist is empty")));
     }
@@ -3144,7 +3271,11 @@ mod tests {
                 list.kind = kind;
             }
             let lines = render(&mut st, 70, 12);
-            assert!(lines[0].contains("MY LIST"), "{kind:?}: {:?}", lines[0]);
+            assert!(
+                lines[PATH].contains("MY LIST"),
+                "{kind:?}: {:?}",
+                lines[PATH]
+            );
         }
     }
 
@@ -3176,8 +3307,127 @@ mod tests {
                 owner_id: "someone".into(),
                 snapshot_id: "s1".into(),
             }],
+            stations: vec![test_station("st1", "Radio Paradise")],
+            ..Default::default()
         });
         st
+    }
+
+    /// A station with enough on it to fill every column of the table.
+    fn test_station(uuid: &str, name: &str) -> crate::app::state::Station {
+        crate::app::state::Station {
+            uuid: uuid.into(),
+            name: name.into(),
+            url: format!("http://example.test/{uuid}"),
+            homepage: String::new(),
+            tags: "eclectic,rock".into(),
+            country: "United States".into(),
+            countrycode: "US".into(),
+            language: "english".into(),
+            codec: "MP3".into(),
+            bitrate: 128,
+            votes: 900,
+            hls: false,
+        }
+    }
+
+    /// The Stations tab is the directory's own table, not a fifth layout: the
+    /// same columns a radio page draws, so a station reads the same wherever
+    /// you found it.
+    #[test]
+    fn the_stations_tab_draws_the_directorys_own_table() {
+        let mut st = search_state();
+        st.search_tab = SearchTab::Stations;
+        let joined = render(&mut st, 90, 18).join("\n");
+        for column in ["Station", "Tags", "Where", "Stream"] {
+            assert!(joined.contains(column), "missing {column:?} in {joined}");
+        }
+        assert!(joined.contains("Radio Paradise"), "{joined}");
+        assert!(joined.contains("MP3 128k"), "{joined}");
+        assert!(joined.contains("1 results"), "{joined}");
+    }
+
+    /// The saved star and the playing note reach search results too, which is
+    /// only true if `radio_favorites` and the playing station are threaded
+    /// through `draw` to this tab.
+    #[test]
+    fn a_saved_or_playing_station_is_marked_in_search_results() {
+        let station = test_station("st1", "Radio Paradise");
+
+        let mut st = search_state();
+        st.search_tab = SearchTab::Stations;
+        st.radio_favorites = vec![station.clone()];
+        let saved = render(&mut st, 90, 18).join("\n");
+        assert!(
+            saved.contains(&format!(
+                "{} Radio Paradise",
+                super::super::table::LIKED_MARK
+            )),
+            "{saved}"
+        );
+
+        let mut st = search_state();
+        st.search_tab = SearchTab::Stations;
+        st.radio = Some(crate::app::state::RadioPlayback {
+            station,
+            is_playing: true,
+            started_at: std::time::Instant::now(),
+            title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            volume_percent: 50,
+        });
+        let playing = render(&mut st, 90, 18).join("\n");
+        assert!(playing.contains("♫ Radio Paradise"), "{playing}");
+    }
+
+    /// A directory that has not answered yet is not a directory that answered
+    /// "nothing". The count band says which, so an empty tab mid-flight cannot
+    /// be read as a failed search.
+    #[test]
+    fn a_pending_stations_tab_says_it_is_searching() {
+        let mut st = search_state();
+        st.search_tab = SearchTab::Stations;
+        if let MainView::Search(r) = &mut st.main {
+            r.stations.clear();
+            r.stations_loading = true;
+        }
+        let joined = render(&mut st, 90, 18).join("\n");
+        assert!(joined.contains("searching…"), "{joined}");
+        assert!(!joined.contains("0 results"), "{joined}");
+        assert!(!joined.contains("no stations for"), "{joined}");
+    }
+
+    /// …and once it has answered, an empty tab says so plainly. Not "no
+    /// stations results for", which the generic template would have produced.
+    #[test]
+    fn an_answered_empty_stations_tab_says_there_are_none() {
+        let mut st = search_state();
+        st.search_tab = SearchTab::Stations;
+        if let MainView::Search(r) = &mut st.main {
+            r.stations.clear();
+            r.stations_loading = false;
+        }
+        let joined = render(&mut st, 90, 18).join("\n");
+        assert!(joined.contains("no stations for \"muse\""), "{joined}");
+    }
+
+    /// The tab strip must not move while the slower half lands: its labels are
+    /// hit rects, and a label that grew or shrank mid-search would slide the
+    /// other tabs out from under the pointer.
+    #[test]
+    fn the_tab_strip_does_not_move_while_the_stations_land() {
+        let mut st = search_state();
+        st.search_tab = SearchTab::Tracks;
+        if let MainView::Search(r) = &mut st.main {
+            r.stations.clear();
+            r.stations_loading = true;
+        }
+        render(&mut st, 90, 18);
+        let pending = st.hit.search_tabs.clone();
+
+        let mut st = search_state();
+        st.search_tab = SearchTab::Tracks;
+        render(&mut st, 90, 18);
+        assert_eq!(pending, st.hit.search_tabs);
     }
 
     #[test]
@@ -3186,7 +3436,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
         terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        assert_eq!(st.hit.search_tabs.len(), 4);
+        assert_eq!(st.hit.search_tabs.len(), SearchTab::ALL.len());
         for (rect, tab) in &st.hit.search_tabs {
             assert!(!rect.is_empty());
             let text: String = (rect.x..rect.right())
@@ -3285,7 +3535,7 @@ mod tests {
     fn artist_page_stacks_a_portrait_band_over_tracks_then_cards() {
         let mut st = artist_state();
         let lines = render(&mut st, 90, 26);
-        assert!(lines[0].contains("MUSE"));
+        assert!(lines[PATH].contains("MUSE"));
         // The photo occupies the left 12 cells of the six band rows (a
         // placeholder swatch here: nothing is decoded in the test).
         let w = super::super::table::art_w(ART_H) as usize;

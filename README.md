@@ -112,7 +112,9 @@ The path stays a path rather than a log of everything you clicked. Opening a pag
 already on it walks *back* to that page instead of adding a second copy, so bouncing
 between an album and its artist never lengthens the trail, and opening the page you are
 already standing on does nothing. Search is one slot: a new query takes the old one's
-place wherever it sat. A path too long for the row loses its middle — both `HOME` and the
+place wherever it sat. `/` asks both catalogues at once, wherever you press it, and the
+answers come back on one page — **Tracks**, **Albums**, **Artists**, **Playlists** and
+**Stations**. The Spotify tabs land first; stations follow when the directory answers. A path too long for the row loses its middle — both `HOME` and the
 page you're on stay put, with an `…` standing for what was dropped.
 
 The player view draws the same path over the page waiting underneath, and clicking any of
@@ -125,8 +127,9 @@ Stations come from [Radio Browser](https://api.radio-browser.info), the communit
 directory — no account, no API key, around 57,000 stations across 241 countries. The page
 has four tabs (`←` / `→`, or click them): **Popular**, the directory's own most-voted chart;
 **Countries** and **Genres**, which you drill into; and **Saved**, the ones you kept.
-Pressing `/` on any radio page searches stations rather than Spotify — the search row at
-the top of the screen says which of the two it is pointed at.
+This page is for browsing; to find a station by name just use the search box, like
+anything else — `/` asks Spotify and the directory together, and the stations come back
+under a **Stations** tab beside the Spotify ones.
 
 `Enter` plays the selected station, and `Enter` on the station already playing stops it.
 `L` saves a station, or unsaves it; saved stations live in `%APPDATA%\spot\radio.json`,
@@ -168,7 +171,7 @@ is a worse answer than a row that says why it won't play.
 | `L` | like / unlike the track — the selected row, or the playing one in the player view; on a station row, save it |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction |
-| `/` | search Spotify — or, on a radio page, the station directory |
+| `/` | search Spotify and the radio directory at once |
 | `R` | refresh the current view and your playlists |
 | `?` | help overlay |
 | `q`, `Ctrl-c` | quit |

@@ -389,24 +389,17 @@ fn handle_search_input(
                 // were — nothing there knows it is open — and results the
                 // player was hiding would be worse than a redundant line.
                 st.show_player = false;
-                // The prompt searches whatever you are looking at. On a radio
-                // page that is the station directory — the two catalogues have
-                // nothing to do with each other, and one box that quietly
-                // queried both would return a list nobody asked for.
-                if matches!(st.main, MainView::Radio(_)) {
-                    navigate(
-                        &mut st,
-                        AppCommand::LoadRadio {
-                            scope: RadioScope::Search(query),
-                        },
-                        tx,
-                    );
-                } else {
-                    // Before the tab reset, so the snapshot keeps the tab the
-                    // page you are leaving was on.
-                    navigate(&mut st, AppCommand::Search(query), tx);
-                    st.search_tab = SearchTab::Tracks;
-                }
+                // One box, one query, both catalogues. Which of them you meant
+                // is a tab on the results rather than a mode on the box: the
+                // old prompt pointed at Spotify or at the station directory
+                // depending on the page behind it, which meant you could not
+                // reach a station without first walking to Radio, and could not
+                // reach Spotify from there at all.
+                //
+                // Before the tab reset, so the snapshot keeps the tab the page
+                // you are leaving was on.
+                navigate(&mut st, AppCommand::Search(query), tx);
+                st.search_tab = SearchTab::Tracks;
             }
         }
         KeyCode::Backspace => {
@@ -801,6 +794,16 @@ fn after_pop(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 name: v.name.clone(),
             });
         }
+        // A search frozen onto the stack mid-flight: the task that would have
+        // filled it checked the view it was about to write to, found the page
+        // the user had moved on to, and exited. Nothing is coming, so without
+        // this the restored page would sit on "searching…" for ever. One
+        // command rather than two — the query is one thing, and re-asking the
+        // half that already answered costs a round trip against a page that
+        // would otherwise never finish.
+        MainView::Search(r) if r.stations_loading => {
+            let _ = tx.send(AppCommand::Search(r.query.clone()));
+        }
         _ => {}
     }
 }
@@ -909,9 +912,11 @@ fn flip_sort(st: &mut AppState) {
 
 /// ←/→: switch tabs on the two tabbed views.
 ///
-/// Search's tabs are four cuts of one result set already in hand, so switching
-/// is free. Radio's are four different queries, so switching *navigates* — the
-/// new tab is its own page, and Esc walks back to the one you left.
+/// Search's tabs are five cuts of one query already answered, so switching is
+/// free — Stations came from a second catalogue, but it was asked at the same
+/// moment and is in hand by the time you reach it. Radio's are four different
+/// queries, so switching *navigates* — the new tab is its own page, and Esc
+/// walks back to the one you left.
 fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand>) {
     match &st.main {
         MainView::Search(_) => {
@@ -1008,6 +1013,18 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             }
             return;
         }
+        // A station in a search result is the same thing as a station on a
+        // radio page, and is played the same way. It has to be resolved up
+        // here rather than in the `cmd` match below: that one holds `st`
+        // immutably for the length of the match, and `play_station` needs it
+        // mutably.
+        MainView::Search(results) if st.search_tab == SearchTab::Stations => {
+            let Some(station) = results.stations.get(st.main_index).cloned() else {
+                return;
+            };
+            play_station(st, station, tx);
+            return;
+        }
         _ => {}
     }
 
@@ -1082,6 +1099,8 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                     context_uri: p.uri.clone(),
                     offset_uri: None,
                 }),
+            // Resolved above, before this match takes its borrow.
+            SearchTab::Stations => None,
         },
     };
     let Some(cmd) = cmd else { return };
@@ -1117,6 +1136,39 @@ fn display_tracks(list: &TrackList) -> Vec<Track> {
 /// changed. An HLS station is refused here rather than in the client, because
 /// this is the only place that can say so while the row is still under the
 /// cursor.
+/// The station under the cursor, wherever stations are listed.
+///
+/// Two pages list them now — a radio page, and the Stations tab of a search —
+/// and `Enter`, `x` and `L` all mean the same thing on both. One definition, so
+/// the three keys cannot come to disagree about which row they are on.
+/// Whether the rows under the cursor are stations at all.
+///
+/// Distinct from [`selected_station`] returning `Some`: a radio page's facet
+/// rows, and a Stations tab the directory has not answered yet, are station
+/// pages with no station under the cursor. Keys that act on a station must stop
+/// there rather than fall through to whatever a Spotify page would have done.
+fn lists_stations(st: &AppState) -> bool {
+    match &st.main {
+        MainView::Radio(_) => true,
+        MainView::Search(_) => st.search_tab == SearchTab::Stations,
+        _ => false,
+    }
+}
+
+fn selected_station(st: &AppState) -> Option<&Station> {
+    match &st.main {
+        MainView::Radio(v) => match v.rows.get(st.main_index) {
+            Some(RadioRow::Station(s)) => Some(s),
+            // A country or genre row is a door, not a station.
+            _ => None,
+        },
+        MainView::Search(r) if st.search_tab == SearchTab::Stations => {
+            r.stations.get(st.main_index)
+        }
+        _ => None,
+    }
+}
+
 fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCommand>) {
     // Enter on the station already playing stops it, which is the only way to
     // stop radio without starting something else. It needs no key of its own:
@@ -1193,10 +1245,18 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             _ => None,
         },
         // A station is played, never opened, so `x` and Enter are the same
-        // gesture here. On a facet row there is nothing to play.
-        MainView::Radio(v) => {
-            if let Some(RadioRow::Station(s)) = v.rows.get(st.main_index) {
-                let station = s.clone();
+        // gesture here — on a radio page and on a search's Stations tab alike.
+        // On a facet row there is nothing to play.
+        MainView::Radio(_) => {
+            if let Some(station) = selected_station(st).cloned() {
+                play_station(st, station, tx);
+            }
+            return;
+        }
+        // Only on the Stations tab; the other four fall through to the
+        // current view's context below, as they always have.
+        MainView::Search(_) if st.search_tab == SearchTab::Stations => {
+            if let Some(station) = selected_station(st).cloned() {
                 play_station(st, station, tx);
             }
             return;
@@ -1373,9 +1433,15 @@ fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     // On a station row `L` keeps the station. Same key, same gesture — the
     // difference is only that a station is kept in a file of spot's own,
     // because the directory has no account to keep it in.
-    if let MainView::Radio(v) = &st.main {
-        if let Some(RadioRow::Station(s)) = v.rows.get(st.main_index) {
-            let _ = tx.send(AppCommand::ToggleSavedStation(Box::new(s.clone())));
+    //
+    // The guard is `lists_stations` rather than `selected_station(..).is_some()`
+    // on purpose. A radio page's facet rows, and an empty Stations tab, have no
+    // station under the cursor but are still station pages: falling through
+    // from there would drop into the `None` arm below and quietly like the
+    // *playing Spotify track*, which is not what anyone pressed `L` for.
+    if lists_stations(st) {
+        if let Some(station) = selected_station(st).cloned() {
+            let _ = tx.send(AppCommand::ToggleSavedStation(Box::new(station)));
         }
         return;
     }
@@ -2402,6 +2468,112 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a facet row likes nothing");
     }
 
+    /// A search view's Stations tab, with one station on it.
+    fn station_search(station: Station) -> MainView {
+        MainView::Search(crate::app::state::SearchResults {
+            query: "jazz".into(),
+            stations: vec![station],
+            ..Default::default()
+        })
+    }
+
+    /// A station found through search is the same object as one found on a
+    /// radio page, so Enter plays it the same way.
+    #[test]
+    fn enter_on_a_station_result_plays_it() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = station_search(test_station("a", "Radio Paradise"));
+        st.search_tab = SearchTab::Stations;
+        activate_selection(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayStation(s)) if s.uuid == "a"));
+    }
+
+    /// …and Enter on the station already playing stops it, as on a radio page.
+    #[test]
+    fn enter_on_the_playing_station_result_stops_it() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        let station = test_station("a", "Radio Paradise");
+        st.main = station_search(station.clone());
+        st.search_tab = SearchTab::Stations;
+        st.radio = Some(live_radio(station));
+        activate_selection(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::StopRadio)));
+    }
+
+    /// `x` is the same gesture as Enter on a station, wherever the row is.
+    #[test]
+    fn x_on_a_station_result_is_the_same_as_enter() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = station_search(test_station("a", "Radio Paradise"));
+        st.search_tab = SearchTab::Stations;
+        play_without_opening(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayStation(s)) if s.uuid == "a"));
+    }
+
+    /// The guard that matters: `L` on a station result keeps the *station*.
+    /// Without it the lookup below would come back empty and the key would
+    /// fall through to liking whatever Spotify happens to be playing.
+    #[test]
+    fn l_on_a_station_result_saves_the_station_not_the_playing_track() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = station_search(test_station("a", "Radio Paradise"));
+        st.search_tab = SearchTab::Stations;
+        st.playback = Some(playing("spotify:playlist:p1"));
+        toggle_like_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::ToggleSavedStation(s)) if s.uuid == "a"
+        ));
+        assert!(rx.try_recv().is_err(), "nothing else may follow");
+
+        // And an empty Stations tab likes nothing at all, rather than falling
+        // through to the playing track.
+        st.main = MainView::Search(crate::app::state::SearchResults {
+            query: "jazz".into(),
+            ..Default::default()
+        });
+        toggle_like_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "an empty tab likes nothing");
+    }
+
+    /// A station has no album, no artist and no Spotify URI, so the browse
+    /// and queue keys mean nothing on one.
+    #[test]
+    fn browse_keys_do_nothing_on_a_station_result() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = station_search(test_station("a", "Radio Paradise"));
+        st.search_tab = SearchTab::Stations;
+        open_album_of_selection(&mut st, &tx);
+        open_artist_of_selection(&mut st, &tx);
+        queue_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "a station browses nowhere");
+    }
+
+    /// Search's tabs are cuts of one answer already in hand, Stations
+    /// included: reaching it costs no fetch and no navigation.
+    #[test]
+    fn left_and_right_reach_the_stations_tab() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.main = station_search(test_station("a", "Radio Paradise"));
+        st.search_tab = SearchTab::Tracks;
+
+        cycle_view_tab(&mut st, -1, &tx);
+        assert_eq!(st.search_tab, SearchTab::Stations, "←  wraps onto it");
+        cycle_view_tab(&mut st, 1, &tx);
+        assert_eq!(st.search_tab, SearchTab::Tracks);
+        for _ in 0..4 {
+            cycle_view_tab(&mut st, 1, &tx);
+        }
+        assert_eq!(st.search_tab, SearchTab::Stations, "and → walks to it");
+        assert!(rx.try_recv().is_err(), "switching tabs fetches nothing");
+    }
+
     /// Radio's tabs are four different queries, so ←/→ navigates rather than
     /// re-cutting a result set already in hand.
     #[test]
@@ -2456,12 +2628,16 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AppCommand::VolumeRel(5))));
     }
 
-    /// The one search box points at whichever catalogue the page it is over
-    /// came from.
+    /// The one search box asks both catalogues, from wherever it is pressed.
+    /// It used to point at whichever one the page behind it came from, which
+    /// meant the same keystroke did two different things depending on where
+    /// you were standing.
     #[test]
-    fn the_prompt_searches_stations_on_a_radio_page() {
+    fn the_prompt_searches_both_catalogues_from_every_page() {
         let (tx, mut rx) = channel();
         let state = Arc::new(RwLock::new(AppState::new()));
+
+        // A radio page: the one that used to be the exception.
         {
             let mut st = state.write();
             st.main = radio_page(RadioScope::Popular, vec![]);
@@ -2469,12 +2645,10 @@ mod tests {
             st.input_buffer = "jazz".into();
         }
         handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(AppCommand::LoadRadio { scope: RadioScope::Search(q) }) if q == "jazz"
-        ));
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "jazz"));
+        assert_eq!(state.read().search_tab, SearchTab::Tracks);
 
-        // Anywhere else it is still Spotify.
+        // And everywhere else, the same command.
         {
             let mut st = state.write();
             st.main = MainView::Home;
