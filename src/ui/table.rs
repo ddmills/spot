@@ -260,11 +260,7 @@ pub fn actions_label() -> String {
 /// cannot drift into two spellings of the same control.
 pub fn action_spans(liked: Option<bool>, hover_like: bool, hover_add: bool) -> Vec<Span<'static>> {
     let lit = |style: Style, hovered: bool| {
-        if hovered {
-            hover_style(style)
-        } else {
-            style
-        }
+        if hovered { hover_style(style) } else { style }
     };
     let like_style = if liked == Some(true) {
         theme::accent()

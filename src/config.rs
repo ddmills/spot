@@ -166,9 +166,8 @@ mod tests {
     /// rather than stopping the run — the prefetch fills it again.
     #[test]
     fn a_corrupt_playlist_cache_reads_as_empty() {
-        let empty: HashMap<String, PlaylistContents> = serde_json::from_str("{ nonsense")
-            .ok()
-            .unwrap_or_default();
+        let empty: HashMap<String, PlaylistContents> =
+            serde_json::from_str("{ nonsense").ok().unwrap_or_default();
         assert!(empty.is_empty());
     }
 }

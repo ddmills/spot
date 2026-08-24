@@ -1945,7 +1945,12 @@ impl Client {
                 // while it runs comes back with a hash the next load rejects
                 // and gets walked again.
                 .filter_map(|id| {
-                    let snapshot = st.playlists.iter().find(|p| p.id == id)?.snapshot_id.clone();
+                    let snapshot = st
+                        .playlists
+                        .iter()
+                        .find(|p| p.id == id)?
+                        .snapshot_id
+                        .clone();
                     Some((id, snapshot))
                 })
                 .filter(|(id, _)| self.membership_probe.insert(id.clone()))
@@ -2029,11 +2034,9 @@ impl Client {
         st.picker = None;
         drop(st);
         if !uncached.is_empty() {
-            let _ = self
-                .tx
-                .send(AppCommand::CachePlaylistTracks {
-                    playlist_ids: uncached,
-                });
+            let _ = self.tx.send(AppCommand::CachePlaylistTracks {
+                playlist_ids: uncached,
+            });
         }
     }
 
@@ -2775,7 +2778,10 @@ mod tests {
         let playlists = vec![listed("p1", "moved", "me"), listed("p2", "s2", "me")];
         assert!(drop_stale_playlist_tracks(&mut cache, &playlists));
         assert!(!cache.contains_key("p1"), "the changed playlist stood");
-        assert!(cache.contains_key("p2"), "an unchanged playlist was dropped");
+        assert!(
+            cache.contains_key("p2"),
+            "an unchanged playlist was dropped"
+        );
         assert!(!cache.contains_key("gone"), "a playlist you no longer have");
         assert!(
             !drop_stale_playlist_tracks(&mut cache, &playlists),

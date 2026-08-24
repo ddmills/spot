@@ -1750,7 +1750,12 @@ fn body_area(area: Rect) -> Rect {
 
 /// Centered dim hint for a view with nothing to list.
 fn empty_message(frame: &mut Frame, inner: Rect, text: &str) {
-    centered_line(frame, inner, 0, Line::styled(text.to_string(), theme::dim()));
+    centered_line(
+        frame,
+        inner,
+        0,
+        Line::styled(text.to_string(), theme::dim()),
+    );
 }
 
 /// Centered spinner and label while a view's own contents are in flight.
@@ -3449,7 +3454,12 @@ mod tests {
         let bg_at = |st: &mut AppState, x: u16, y: u16| {
             let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
             terminal.draw(|f| screen(st, f)).unwrap();
-            terminal.backend().buffer().cell(Position { x, y }).unwrap().bg
+            terminal
+                .backend()
+                .buffer()
+                .cell(Position { x, y })
+                .unwrap()
+                .bg
         };
 
         // The padding is part of the control, so the pointer catches it a cell
@@ -3595,7 +3605,10 @@ mod tests {
         let lines = render(&mut st, 60, 16);
         assert!(lines.iter().any(|l| l.contains("asked again once")));
         assert!(lines.iter().any(|l| l.contains(RETRY_PILL)));
-        assert!(!st.hit.retry_btn.is_empty(), "the tally crowded the control");
+        assert!(
+            !st.hit.retry_btn.is_empty(),
+            "the tally crowded the control"
+        );
 
         st.retries = 3;
         assert!(

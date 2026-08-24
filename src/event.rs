@@ -2450,7 +2450,10 @@ mod tests {
         let mut st = AppState::new();
         st.show_player = true;
         st.set_queue(Some(crate::app::queue::Queue::new(
-            vec![track("Starlight", Some("a1")), track("Hysteria", Some("a1"))],
+            vec![
+                track("Starlight", Some("a1")),
+                track("Hysteria", Some("a1")),
+            ],
             0,
             "My Mix",
         )));
@@ -3831,10 +3834,18 @@ mod tests {
         cache_playlists(&mut st, &["p3"]);
         handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
         st.hit.picker_list = Rect::new(10, 10, 40, 10);
-        assert_eq!(st.picker_rows(), vec![2, 0], "the row it is on is not first");
+        assert_eq!(
+            st.picker_rows(),
+            vec![2, 0],
+            "the row it is on is not first"
+        );
 
         handle_click(&mut st, Position { x: 20, y: 10 }, &tx);
-        assert_eq!(st.picker_rows(), vec![2, 0], "the row moved under the click");
+        assert_eq!(
+            st.picker_rows(),
+            vec![2, 0],
+            "the row moved under the click"
+        );
     }
 
     /// One click on a row is the whole gesture: it flips that row, and the box

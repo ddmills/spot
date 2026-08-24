@@ -387,7 +387,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let (Some(pb), Some(track)) = (playback.as_ref(), track) else {
         deck::no_playback_hint(frame, header_area, spotify_ready);
         draw_queue(
-            frame, queue_area, queue.as_ref(), 0, queue_list, hit, liked, mouse,
+            frame,
+            queue_area,
+            queue.as_ref(),
+            0,
+            queue_list,
+            hit,
+            liked,
+            mouse,
         );
         return;
     };
@@ -1972,7 +1979,10 @@ mod tests {
         let (like, add) = (st.hit.queue_like_col, st.hit.queue_add_col);
         assert_eq!(like.width, 3, "the control lost its padding");
         assert_eq!(add.x, like.right(), "the pair is not flush");
-        assert!(st.hit.player_queue.contains(Position { x: like.x, y: like.y }));
+        assert!(st.hit.player_queue.contains(Position {
+            x: like.x,
+            y: like.y
+        }));
 
         // Each mark is centred in its own padded cell.
         let cell = |x: u16, row: u16| {
