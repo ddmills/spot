@@ -1024,8 +1024,13 @@ pub struct HitAreas {
     pub album_names: Vec<(Rect, usize)>,
     /// The ▶ play control on each visible album card, with the row it plays.
     pub card_play: Vec<(Rect, usize)>,
+    /// The shuffle control on each visible album card, with the row it plays.
+    pub card_shuffle: Vec<(Rect, usize)>,
     /// The ▶ Play button in a view's header band; plays the whole context.
     pub header_play_btn: Rect,
+    /// The shuffle button in a view's header band; plays the whole context
+    /// shuffled.
+    pub header_shuffle_btn: Rect,
     /// The trail on a page's section row, one entry per crumb, in the order
     /// they are drawn. A trail rather than a single `← <page>` pill: a pill
     /// sitting after the section label takes its column from the label's width

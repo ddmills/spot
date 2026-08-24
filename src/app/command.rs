@@ -44,12 +44,18 @@ pub enum AppCommand {
         name: String,
         key: Option<String>,
         loading: bool,
+        /// Start the queue shuffled and turn the shuffle mode on; false
+        /// inherits whatever mode is in force.
+        shuffle: bool,
     },
     /// Play a source whose rows are not loaded yet, from the top: fetch its
     /// pages and grow the queue as they land.
     PlayFetched {
         source: FetchSource,
         name: String,
+        /// Start the queue shuffled and turn the shuffle mode on; false
+        /// inherits whatever mode is in force.
+        shuffle: bool,
     },
     /// Enter on a queue row: play that row of the queue as it stands.
     JumpTo(usize),

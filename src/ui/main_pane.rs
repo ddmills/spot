@@ -597,6 +597,50 @@ const CARD_H: usize = CARD_ART_H as usize + 1;
 const MIN_CARD_TEXT_W: u16 = 24;
 /// The play control on a card, and on the header bands above it.
 const PLAY_PILL: &str = "▶ play";
+/// The shuffle control beside every ▶ play. The bare word, no glyph: the
+/// deck already names the mode in words, and the common shuffle glyphs are
+/// emoji- or ambiguous-width, which would drift the recorded hit rect.
+const SHUFFLE_PILL: &str = "shuffle";
+
+/// Narrowest text column that seats both card pills with their gap; below it
+/// the card keeps ▶ play alone.
+fn card_pills_min_w() -> usize {
+    super::table::width(PLAY_PILL) + 2 + super::table::width(SHUFFLE_PILL)
+}
+
+/// Append the shuffle pill after a band's ▶ play and return its hit rect.
+/// Dim at rest; under the pointer it takes the accent, which `hover_style`
+/// keeps — it only promotes DIM text.
+fn shuffle_segment(
+    spans: &mut Vec<Span<'static>>,
+    x: &mut u16,
+    area: Rect,
+    mouse: Option<Position>,
+) -> Rect {
+    spans.push(Span::raw("  "));
+    *x = x.saturating_add(2);
+    let rect = Rect {
+        x: *x,
+        y: area.y,
+        width: super::table::width(SHUFFLE_PILL) as u16,
+        height: 1,
+    };
+    let hovered = mouse.is_some_and(|m| rect.contains(m)) && rect.right() <= area.right();
+    super::table::segment(
+        spans,
+        x,
+        area,
+        mouse,
+        vec![Span::styled(
+            SHUFFLE_PILL,
+            if hovered {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+        )],
+    )
+}
 
 /// One line of the artist page's scrolling body.
 ///
@@ -782,6 +826,7 @@ fn artist_band(
         mouse,
         vec![Span::styled(PLAY_PILL, theme::accent())],
     );
+    hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
 
     let used = if stacked { ART_BAND_H } else { TEXT_BAND_H };
@@ -909,18 +954,20 @@ fn artist_body(
         );
     }
 
-    // The two controls on each visible card — its name and its ▶ play —
-    // recorded before the rows are built, so hovering one can light it.
+    // The controls on each visible card — its name, its ▶ play, and its
+    // shuffle — recorded before the rows are built, so hovering one can
+    // light it.
     hit.card_play.clear();
+    hit.card_shuffle.clear();
     hit.album_names.clear();
     for (album, a) in v.display.iter().map(|&i| &v.albums[i]).enumerate() {
         let first = cards_from + album * CARD_H;
-        let push = |hits: &mut Vec<(Rect, usize)>, row: u16, w: u16| {
+        let push = |hits: &mut Vec<(Rect, usize)>, row: u16, dx: u16, w: u16| {
             let Some(y) = screen_y(first + row as usize) else {
                 return;
             };
             let rect = Rect {
-                x: body.x + indent,
+                x: body.x + indent + dx,
                 y,
                 width: w,
                 height: 1,
@@ -933,12 +980,21 @@ fn artist_body(
         // The link is the name as printed — not the cell it sits in, which is
         // padded to the pane's width and would make the whole row a link.
         let name_w = super::table::width(fit(&a.name, card_text_w).trim_end()) as u16;
-        push(&mut hit.album_names, 0, name_w);
+        push(&mut hit.album_names, 0, 0, name_w);
         push(
             &mut hit.card_play,
             CARD_PLAY_ROW,
+            0,
             super::table::width(PLAY_PILL) as u16,
         );
+        if card_text_w >= card_pills_min_w() {
+            push(
+                &mut hit.card_shuffle,
+                CARD_PLAY_ROW,
+                (super::table::width(PLAY_PILL) + 2) as u16,
+                super::table::width(SHUFFLE_PILL) as u16,
+            );
+        }
     }
     let over = |hits: &[(Rect, usize)]| {
         mouse.and_then(|m| {
@@ -949,6 +1005,7 @@ fn artist_body(
     };
     let hover_album = over(&hit.album_names);
     let hover_play = over(&hit.card_play);
+    let hover_shuffle = over(&hit.card_shuffle);
 
     // Clickable cells of the track block, clipped to the rows on screen.
     let mut hover_cell: Option<(usize, HoverCol)> = None;
@@ -1030,6 +1087,7 @@ fn artist_body(
                 split + album == main_index,
                 hover_album == Some(album),
                 hover_play == Some(album),
+                hover_shuffle == Some(album),
             ),
             ArtistLine::Blank => ListItem::new(Line::default()),
         })
@@ -1086,6 +1144,7 @@ const CARD_PLAY_ROW: u16 = 2;
 
 /// One line of an album card: the name, its metadata, a blank, then ▶ play,
 /// each indented past the sleeve.
+#[allow(clippy::too_many_arguments)]
 fn card_line(
     a: &crate::app::state::AlbumItem,
     row: u16,
@@ -1094,6 +1153,7 @@ fn card_line(
     selected: bool,
     hovered: bool,
     play_hover: bool,
+    shuffle_hover: bool,
 ) -> ListItem<'static> {
     let pad = Span::raw(" ".repeat(indent));
     let mut spans = vec![pad];
@@ -1113,6 +1173,15 @@ fn card_line(
             // is a separate target, and brightening it would read as the
             // thing selected.
             spans.push(Span::styled(PLAY_PILL, style));
+            if text_w >= card_pills_min_w() {
+                spans.push(Span::raw("  "));
+                let style = if shuffle_hover {
+                    super::table::hover_style(theme::accent())
+                } else {
+                    theme::dim()
+                };
+                spans.push(Span::styled(SHUFFLE_PILL, style));
+            }
             return ListItem::new(Line::from(spans));
         }
         _ => {}
@@ -1303,6 +1372,7 @@ fn header_band(
         mouse,
         vec![Span::styled(PLAY_PILL, accent)],
     );
+    hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
     if list.sort.key != SortKey::Position {
         let hint = Span::styled(
@@ -2639,7 +2709,9 @@ mod tests {
         assert!(lines[5].contains("Donna The Buffalo · 2018"));
         assert!(lines[6].contains("2 tracks"));
         assert!(lines[8].contains("▶ play"));
+        assert!(lines[8].contains("shuffle"));
         assert!(!st.hit.header_play_btn.is_empty());
+        assert!(!st.hit.header_shuffle_btn.is_empty());
         // The table starts after the band and its spacer.
         assert!(lines[11].contains("Title"));
     }
@@ -3042,7 +3114,9 @@ mod tests {
         assert!(lines[4].contains("My List"));
         assert!(lines[4].contains("3 tracks · 4 min"));
         assert!(lines[5].contains("▶ play"));
+        assert!(lines[5].contains("shuffle"));
         assert!(!st.hit.header_play_btn.is_empty());
+        assert!(!st.hit.header_shuffle_btn.is_empty());
         assert!(lines[7].contains("Title"));
         assert!(lines[7].contains("Artist"));
         assert!(lines[7].contains("Album"));
@@ -3253,7 +3327,9 @@ mod tests {
         // Body height 6, under the band's minimum of 8.
         let lines = render(&mut st, 80, 10);
         assert!(!lines.iter().any(|l| l.contains("▶ play")));
+        assert!(!lines.iter().any(|l| l.contains("shuffle")));
         assert!(st.hit.header_play_btn.is_empty());
+        assert!(st.hit.header_shuffle_btn.is_empty());
     }
 
     #[test]
@@ -3594,7 +3670,9 @@ mod tests {
         assert!(lines[6].contains("1 record"));
         assert!(!lines[6].contains("top track"));
         assert!(lines[8].contains("▶ play"));
+        assert!(lines[8].contains("shuffle"));
         assert!(!st.hit.header_play_btn.is_empty());
+        assert!(!st.hit.header_shuffle_btn.is_empty());
 
         // Body: the two sections, in order. Both headings keep a blank row
         // under them, and this catalogue is one group deep, so the album
@@ -3608,7 +3686,20 @@ mod tests {
         assert!(lines[18].contains("Black Holes"));
         assert!(lines[19].contains("2006 · 12 tracks"));
         assert!(lines[20].contains("▶ play"));
+        assert!(lines[20].contains("shuffle"));
         assert_eq!(st.hit.card_play.len(), 1);
+        assert_eq!(st.hit.card_shuffle.len(), 1);
+    }
+
+    /// A pane too narrow to seat both pills keeps ▶ play and drops shuffle —
+    /// in the drawing and the hit rects alike.
+    #[test]
+    fn narrow_cards_drop_the_shuffle_pill() {
+        let mut st = artist_state();
+        let lines = render(&mut st, 14, 26);
+        assert!(!st.hit.card_play.is_empty());
+        assert!(st.hit.card_shuffle.is_empty());
+        assert!(!lines.iter().any(|l| l.contains("shuffle")));
     }
 
     /// Cards are five lines apiece, so the pane keeps a line model and every
@@ -3629,6 +3720,7 @@ mod tests {
         assert_eq!(&rows[12..17], &[Some(2), Some(2), Some(2), Some(2), None]);
         assert_eq!(st.hit.album_names.len(), 2);
         assert_eq!(st.hit.card_play.len(), 2);
+        assert_eq!(st.hit.card_shuffle.len(), 2);
     }
 
     /// A catalogue in several groups gets a strip under the heading, and the
@@ -3655,6 +3747,7 @@ mod tests {
         assert!(lines[20].contains("Origin Of Symmetry"));
         assert!(!lines.iter().any(|l| l.contains("Hysteria")));
         assert_eq!(st.hit.card_play.len(), 1);
+        assert_eq!(st.hit.card_shuffle.len(), 1);
         assert_eq!(
             st.hit
                 .artist_tabs

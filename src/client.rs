@@ -310,8 +310,13 @@ impl Client {
                 name,
                 key,
                 loading,
-            } => self.play(tracks, start, name, key, loading),
-            PlayFetched { source, name } => self.play_fetched(source, name).await,
+                shuffle,
+            } => self.play(tracks, start, name, key, loading, shuffle),
+            PlayFetched {
+                source,
+                name,
+                shuffle,
+            } => self.play_fetched(source, name, shuffle).await,
             QueueInsertNext(track) => {
                 let queued = {
                     let mut st = self.state.write();
@@ -327,7 +332,7 @@ impl Client {
                 // Nothing playing: `a` becomes a play of one track, which is
                 // the nearest honest reading of "put this on next".
                 if !queued {
-                    self.play(vec![track], 0, "Queue".to_string(), None, false);
+                    self.play(vec![track], 0, "Queue".to_string(), None, false, false);
                 }
             }
             SetLiked { uri, liked } => self.set_liked(uri, liked).await,
@@ -433,6 +438,7 @@ impl Client {
         name: String,
         key: Option<String>,
         loading: bool,
+        shuffle: bool,
     ) {
         self.yield_to_spotify();
         {
@@ -460,7 +466,20 @@ impl Client {
             if tracks.is_empty() {
                 return;
             }
-            let shuffle = st.playback.as_ref().is_some_and(|pb| pb.shuffle);
+            // A shuffle control asks for the mode, not just one mixed queue:
+            // record it in playback so the deck agrees and later plays
+            // inherit it. Before anything has played there is no playback to
+            // stamp, so install one; `load_current` rebuilds it right after,
+            // inheriting the bit.
+            if shuffle {
+                match st.playback.as_mut() {
+                    Some(pb) => pb.shuffle = true,
+                    None => {
+                        st.playback = Some(Playback::started(self.local_volume_pct(), true));
+                    }
+                }
+            }
+            let shuffle = shuffle || st.playback.as_ref().is_some_and(|pb| pb.shuffle);
             let mut q = Queue::new(tracks, start, name);
             q.source_key = key;
             q.loading = loading;
@@ -478,7 +497,7 @@ impl Client {
     /// Play a source whose rows are not in hand — a playlist row's `x`, an
     /// album card's ▶. The first page is fetched inline so play starts as
     /// soon as it lands; the rest stream into the queue behind it.
-    async fn play_fetched(&mut self, source: FetchSource, name: String) {
+    async fn play_fetched(&mut self, source: FetchSource, name: String, shuffle: bool) {
         let source = match source {
             FetchSource::Playlist { id } => TrackSource::Playlist(id),
             FetchSource::Album { id, year } => TrackSource::Album {
@@ -494,7 +513,7 @@ impl Client {
         // starting instantly.
         let cached = self.cache.lock().get(&key).map(|e| e.tracks.clone());
         if let Some(tracks) = cached {
-            self.play(tracks, 0, name, Some(key), false);
+            self.play(tracks, 0, name, Some(key), false, shuffle);
             return;
         }
 
@@ -516,7 +535,14 @@ impl Client {
             self.state.write().toast("nothing to play");
             return;
         }
-        self.play(tracks.clone(), 0, name, Some(key.clone()), has_more);
+        self.play(
+            tracks.clone(),
+            0,
+            name,
+            Some(key.clone()),
+            has_more,
+            shuffle,
+        );
         if !has_more {
             self.cache.lock().insert(
                 key,

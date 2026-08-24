@@ -168,12 +168,16 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
-    if let Some(row) = card_hit(&st.hit.album_names).or_else(|| card_hit(&st.hit.card_play)) {
-        let play = card_hit(&st.hit.card_play).is_some();
+    if let Some(row) = card_hit(&st.hit.album_names)
+        .or_else(|| card_hit(&st.hit.card_play))
+        .or_else(|| card_hit(&st.hit.card_shuffle))
+    {
+        let shuffle = card_hit(&st.hit.card_shuffle).is_some();
+        let play = shuffle || card_hit(&st.hit.card_play).is_some();
         st.main_index = row;
         st.last_main_click = None;
         if play {
-            play_selected_album(st, tx);
+            play_selected_album(st, tx, shuffle);
         } else {
             open_album_of_selection(st, tx);
         }
@@ -259,7 +263,12 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
     }
 
     if st.hit.header_play_btn.contains(pos) {
-        play_current_view(st, tx);
+        play_current_view(st, tx, false);
+        return;
+    }
+
+    if st.hit.header_shuffle_btn.contains(pos) {
+        play_current_view(st, tx, true);
         return;
     }
 
@@ -1033,7 +1042,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             if list.display.get(index).is_none() {
                 return;
             }
-            Some(play_list(list, index))
+            Some(play_list(list, index, false))
         }
         MainView::Artist(v) => match v.row(index) {
             // The visible top-tracks list, played directly.
@@ -1043,6 +1052,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 name: v.name.clone(),
                 key: None,
                 loading: false,
+                shuffle: false,
             }),
             // A card's row opens its album; its own ▶ play is what starts the
             // record without leaving the page.
@@ -1056,6 +1066,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 name: "Search results".to_string(),
                 key: None,
                 loading: false,
+                shuffle: false,
             }),
             SearchTab::Albums => results.albums.get(index).map(open_album_item),
             SearchTab::Artists => results.artists.get(index).map(|a| AppCommand::OpenArtist {
@@ -1069,6 +1080,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 .map(|p| AppCommand::PlayFetched {
                     source: FetchSource::Playlist { id: p.id.clone() },
                     name: p.name.clone(),
+                    shuffle: false,
                 }),
             // Resolved above, before this match takes its borrow.
             SearchTab::Stations => None,
@@ -1090,7 +1102,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// The `Play` a track list's row `start` sends: the display order as the
 /// play order, with the source key attached only when the rows are in fetch
 /// order — the one order later pages can honestly extend.
-fn play_list(list: &TrackList, start: usize) -> AppCommand {
+fn play_list(list: &TrackList, start: usize, shuffle: bool) -> AppCommand {
     let natural = list.sort.key == SortKey::Position;
     AppCommand::Play {
         tracks: display_tracks(list),
@@ -1098,6 +1110,7 @@ fn play_list(list: &TrackList, start: usize) -> AppCommand {
         name: list.header.name.clone(),
         key: list.cache_key.clone().filter(|_| natural),
         loading: natural && list.loading,
+        shuffle,
     }
 }
 
@@ -1173,9 +1186,9 @@ fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCom
     let _ = tx.send(AppCommand::PlayStation(Box::new(station)));
 }
 
-fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>, shuffle: bool) {
     let cmd = match &st.main {
-        MainView::Tracks(list) if !list.display.is_empty() => Some(play_list(list, 0)),
+        MainView::Tracks(list) if !list.display.is_empty() => Some(play_list(list, 0, shuffle)),
         MainView::Tracks(_) => None,
         // The page's top tracks, played as the list they are: spot owns the
         // queue, and the top tracks are the page's own answer to "play this
@@ -1186,6 +1199,7 @@ fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             name: v.name.clone(),
             key: None,
             loading: false,
+            shuffle,
         }),
         _ => None,
     };
@@ -1234,7 +1248,7 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             return;
         }
         _ => {
-            play_current_view(st, tx);
+            play_current_view(st, tx, false);
             return;
         }
     };
@@ -1242,6 +1256,7 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         let _ = tx.send(AppCommand::PlayFetched {
             source: FetchSource::Playlist { id },
             name,
+            shuffle: false,
         });
     }
 }
@@ -1553,7 +1568,7 @@ fn send_like(st: &AppState, uri: String, tx: &UnboundedSender<AppCommand>) {
 
 /// Play the selected album straight from its card, without opening it — the
 /// card's own ▶ play, and the artist page's answer to `x`.
-fn play_selected_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+fn play_selected_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>, shuffle: bool) {
     let MainView::Artist(v) = &st.main else {
         return;
     };
@@ -1568,6 +1583,7 @@ fn play_selected_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             year: a.release_year.clone(),
         },
         name: a.name.clone(),
+        shuffle,
     });
 }
 
@@ -1760,15 +1776,35 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
 
-        play_current_view(&mut st, &tx);
+        play_current_view(&mut st, &tx, false);
 
         match rx.try_recv() {
-            Ok(AppCommand::Play { start, tracks, .. }) => {
+            Ok(AppCommand::Play {
+                start,
+                tracks,
+                shuffle,
+                ..
+            }) => {
                 assert_eq!(start, 0);
                 assert_eq!(tracks.len(), 2);
+                assert!(!shuffle);
             }
             other => panic!("sent {other:?}"),
         }
+    }
+
+    /// The header's shuffle pill plays the same view, mixed.
+    #[test]
+    fn the_header_shuffle_button_plays_the_view_shuffled() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+
+        play_current_view(&mut st, &tx, true);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::Play { shuffle: true, .. })
+        ));
     }
 
     /// `L` flips whatever is known about the selected row: the saved one is
@@ -1955,14 +1991,16 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = artist_state();
         st.main_index = 1;
-        play_selected_album(&mut st, &tx);
+        play_selected_album(&mut st, &tx, false);
         match rx.try_recv() {
             Ok(AppCommand::PlayFetched {
                 source: FetchSource::Album { id, .. },
                 name,
+                shuffle,
             }) => {
                 assert_eq!(id, "a1");
                 assert_eq!(name, "Black Holes");
+                assert!(!shuffle);
             }
             other => panic!("sent {other:?}"),
         }
@@ -1970,8 +2008,26 @@ mod tests {
 
         // A top track is not a card, so the control cannot land on one.
         st.main_index = 0;
-        play_selected_album(&mut st, &tx);
+        play_selected_album(&mut st, &tx, false);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A card's shuffle pill starts the record mixed, without opening it.
+    #[test]
+    fn an_album_cards_shuffle_plays_it_shuffled() {
+        let (tx, mut rx) = channel();
+        let mut st = artist_state();
+        st.hit.main_list = Rect::new(0, 0, 40, 20);
+        st.hit.main_lines = vec![Some(0), None, None, None, Some(1), Some(1), Some(1)];
+        st.hit.card_shuffle = vec![(Rect::new(20, 6, 7, 1), 1)];
+
+        handle_click(&mut st, Position { x: 20, y: 6 }, &tx);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::PlayFetched { shuffle: true, .. })
+        ));
+        assert!(st.view_stack.is_empty(), "shuffling a card navigated away");
     }
 
     /// The artist page's `B` must not re-open the artist page.
