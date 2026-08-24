@@ -1,10 +1,11 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
+use super::table::centered;
 use super::theme;
+use crate::app::state::{AppState, UpdateState};
 
 /// The keymap, grouped for display. This is the single source of truth the
 /// README's key table must mirror (see the drift test below).
@@ -27,6 +28,7 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-d/u", "half page down / up"),
             ("H", "go home"),
             ("v", "toggle player view (Esc closes)"),
+            ("V", "cycle the visualizer (in the player view)"),
             ("← / →", "switch search, artist or radio tab"),
             ("Backspace", "back to previous view"),
             ("Esc", "back / close overlay"),
@@ -55,7 +57,9 @@ const MOUSE_HINTS: &[&str] = &[
     "click ♫ spot, top left of either view, to go home",
     "on Home, one click anywhere on a row opens it",
     "click rows to select / open · double-click plays",
-    "click the ★ column, or the ★ on the bar, to like a track",
+    "every track row ends in ★ +: like it, or put it on a playlist",
+    "the same pair sits on the bar and in the player, for what is playing",
+    "in that box, click a playlist to put the track on it or take it off",
     "on a radio or artist page, click a tab to change what it lists",
     "click an artist or album name to open its page",
     "on a station, spot looks the announced track up on Spotify",
@@ -64,18 +68,21 @@ const MOUSE_HINTS: &[&str] = &[
     "click a step of the path, beside the mark in either view, to go there",
     "opening a page already on the path walks back to it",
     "click tabs, transport, ▶ play, shuffle, sliders",
+    "when a page will not load, ↻ try again asks for it again; so does Enter",
     "on a browse page, click the search row under the path to search",
     "click the visualizer to play / pause; the cover opens its album",
     "scroll lists; scroll over the bottom bar = volume",
 ];
 
-pub fn draw(frame: &mut Frame) {
+pub fn draw(frame: &mut Frame, state: &AppState) {
     let mut lines: Vec<Line> = Vec::new();
     let group_style = theme::accent().add_modifier(Modifier::BOLD);
-    for (i, (group, entries)) in KEYS.iter().enumerate() {
-        if i > 0 {
-            lines.push(Line::default());
-        }
+    // First, not last: the box is taller than the keymap deserves and a short
+    // terminal clips its bottom, so a version line under the mouse hints would
+    // be invisible on exactly the windows spot is usually run in.
+    lines.push(Line::styled(format!("  {}", version(state)), theme::dim()));
+    for (group, entries) in KEYS.iter() {
+        lines.push(Line::default());
         lines.push(Line::styled(format!("  {group}"), group_style));
         for (key, action) in entries.iter() {
             lines.push(Line::from(vec![
@@ -103,24 +110,18 @@ pub fn draw(frame: &mut Frame) {
     frame.render_widget(para, area);
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(height.min(area.height)),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let h = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(width.min(area.width)),
-            Constraint::Min(0),
-        ])
-        .split(v[1]);
-    h[1]
+/// The build being run, and what Home is offering if it is offering anything.
+///
+/// The only place the version appears in the UI. It belongs here rather than
+/// beside the mark, where it would push the two views' shared header apart.
+fn version(state: &AppState) -> String {
+    const RUNNING: &str = concat!("spot v", env!("CARGO_PKG_VERSION"));
+    match &state.update {
+        Some(UpdateState::Available(release)) => format!("{RUNNING} · {} available", release.tag),
+        Some(UpdateState::Installing) => format!("{RUNNING} · downloading an update"),
+        Some(UpdateState::Installed) => format!("{RUNNING} · restart to finish the update"),
+        Some(UpdateState::Failed) | None => RUNNING.to_string(),
+    }
 }
 
 #[cfg(test)]

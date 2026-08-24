@@ -1,19 +1,28 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::http::Query;
 use rspotify::model::{
-    AlbumId, ArtistId, FullTrack, Id, LibraryId, PlayableItem, PlaylistId, SearchResult,
-    SearchType, SimplifiedAlbum, SimplifiedPlaylist, TrackId,
+    AlbumId, ArtistId, FullTrack, Id, LibraryId, PlayableId, PlayableItem, PlaylistId,
+    SearchResult, SearchType, SimplifiedAlbum, SimplifiedPlaylist, SubscriptionLevel, TrackId,
 };
 use rspotify::{AuthCodeSpotify, Token};
 use serde::Deserialize;
 
-use crate::app::state::{AlbumItem, ArtistItem, Playlist, SearchResults, Track};
+use crate::app::state::{AlbumItem, ArtistItem, Playlist, SearchResults, Track, track_id};
 
 pub const PAGE_LIMIT: u32 = 50;
 /// Pages of an artist's catalogue to walk before giving up on the rest.
 const ARTIST_ALBUM_PAGES: u32 = 4;
 const MAX_PLAYLISTS: u32 = 1000;
+
+/// The signed-in account, as much of it as spot needs.
+pub struct Account {
+    pub id: String,
+    /// `None` when Spotify does not report the subscription level.
+    pub premium: Option<bool>,
+}
 
 /// Everything the artist page is built from.
 pub struct ArtistOverview {
@@ -51,6 +60,25 @@ struct RawArtist {
     name: String,
 }
 
+/// One page of a playlist cut down to the track URIs, which is all
+/// [`Api::playlist_track_ids`] asks for. A local file or a podcast episode has
+/// no track object, and an unavailable one has no URI, hence both `Option`s.
+#[derive(Deserialize)]
+struct RawTrackUriPage {
+    items: Vec<RawTrackUriItem>,
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawTrackUriItem {
+    track: Option<RawTrackUri>,
+}
+
+#[derive(Deserialize)]
+struct RawTrackUri {
+    uri: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Api {
     client: AuthCodeSpotify,
@@ -68,18 +96,28 @@ impl Api {
         *self.client.get_token().lock().await.unwrap() = Some(token);
     }
 
-    /// The signed-in user's Spotify id.
+    /// Who is signed in, and whether Spotify will let spot stream for them.
     ///
-    /// Fetched alongside the playlists, which is the only thing that wants it:
-    /// the Playlists page blanks the Owner cell for the ones you own, and it
-    /// needs an id rather than a display name to tell which those are.
-    pub async fn me_id(&self) -> Result<String> {
+    /// The id is what the Playlists page blanks the Owner cell against — a
+    /// display name need not be unique.
+    ///
+    /// `premium` decides whether the streaming session is worth opening:
+    /// librespot's login is refused for everything below Premium, and reading
+    /// it here costs one request instead of a browser window and a failure.
+    /// Spotify has been withdrawing `product` from this endpoint, hence the
+    /// `Option` and the allow: a level it will not report is not a level of
+    /// `Free`, and the caller has to fall back to trying the login.
+    #[allow(deprecated)]
+    pub async fn account(&self) -> Result<Account> {
         let me = self
             .client
             .me()
             .await
             .context("failed to fetch the current user")?;
-        Ok(me.id.id().to_string())
+        Ok(Account {
+            id: me.id.id().to_string(),
+            premium: me.product.map(|p| p == SubscriptionLevel::Premium),
+        })
     }
 
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
@@ -150,6 +188,21 @@ impl Api {
             self.search_one(query, SearchType::Artist),
             self.search_one(query, SearchType::Playlist),
         );
+
+        // Four requests, four answers. One that fails is dropped so the tabs
+        // that did answer are still drawn, but four that fail is the search
+        // failing, and reporting that as an empty result set would have every
+        // tab claim Spotify holds nothing for the query.
+        let refused: Vec<&anyhow::Error> = [&tracks, &albums, &artists, &playlists]
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .collect();
+        if refused.len() == 4 {
+            anyhow::bail!("{}", refused[0]);
+        }
+        for e in refused {
+            log::warn!("part of the search for {query:?} failed: {e:#}");
+        }
 
         let mut results = SearchResults {
             query: query.to_string(),
@@ -352,6 +405,90 @@ impl Api {
             }
         })?;
         Ok(())
+    }
+
+    /// Put one track on a playlist, or take every copy of it off.
+    ///
+    /// Returns the playlist's new snapshot id, so the caller can retire the
+    /// copy it holds — the track cache keys its entries on that hash and would
+    /// otherwise serve the list back as it stood before the change.
+    ///
+    /// Removal takes *all* occurrences rather than a position. The box says
+    /// whether the record is on the playlist, not how many times, so taking it
+    /// off has to mean it is off.
+    pub async fn set_track_on_playlist(
+        &self,
+        playlist_id: &str,
+        uri: &str,
+        on: bool,
+    ) -> Result<String> {
+        let playlist = PlaylistId::from_id(playlist_id)?;
+        let track = PlayableId::Track(TrackId::from_uri(uri)?);
+        let result = if on {
+            self.client
+                .playlist_add_items(playlist, [track], None)
+                .await
+        } else {
+            self.client
+                .playlist_remove_all_occurrences_of_items(playlist, [track], None)
+                .await
+        }
+        .with_context(|| {
+            if on {
+                "failed to add the track to the playlist"
+            } else {
+                "failed to take the track off the playlist"
+            }
+        })?;
+        Ok(result.snapshot_id)
+    }
+
+    /// Every track a playlist holds, as bare ids.
+    ///
+    /// Spotify has no endpoint that answers "does this playlist hold this
+    /// track" — there is nothing here like the Library API's
+    /// `library_contains` — so the only way to know is to read the playlist
+    /// and look. Reading the whole thing costs no more than looking for one
+    /// record and answers for every record instead, which is why the contents
+    /// are what gets cached. `fields` cuts the response to the track URIs and
+    /// the pages are the largest the endpoint allows, so the cost is one
+    /// request per hundred tracks and almost no bytes.
+    ///
+    /// Read as raw JSON for the same reason [`Self::artist_albums`] is: a
+    /// narrowed `fields` cannot deserialize into rspotify's full
+    /// `PlaylistItem`.
+    pub async fn playlist_track_ids(&self, playlist_id: &str) -> Result<HashSet<String>> {
+        const LIMIT: u32 = 100;
+        let limit = LIMIT.to_string();
+        let mut offset = 0u32;
+        let mut ids = HashSet::new();
+        loop {
+            let at = offset.to_string();
+            let params: Query = [
+                ("fields", "items(track(uri)),next"),
+                ("limit", limit.as_str()),
+                ("offset", at.as_str()),
+            ]
+            .into_iter()
+            .collect();
+            let body = self
+                .client
+                .api_get(&format!("playlists/{playlist_id}/tracks"), &params)
+                .await
+                .context("failed to read the playlist")?;
+            let page: RawTrackUriPage = serde_json::from_str(&body)?;
+            ids.extend(
+                page.items
+                    .iter()
+                    .filter_map(|i| i.track.as_ref())
+                    .filter_map(|t| t.uri.as_deref())
+                    .map(|uri| track_id(uri).to_string()),
+            );
+            offset += page.items.len() as u32;
+            if page.next.is_none() || page.items.is_empty() {
+                return Ok(ids);
+            }
+        }
     }
 }
 

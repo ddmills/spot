@@ -57,29 +57,99 @@ const SEEK_LABEL: &str = "seek ▸▸";
 
 /// The liked control at the right end of the title row, in both states.
 /// Unpadded, like every other control on the deck — the hover pill covers the
-/// text and nothing else — and of a fixed width so nothing under the cursor
-/// moves when the state flips.
+/// text and nothing else.
 ///
 /// The same solid glyph either way — the word beside it is what says which
 /// state you are in, so the pair never comes down to telling one glyph from
 /// a hollow twin by its shade.
 /// Built from [`super::table::LIKED_MARK`] at draw time rather than spelled
 /// out here: the table's column and this control wear the same mark, and a
-/// second copy of the glyph is a second thing to forget. Both states are the
-/// same width, so nothing under the cursor moves when one becomes the other.
+/// second copy of the glyph is a second thing to forget.
 fn like_label(liked: bool) -> String {
     let mark = super::table::LIKED_MARK;
     if liked {
         format!("{mark} liked")
     } else {
-        format!("{mark} like ")
+        format!("{mark} like")
     }
 }
 
-/// What both views say when nothing is playing, said once.
-pub fn no_playback_hint(frame: &mut Frame, area: Rect) {
+/// The label of the control that opens the add-to-playlist box.
+const ADD_LABEL: &str = "+ add";
+
+/// Draw the title row's controls — the liked pill, and the `+ add` beside it —
+/// and return the cells they took.
+///
+/// Both mastheads carry the same pair in the same corner, and `right_row`
+/// gives the pair its order: groups are laid out left to right from the row's
+/// right edge, so `+ add` lands right of the `★`.
+///
+/// `right_row` is all or nothing — a row too narrow for the groups draws none
+/// of them — so a row that cannot hold both is offered the liked control
+/// alone rather than losing a control that used to fit.
+fn title_controls(
+    frame: &mut Frame,
+    row: Rect,
+    liked: Option<bool>,
+    add: bool,
+    mouse: Option<Position>,
+    hit: &mut HitAreas,
+) -> u16 {
+    let groups = |add: bool| {
+        let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+        if let Some(liked) = liked {
+            let style = if liked { theme::accent() } else { theme::dim() };
+            groups.push(vec![Span::styled(like_label(liked), style)]);
+        }
+        if add {
+            groups.push(vec![Span::styled(ADD_LABEL, theme::dim())]);
+        }
+        groups
+    };
+
+    let mut wanted = groups(add);
+    if wanted.is_empty() {
+        return 0;
+    }
+    let mut rects = right_row(frame, row, mouse, wanted);
+    if rects[0].is_empty() && add {
+        wanted = groups(false);
+        if wanted.is_empty() {
+            return 0;
+        }
+        rects = right_row(frame, row, mouse, wanted);
+    }
+
+    // The cells the controls hold, the gaps `right_row` set between them
+    // included, measured from the leftmost one to the row's right edge.
+    let width = rects
+        .iter()
+        .find(|r| !r.is_empty())
+        .map_or(0, |r| row.right() - r.x);
+    let mut rects = rects.into_iter();
+    if liked.is_some() {
+        hit.like_btn = rects.next().unwrap_or_default();
+    }
+    hit.add_btn = rects.next().unwrap_or_default();
+    width
+}
+
+/// What the player says when nothing is playing. The bottom bar says nothing:
+/// with no subject it is dropped from the layout — see [`super::now_playing`].
+///
+/// It names what there is to press Enter on, so without an account it points
+/// at a station rather than at a track that cannot be reached.
+pub fn no_playback_hint(frame: &mut Frame, area: Rect, spotify_ready: bool) {
+    let subject = if spotify_ready {
+        "a track"
+    } else {
+        "a station"
+    };
     frame.render_widget(
-        Paragraph::new("nothing playing — press Enter on a track to start").style(theme::dim()),
+        Paragraph::new(format!(
+            "nothing playing — press Enter on {subject} to start"
+        ))
+        .style(theme::dim()),
         Rect { height: 1, ..area },
     );
 }
@@ -127,6 +197,7 @@ pub fn masthead(
     track: &Track,
     volume_percent: u8,
     liked: Option<bool>,
+    add: bool,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -135,30 +206,21 @@ pub fn masthead(
     }
     let dim = theme::dim();
 
-    // Row 0: the track title, as large as a terminal allows, with the liked
-    // control opposite it.
+    // Row 0: the track title, as large as a terminal allows, with the record's
+    // controls opposite it.
     //
-    // Drawn only once the saved state is known — a control that cannot say
-    // which way it would go is worse than none at all. `right_row` drops it
-    // whole on a row too narrow for it, so the title never has to share its
-    // cells with half a control.
+    // The liked control is drawn only once the saved state is known — one that
+    // cannot say which way it would go is worse than none at all. `right_row`
+    // drops a control whole on a row too narrow for it, so the title never has
+    // to share its cells with half of one.
     let title_row = Rect { height: 1, ..area };
-    if let Some(liked) = liked {
-        let style = if liked { theme::accent() } else { dim };
-        let label = like_label(liked);
-        hit.like_btn = right_row(
-            frame,
-            title_row,
-            mouse,
-            vec![vec![Span::styled(label, style)]],
-        )[0];
-    }
-    // One cell of daylight between the title and the control, so a title that
+    let controls_w = title_controls(frame, title_row, liked, add, mouse, hit);
+    // One cell of daylight between the title and the controls, so a title that
     // runs the full width ends in an ellipsis rather than against the pill.
-    let title_w = if hit.like_btn.is_empty() {
+    let title_w = if controls_w == 0 {
         title_row.width
     } else {
-        title_row.width.saturating_sub(hit.like_btn.width + 1)
+        title_row.width.saturating_sub(controls_w + 1)
     };
     frame.render_widget(
         Paragraph::new(Line::styled(
@@ -277,6 +339,7 @@ pub fn radio_masthead(
     area: Rect,
     radio: &RadioPlayback,
     liked: Option<bool>,
+    add: bool,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -287,31 +350,26 @@ pub fn radio_masthead(
     let matched = radio.matched_track();
     let announced = radio.now_title();
 
-    // The liked control, on the title row, exactly as `masthead` places it —
-    // and only where that row names a record rather than a station.
+    // The record's controls, on the title row, exactly as `masthead` places
+    // them — and only where that row names a record rather than a station.
     let title_row = Rect { height: 1, ..area };
-    if let (Some(_), Some(liked)) = (matched, liked) {
-        let style = if liked { theme::accent() } else { dim };
-        hit.like_btn = right_row(
-            frame,
-            title_row,
-            mouse,
-            vec![vec![Span::styled(like_label(liked), style)]],
-        )[0];
-    }
+    let controls_w = match matched {
+        Some(_) => title_controls(frame, title_row, liked, add, mouse, hit),
+        None => 0,
+    };
 
     let title = match (matched, &announced) {
         (Some(t), _) => t.name.clone(),
         (None, Some(said)) => said.clone(),
         (None, None) => radio.station.name.clone(),
     };
-    // One cell of daylight between the title and the control, as on the
+    // One cell of daylight between the title and the controls, as on the
     // Spotify deck, so a long name ends in an ellipsis rather than against
     // the pill.
-    let title_w = if hit.like_btn.is_empty() {
+    let title_w = if controls_w == 0 {
         title_row.width
     } else {
-        title_row.width.saturating_sub(hit.like_btn.width + 1)
+        title_row.width.saturating_sub(controls_w + 1)
     };
     frame.render_widget(
         Paragraph::new(Line::styled(
@@ -907,7 +965,9 @@ mod tests {
     #[test]
     fn the_masthead_writes_two_rows_and_their_controls() {
         let t = song();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, None, false, None, h)
+        });
         assert!(lines[0].starts_with("Song Title"), "{:?}", lines[0]);
         // The state pill left this row for the transport; the title has the
         // whole width to itself now.
@@ -930,10 +990,11 @@ mod tests {
     #[test]
     fn the_masthead_carries_a_liked_control_for_the_playing_track() {
         let t = song();
-        let (liked_lines, liked_hit, _) =
-            render(80, 2, |f, a, h| masthead(f, a, &t, 56, Some(true), None, h));
+        let (liked_lines, liked_hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, Some(true), false, None, h)
+        });
         let (plain_lines, plain_hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(false), None, h)
+            masthead(f, a, &t, 56, Some(false), false, None, h)
         });
 
         // The same mark either way; the word is what changes, so the two
@@ -945,15 +1006,77 @@ mod tests {
             liked_lines[0]
         );
         assert!(
-            plain_lines[0].contains(&format!("{mark} like ")),
+            plain_lines[0].contains(&format!("{mark} like")),
             "{:?}",
             plain_lines[0]
         );
-        assert_eq!(liked_hit.like_btn, plain_hit.like_btn);
+        assert_eq!(liked_hit.like_btn.right(), plain_hit.like_btn.right());
         assert_eq!(liked_hit.like_btn.y, 0, "the control left the title row");
         assert_eq!(liked_hit.like_btn.right(), 80);
         // The title still leads the row, and stops clear of the control.
         assert!(liked_lines[0].starts_with("Song Title"));
+    }
+
+    /// `+ add` takes the right end and pushes the liked control left of it,
+    /// so the pair reads in the order the mouse hints name them.
+    #[test]
+    fn the_add_control_sits_right_of_the_liked_one() {
+        let t = song();
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, Some(true), true, None, h)
+        });
+        // One space between the two, owned by neither, so it never lights
+        // under the pointer as a third control that does nothing.
+        let mark = super::super::table::LIKED_MARK;
+        assert!(
+            lines[0].contains(&format!("{mark} liked + add")),
+            "{:?}",
+            lines[0]
+        );
+        assert_eq!(hit.add_btn.y, 0);
+        assert_eq!(hit.add_btn.right(), 80);
+        assert_eq!(
+            hit.add_btn.x,
+            hit.like_btn.right() + 1,
+            "a gap belonging to neither control"
+        );
+        assert!(lines[0].starts_with("Song Title"));
+    }
+
+    /// The control does not depend on the saved state the `★` waits for, so
+    /// it is drawn while that answer is still out.
+    #[test]
+    fn the_add_control_does_not_wait_for_the_liked_answer() {
+        let t = song();
+        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, true, None, h));
+        assert!(lines[0].contains("+ add"), "{:?}", lines[0]);
+        assert_eq!(hit.add_btn.right(), 80);
+        assert!(hit.like_btn.is_empty());
+    }
+
+    /// A row that cannot hold both keeps the one that was there first, rather
+    /// than losing the pair to `right_row`'s all-or-nothing rule.
+    #[test]
+    fn a_narrow_title_row_drops_the_add_control_first() {
+        let t = song();
+        let (lines, hit, _) = render(12, 2, |f, a, h| {
+            masthead(f, a, &t, 56, Some(true), true, None, h)
+        });
+        assert!(!lines[0].contains("+ add"), "{:?}", lines[0]);
+        assert!(hit.add_btn.is_empty());
+        assert!(!hit.like_btn.is_empty(), "the ★ went with it");
+    }
+
+    /// The bar passes `false`, so its title row is unchanged by any of this.
+    #[test]
+    fn the_add_control_is_opt_in() {
+        let t = song();
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, Some(true), false, None, h)
+        });
+        assert!(!lines[0].contains("+ add"));
+        assert!(hit.add_btn.is_empty());
+        assert_eq!(hit.like_btn.right(), 80);
     }
 
     /// Nothing known about the track, so no control: one that cannot say
@@ -961,7 +1084,9 @@ mod tests {
     #[test]
     fn the_liked_control_waits_for_an_answer() {
         let t = song();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, None, false, None, h)
+        });
         let mark = super::super::table::LIKED_MARK;
         assert!(!lines[0].contains(mark));
         assert!(hit.like_btn.is_empty());
@@ -972,7 +1097,9 @@ mod tests {
     #[test]
     fn the_metadata_row_is_not_indented() {
         let t = song();
-        let (_, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
+        let (_, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, None, false, None, h)
+        });
         assert_eq!(hit.now_artist.x, 0);
     }
 
@@ -982,7 +1109,9 @@ mod tests {
         let mut t = song();
         t.artist_id = None;
         t.album_id = None;
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, None, false, None, h)
+        });
         assert!(lines[1].contains("Artist Name · Album Name"));
         assert!(hit.now_artist.is_empty() && hit.now_album.is_empty());
     }
@@ -995,7 +1124,9 @@ mod tests {
         let mut t = song();
         t.artists = "高橋洋子".into();
         t.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
-        let (lines, hit, _) = render(60, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
+        let (lines, hit, _) = render(60, 2, |f, a, h| {
+            masthead(f, a, &t, 56, None, false, None, h)
+        });
         let row = &lines[1];
         assert!(
             !row.trim_end().ends_with('·'),
@@ -1015,7 +1146,9 @@ mod tests {
     fn a_self_titled_album_is_still_printed() {
         let mut t = song();
         t.album = "Artist Name".into();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, None, false, None, h)
+        });
         assert!(
             lines[1].starts_with("Artist Name · Artist Name · 2020"),
             "{:?}",
@@ -1256,7 +1389,7 @@ mod tests {
         for width in 0..40u16 {
             render(width.max(1), 2, |f, a, h| {
                 let a = Rect { width, ..a };
-                masthead(f, a, &t, 56, Some(true), None, h);
+                masthead(f, a, &t, 56, Some(true), false, None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, DURATION, h);
                 transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
                 context_row(f, Rect { height: 1, ..a }, false, Some(&q), None, h);
@@ -1314,7 +1447,7 @@ mod tests {
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
 
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Some(false), None, h)
+            radio_masthead(f, a, &r, Some(false), false, None, h)
         });
         // Row 0 names the record, not the station.
         assert!(lines[0].starts_with("Frenesi"), "{:?}", lines[0]);
@@ -1340,7 +1473,9 @@ mod tests {
     fn the_liked_control_waits_until_the_saved_state_is_known() {
         let mut r = radio("Adroit Jazz");
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
-        let (_, hit, _) = render(80, 2, |f, a, h| radio_masthead(f, a, &r, None, None, h));
+        let (_, hit, _) = render(80, 2, |f, a, h| {
+            radio_masthead(f, a, &r, None, false, None, h)
+        });
         assert!(hit.like_btn.is_empty(), "{:?}", hit.like_btn);
     }
 
@@ -1353,7 +1488,7 @@ mod tests {
         r.matched = crate::app::state::RadioMatch::Unmatched;
 
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Some(true), None, h)
+            radio_masthead(f, a, &r, Some(true), false, None, h)
         });
         assert!(lines[0].starts_with("Some Band - A Song"), "{:?}", lines[0]);
         // Row 1 falls back to what the station says about itself.
@@ -1371,7 +1506,7 @@ mod tests {
     fn a_station_that_says_nothing_still_names_itself() {
         let r = radio("Adroit Jazz");
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Some(true), None, h)
+            radio_masthead(f, a, &r, Some(true), false, None, h)
         });
         assert!(lines[0].starts_with("Adroit Jazz"), "{:?}", lines[0]);
         assert!(lines[1].starts_with("jazz"), "{:?}", lines[1]);
@@ -1505,7 +1640,7 @@ mod tests {
                     let r = if saved { &r } else { &dead };
                     render(width.max(1), 2, |f, a, h| {
                         let a = Rect { width, ..a };
-                        radio_masthead(f, a, r, Some(true), None, h);
+                        radio_masthead(f, a, r, Some(true), false, None, h);
                         radio_status(f, Rect { height: 1, ..a }, r, h);
                         radio_transport(
                             f,

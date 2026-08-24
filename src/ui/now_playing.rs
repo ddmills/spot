@@ -31,6 +31,18 @@ const MIN_TEXT_W: u16 = 44;
 /// there is not enough of a message left to be worth reading.
 const TOAST_MIN_W: u16 = 14;
 
+/// Whether the bar has a subject. With no station and no track it is left out
+/// of the layout entirely and the pane above takes its rows.
+pub fn has_subject(state: &AppState) -> bool {
+    state.radio.is_some()
+        || state
+            .playback
+            .as_ref()
+            .and(state.queue.as_ref())
+            .and_then(|q| q.current())
+            .is_some()
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // What the corner of the header is saying, read before the split borrow
     // below so the pill under the progress track can only agree with it.
@@ -38,7 +50,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Read for the same reason and in the same place: what the radio row can
     // offer is state the split borrow below gives up.
     let steps = play_state::radio_steps(state);
-
+    // Read here for the same reason: whether the `+ add` control has anywhere
+    // to lead is state the split borrow below gives up.
+    let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
     // Split borrows: playback/queue/toast/cover are read while hit areas are
     // written.
     let AppState {
@@ -89,6 +103,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             r,
             toast.as_ref().map(|(m, _)| m.as_str()),
             like,
+            spotify_ready,
             saved,
             play,
             steps,
@@ -105,7 +120,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .and(queue.as_ref())
         .and_then(|q| q.current());
     let (Some(pb), Some(track)) = (playback.as_ref(), track) else {
-        deck::no_playback_hint(frame, body);
         return;
     };
 
@@ -136,7 +150,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     // Rows 0-1: the title, then the metadata with the volume slider opposite.
     let like = liked.get(&track.uri).copied();
-    deck::masthead(frame, text, track, pb.volume_percent, like, mouse, hit);
+    deck::masthead(
+        frame,
+        text,
+        track,
+        pb.volume_percent,
+        like,
+        spotify_ready,
+        mouse,
+        hit,
+    );
 
     // The whole bar is the wheel target, sleeve included, which is wider than
     // the two rows `masthead` claims for the player's benefit. Assigned after
@@ -222,13 +245,14 @@ fn draw_radio(
     radio: &crate::app::state::RadioPlayback,
     toast: Option<&str>,
     liked: Option<bool>,
+    add: bool,
     saved: bool,
     play: PlayState,
     steps: play_state::RadioSteps,
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
 ) {
-    deck::radio_masthead(frame, body, radio, liked, mouse, hit);
+    deck::radio_masthead(frame, body, radio, liked, add, mouse, hit);
 
     if body.height < 3 {
         return;
@@ -671,10 +695,14 @@ mod tests {
     }
 
     #[test]
-    fn nothing_playing_shows_a_hint() {
+    fn nothing_playing_draws_no_bar() {
         let mut state = AppState::new();
+        assert!(!has_subject(&state));
         let lines = render(&mut state, 100, BAR_H);
-        assert!(lines[1].contains("nothing playing"));
+        assert!(
+            lines.iter().all(|l| l.trim().is_empty()),
+            "the idle bar should draw nothing: {lines:?}"
+        );
         assert!(state.hit.play_btn.is_empty());
     }
 

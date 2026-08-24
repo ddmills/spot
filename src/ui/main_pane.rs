@@ -7,8 +7,8 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use super::theme;
 use crate::app::state::{
-    AppState, Crumb, CrumbTarget, HitAreas, HomeItem, MainView, SearchTab, SortKey, Track,
-    TrackSort, format_duration,
+    AppState, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError, MainView, SearchTab, SortKey,
+    Track, TrackSort, format_duration,
 };
 
 /// Playback context needed to mark the playing row, copied out of the queue
@@ -27,6 +27,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let list_area = area;
 
     let loading = state.loading;
+    let retries = state.retries;
     let search_tab = state.search_tab;
     let main_index = state.main_index;
     let mouse = state.mouse_pos;
@@ -43,16 +44,20 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let playing_station = state.radio.as_ref().map(|r| r.station.url.clone());
     // Home's rows and their tails, resolved before the split borrow below —
     // both read `playlists`, which the borrow takes.
-    let home: Vec<(HomeItem, String)> = state
+    let home: Vec<(HomeItem, String, &'static str)> = state
         .home_items()
         .into_iter()
-        .map(|item| (item, state.home_count(item)))
+        .map(|item| (item, state.home_count(item), state.home_blurb(item)))
         .collect();
+    // The strip the search page draws: four of the five tabs are Spotify's,
+    // and without an account there is only the directory's own.
+    let search_tabs = state.search_tabs();
     // Split borrows: the view data is read while the list state and hit
     // areas are written.
     let AppState {
         main,
         playlists,
+        playlists_error,
         radio_favorites,
         main_list,
         hit,
@@ -65,6 +70,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let radio_favorites = &*radio_favorites;
     let page_art = &*page_art;
     let playlists = &*playlists;
+    let playlists_error = &*playlists_error;
     // The *browsed* album's sleeve, not the playing one — see
     // `AppState::view_cover`.
     //
@@ -87,15 +93,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             frame,
             list_area,
             playlists,
+            playlists_error.as_ref(),
+            loading,
             me_id.as_deref(),
             main_index,
             main_list,
+            retries,
             hit,
             &marks,
+            mouse,
         ),
         MainView::Tracks(list) => draw_tracks(
-            frame, list_area, list, view_cover, loading, main_index, main_list, hit, &marks, liked,
-            mouse,
+            frame, list_area, list, view_cover, loading, main_index, main_list, retries, hit,
+            &marks, liked, mouse,
         ),
         MainView::Search(results) => draw_search(
             frame,
@@ -103,8 +113,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             results,
             loading,
             search_tab,
+            &search_tabs,
             main_index,
             main_list,
+            retries,
             hit,
             &marks,
             mouse,
@@ -113,7 +125,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             playing_station.as_deref(),
         ),
         MainView::Artist(v) => draw_artist(
-            frame, list_area, v, page_art, main_index, main_list, hit, &marks, mouse, liked,
+            frame, list_area, v, page_art, main_index, main_list, retries, hit, &marks, mouse,
+            liked,
         ),
         MainView::Radio(v) => draw_radio(
             frame,
@@ -123,6 +136,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             playing_station.as_deref(),
             main_index,
             main_list,
+            retries,
             hit,
             mouse,
         ),
@@ -156,7 +170,7 @@ const HOME_INDENT: usize = 2;
 fn draw_home(
     frame: &mut Frame,
     area: Rect,
-    items: &[(HomeItem, String)],
+    items: &[(HomeItem, String, &'static str)],
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
@@ -179,7 +193,7 @@ fn draw_home(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut owner: Vec<Option<usize>> = Vec::new();
-    for (i, (item, count)) in items.iter().enumerate() {
+    for (i, (item, count, blurb)) in items.iter().enumerate() {
         if i > 0 {
             for _ in 0..HOME_ENTRY_GAP {
                 lines.push(Line::default());
@@ -210,7 +224,7 @@ fn draw_home(
         lines.push(name);
         owner.push(Some(i));
         lines.push(Line::styled(
-            format!("{indent}{}", fit(item.blurb(), name_w)),
+            format!("{indent}{}", fit(blurb, name_w)),
             theme::dim(),
         ));
         owner.push(Some(i));
@@ -250,14 +264,30 @@ fn draw_playlists(
     frame: &mut Frame,
     area: Rect,
     playlists: &[crate::app::state::Playlist],
+    error: Option<&LoadError>,
+    loading: bool,
     me_id: Option<&str>,
     main_index: usize,
     list_state: &mut ListState,
+    retries: u32,
     hit: &mut HitAreas,
     marks: &PlayMarks,
+    mouse: Option<Position>,
 ) {
     let inner = body_area(area);
     if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Before the column header, which is a heading for a table this page does
+    // not have: a page that is still asking, or that was refused, has nothing
+    // to put columns over.
+    if playlists.is_empty() && (error.is_some() || loading) {
+        hit.main_list = inner;
+        match error {
+            Some(e) => error_message(frame, inner, e, retries, hit, mouse),
+            None => loading_message(frame, inner, "loading playlists…"),
+        }
         return;
     }
 
@@ -484,6 +514,7 @@ fn draw_radio(
     playing_url: Option<&str>,
     main_index: usize,
     list_state: &mut ListState,
+    retries: u32,
     hit: &mut HitAreas,
     mouse: Option<Position>,
 ) {
@@ -522,7 +553,11 @@ fn draw_radio(
 
     if view.rows.is_empty() {
         hit.main_list = body;
-        empty_message(frame, body, radio_empty_hint(view));
+        match &view.error {
+            Some(e) => error_message(frame, body, e, retries, hit, mouse),
+            None if view.loading => loading_message(frame, body, "loading stations…"),
+            None => empty_message(frame, body, radio_empty_hint(view)),
+        }
         return;
     }
 
@@ -575,9 +610,6 @@ fn draw_radio(
 /// What to say on a radio page with nothing on it.
 fn radio_empty_hint(view: &crate::app::state::RadioView) -> &'static str {
     use crate::app::state::RadioScope;
-    if view.loading {
-        return "loading stations…";
-    }
     match view.scope {
         RadioScope::Favorites => "no saved stations yet — press L on one to keep it",
         _ => "nothing here",
@@ -687,6 +719,7 @@ fn draw_artist(
     page_art: &crate::cover::CoverCache,
     main_index: usize,
     list_state: &mut ListState,
+    retries: u32,
     hit: &mut HitAreas,
     marks: &PlayMarks,
     mouse: Option<Position>,
@@ -696,15 +729,11 @@ fn draw_artist(
     let body = artist_band(frame, inner, v, page_art, hit, mouse);
     if v.len() == 0 {
         hit.main_list = body;
-        empty_message(
-            frame,
-            body,
-            if v.loading {
-                "loading…"
-            } else {
-                "nothing to show for this artist"
-            },
-        );
+        match &v.error {
+            Some(e) => error_message(frame, body, e, retries, hit, mouse),
+            None if v.loading => loading_message(frame, body, "loading…"),
+            None => empty_message(frame, body, "nothing to show for this artist"),
+        }
         return;
     }
     artist_body(
@@ -1021,8 +1050,9 @@ fn artist_body(
                 }
                 .intersection(body)
             };
-            if cols.like {
+            if cols.actions {
                 hit.main_like_col = rect(cols.like_offset(), LIKE_W);
+                hit.main_add_col = rect(cols.add_offset(), ADD_W);
             }
             hit.main_artist_col = rect(cols.artist_offset(), cols.artist);
             if let Some(off) = cols.album_offset() {
@@ -1035,6 +1065,8 @@ fn artist_body(
                 .and_then(|m| {
                     if hit.main_like_col.contains(m) {
                         Some((m, HoverCol::Like))
+                    } else if hit.main_add_col.contains(m) {
+                        Some((m, HoverCol::Add))
                     } else if hit.main_artist_col.contains(m) {
                         Some((m, HoverCol::Artist))
                     } else if hit.main_album_col.contains(m) {
@@ -1684,7 +1716,10 @@ pub(super) fn page_header(st: &AppState) -> PageHeader {
             count: None,
         },
         MainView::Radio(v) => PageHeader {
-            loading: v.loading && v.rows.is_empty(),
+            // The pane is the one that says so here: a directory page has
+            // nothing above its tab strip *but* the trail, so the word on the
+            // row and the spinner under it were the same news said twice.
+            loading: false,
             count: (!v.rows.is_empty()).then(|| {
                 let facets = matches!(
                     v.rows.first(),
@@ -1715,20 +1750,103 @@ fn body_area(area: Rect) -> Rect {
 
 /// Centered dim hint for a view with nothing to list.
 fn empty_message(frame: &mut Frame, inner: Rect, text: &str) {
+    centered_line(frame, inner, 0, Line::styled(text.to_string(), theme::dim()));
+}
+
+/// Centered spinner and label while a view's own contents are in flight.
+///
+/// The page saying so itself, rather than the nav row's `● LOADING`, which is
+/// about what is *playing*: a pane that draws nothing at all while it waits
+/// reads exactly like one that came back with nothing.
+fn loading_message(frame: &mut Frame, inner: Rect, text: &str) {
+    let label = format!("{} {text}", super::table::spinner());
+    centered_line(frame, inner, 0, Line::styled(label, theme::dim()));
+}
+
+/// The control a failed page carries.
+const RETRY_PILL: &str = "↻ try again";
+
+/// Centered failure notice with [`RETRY_PILL`] under it.
+///
+/// The reason is kept on the page rather than left to the toast, which
+/// expires in seconds and draws on a bottom bar that is not there at all
+/// while nothing is playing — so the commonest failure said nothing you
+/// could still read by the time you looked.
+fn error_message(
+    frame: &mut Frame,
+    inner: Rect,
+    err: &LoadError,
+    retries: u32,
+    hit: &mut HitAreas,
+    mouse: Option<Position>,
+) {
+    // `fit` pads to exactly the width; trim it back so the centring has the
+    // message to work on rather than the padding.
+    let message = super::table::fit(&err.message, inner.width as usize)
+        .trim_end()
+        .to_string();
+    centered_line(frame, inner, 0, Line::styled(message, theme::warn()));
+
+    // What the press did, when the answer was the same refusal. A rate limit
+    // refuses in less time than a frame takes, so the spinner between the two
+    // failures is never on screen; this line is what moves.
+    if retries > 0 {
+        let tally = match retries {
+            1 => "asked again once".to_string(),
+            n => format!("asked again {n} times"),
+        };
+        centered_line(frame, inner, 1, Line::styled(tally, theme::dim()));
+    }
+
+    // The control is drawn only where it fits whole. One that ran off the
+    // pane would still record a rect, and a click on the row it would have
+    // taken would retry a page that never offered to be retried.
+    if inner.height < 3 {
+        return;
+    }
+    let row = Rect {
+        y: inner.y + inner.height / 2 + 3,
+        height: 1,
+        ..inner
+    };
+    let width = super::table::width(RETRY_PILL) as u16;
+    if row.bottom() > inner.bottom() || width > inner.width {
+        return;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let start = row.x + (row.width - width) / 2;
+    let mut x = start;
+    hit.retry_btn = super::table::segment(
+        &mut spans,
+        &mut x,
+        row,
+        mouse,
+        vec![Span::styled(RETRY_PILL, theme::accent())],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x: start,
+            width,
+            ..row
+        },
+    );
+}
+
+/// One line across the pane, `offset` rows from its middle.
+fn centered_line(frame: &mut Frame, inner: Rect, offset: i16, line: Line<'static>) {
     if inner.height == 0 {
         return;
     }
     let row = Rect {
-        y: inner.y + inner.height / 2,
+        y: (inner.y + inner.height / 2).saturating_add_signed(offset),
         height: 1,
         ..inner
     };
-    frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .style(theme::dim()),
-        row,
-    );
+    if row.bottom() > inner.bottom() {
+        return;
+    }
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), row);
 }
 
 const DUR_W: usize = 5;
@@ -1736,21 +1854,22 @@ const YEAR_W: usize = 4;
 const COL_GAP: &str = "   ";
 /// Leading marker column: "▶ " playing, "→ " next up.
 const PREFIX_W: usize = 2;
-/// Liked column: the mark when saved, blank when not — it comes back under
-/// the pointer. See [`track_row`] and [`super::table::LIKED_MARK`].
-const LIKE_W: usize = 2;
+use super::table::{ACTIONS_MIN, ACTIONS_W, ADD_W, LIKE_W, action_spans, actions_label};
+
 /// Minimum width of the track-number column, right-aligned.
 const NO_W: usize = 3;
 
 /// Column widths for the track table, derived from the pane's inner width.
-/// Narrow panes drop the year first, then the album, then the liked mark.
+/// Narrow panes drop the year first, then the album, then the track number;
+/// the action pair outlives all three.
 struct TrackCols {
     name: usize,
     artist: usize,
     /// 0 = hidden.
     album: usize,
     year: bool,
-    like: bool,
+    /// The `★ +` pair at the end of the row.
+    actions: bool,
     track_no: bool,
     /// Width of the number column, grown to fit the largest number.
     no_w: usize,
@@ -1760,12 +1879,12 @@ impl TrackCols {
     fn new(width: usize, max_no: u32) -> Self {
         let year = width >= 70;
         let show_album = width >= 50;
-        let like = width >= 60;
+        let actions = width >= ACTIONS_MIN;
         let track_no = width >= 40;
         let no_w = max_no.to_string().len().max(NO_W);
         let mut flex = width.saturating_sub(PREFIX_W + DUR_W + COL_GAP.len());
-        if like {
-            flex = flex.saturating_sub(LIKE_W);
+        if actions {
+            flex = flex.saturating_sub(ACTIONS_W + COL_GAP.len());
         }
         if track_no {
             flex = flex.saturating_sub(no_w + COL_GAP.len());
@@ -1782,7 +1901,7 @@ impl TrackCols {
                 artist,
                 album: flex - name - artist,
                 year,
-                like,
+                actions,
                 track_no,
                 no_w,
             }
@@ -1794,15 +1913,20 @@ impl TrackCols {
                 artist: flex - name,
                 album: 0,
                 year,
-                like,
+                actions,
                 track_no,
                 no_w,
             }
         }
     }
 
-    /// Column offset (from the row start) of the liked cell, shown or not.
-    fn like_offset(&self) -> usize {
+    /// Column offset (from the row start) of the title cell, and the head of
+    /// the offset chain below.
+    ///
+    /// Each offset is built on the one before it rather than repeating its
+    /// arithmetic: a click rect that disagrees with the glyph it covers is the
+    /// bug this chain exists to prevent.
+    fn title_offset(&self) -> usize {
         let mut x = PREFIX_W;
         if self.track_no {
             x += self.no_w + COL_GAP.len();
@@ -1811,21 +1935,36 @@ impl TrackCols {
     }
 
     /// Column offset (from the row start) of the artist cell.
-    ///
-    /// Built on [`Self::like_offset`] rather than repeating its arithmetic:
-    /// the two columns are adjacent, and a click rect that disagrees with the
-    /// glyph it covers is the bug this exists to prevent.
     fn artist_offset(&self) -> usize {
-        let mut x = self.like_offset();
-        if self.like {
-            x += LIKE_W;
-        }
-        x + self.name + COL_GAP.len()
+        self.title_offset() + self.name + COL_GAP.len()
     }
 
     /// Column offset of the album cell, when the column is shown.
     fn album_offset(&self) -> Option<usize> {
         (self.album > 0).then(|| self.artist_offset() + self.artist + COL_GAP.len())
+    }
+
+    /// Column offset of the `★ +` pair, shown or not: past whichever of album
+    /// and artist ends the data columns, then past the year.
+    fn actions_offset(&self) -> usize {
+        let mut x = self
+            .album_offset()
+            .map_or(self.artist_offset() + self.artist, |off| off + self.album);
+        if self.year {
+            x += COL_GAP.len() + YEAR_W;
+        }
+        x + COL_GAP.len()
+    }
+
+    /// Column offset of the liked cell, the first of the pair.
+    fn like_offset(&self) -> usize {
+        self.actions_offset()
+    }
+
+    /// Column offset of the add cell, flush against the liked one: each cell
+    /// carries its own padding, so the two targets meet.
+    fn add_offset(&self) -> usize {
+        self.actions_offset() + LIKE_W
     }
 }
 
@@ -1833,6 +1972,7 @@ impl TrackCols {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HoverCol {
     Like,
+    Add,
     Artist,
     Album,
 }
@@ -1874,9 +2014,6 @@ fn track_header(cols: &TrackCols, sort: Option<TrackSort>) -> Line<'static> {
     if cols.track_no {
         text = format!("{text}{:>w$}{COL_GAP}", "#", w = cols.no_w);
     }
-    if cols.like {
-        text = format!("{text}{}", fit(super::table::LIKED_MARK, LIKE_W));
-    }
     text = format!(
         "{text}{}{COL_GAP}{}",
         fit(&sort_label("Title", SortKey::Title, sort), cols.name),
@@ -1890,6 +2027,9 @@ fn track_header(cols: &TrackCols, sort: Option<TrackSort>) -> Line<'static> {
     }
     if cols.year {
         text = format!("{text}{COL_GAP}{}", fit("Year", YEAR_W));
+    }
+    if cols.actions {
+        text = format!("{text}{COL_GAP}{}", actions_label());
     }
     text = format!(
         "{text}{COL_GAP}{:>DUR_W$}",
@@ -1929,6 +2069,9 @@ fn track_row(
         theme::text()
     };
     let mut spans = vec![prefix];
+    // Where the star lands, so the selection restyle below can put its accent
+    // back.
+    let mut star_at = None;
     if cols.track_no {
         let no = if no > 0 {
             no.to_string()
@@ -1939,32 +2082,6 @@ fn track_row(
             format!("{no:>w$}{COL_GAP}", w = cols.no_w),
             dim,
         ));
-    }
-    if cols.like {
-        // The mark or nothing — never the same shape at two brightnesses. A
-        // column of hollow glyphs beside a column of solid ones reads as one
-        // mark lit two ways, which is exactly what it must not be mistaken
-        // for, and it leaves the page speckled with a glyph that means "no".
-        //
-        // So an unsaved track shows nothing, and hovering the cell brings the
-        // mark up as an offer. That reveal is also the only thing that says
-        // the column can be clicked at all: without it a blank cell has
-        // nothing to invite the pointer.
-        let hovered = hover == Some(HoverCol::Like);
-        let (glyph, style) = match liked {
-            Some(true) => (super::table::LIKED_MARK, theme::accent()),
-            // An unchecked row offers the same mark: `library_add` on a track
-            // you already have is a no-op, so the worst a premature press can
-            // do is confirm what was already true.
-            _ if hovered => (super::table::LIKED_MARK, dim),
-            _ => ("", dim),
-        };
-        let style = if hovered {
-            super::table::hover_style(style)
-        } else {
-            style
-        };
-        spans.push(Span::styled(fit(glyph, LIKE_W), style));
     }
     spans.push(Span::styled(fit(&t.name, cols.name), name_style));
     spans.push(Span::raw(COL_GAP));
@@ -1988,6 +2105,15 @@ fn track_row(
         spans.push(Span::raw(COL_GAP));
         spans.push(Span::styled(fit(&t.release_year, YEAR_W), dim));
     }
+    if cols.actions {
+        spans.push(Span::raw(COL_GAP));
+        star_at = Some(spans.len());
+        spans.extend(action_spans(
+            liked,
+            hover == Some(HoverCol::Like),
+            hover == Some(HoverCol::Add),
+        ));
+    }
     spans.push(Span::raw(COL_GAP));
     spans.push(Span::styled(
         format!("{:>DUR_W$}", format_duration(t.duration_ms)),
@@ -1996,6 +2122,15 @@ fn track_row(
     let mut line = Line::from(spans);
     if selected {
         super::table::apply_selection(&mut line);
+        // Selection restyles every span, which would leave the selected row's
+        // star reading the same as an unsaved one — the one row whose state
+        // you cannot check by moving off it. Put the accent back, the way the
+        // queue puts its playing marker back.
+        if let Some(i) = star_at.filter(|_| liked == Some(true))
+            && let Some(span) = line.spans.get_mut(i)
+        {
+            span.style = theme::accent().add_modifier(Modifier::BOLD);
+        }
     }
     ListItem::new(line)
 }
@@ -2231,8 +2366,9 @@ fn render_track_table(
         }
         .intersection(rows_area)
     };
-    if cols.like {
+    if cols.actions {
         hit.main_like_col = cell_col(cols.like_offset(), LIKE_W);
+        hit.main_add_col = cell_col(cols.add_offset(), ADD_W);
     }
     hit.main_artist_col = cell_col(cols.artist_offset(), cols.artist);
     if let Some(off) = cols.album_offset() {
@@ -2242,6 +2378,8 @@ fn render_track_table(
         let row = |y: u16| list_state.offset() + (y - rows_area.y) as usize;
         if hit.main_like_col.contains(m) {
             Some((row(m.y), HoverCol::Like))
+        } else if hit.main_add_col.contains(m) {
+            Some((row(m.y), HoverCol::Add))
         } else if hit.main_artist_col.contains(m) {
             Some((row(m.y), HoverCol::Artist))
         } else if hit.main_album_col.contains(m) {
@@ -2297,6 +2435,7 @@ fn draw_tracks(
     global_loading: bool,
     main_index: usize,
     list_state: &mut ListState,
+    retries: u32,
     hit: &mut HitAreas,
     marks: &PlayMarks,
     liked: &std::collections::HashMap<String, bool>,
@@ -2305,9 +2444,17 @@ fn draw_tracks(
     let loading = list.loading || global_loading;
     let inner = body_area(area);
     let body = header_band(frame, inner, list, cover, loading, hit, mouse);
-    if list.display.is_empty() && !loading {
+    // A page that failed before its first row said so only through the toast
+    // until now, and drew the very line an empty one draws. A page that
+    // failed part-way through keeps the rows it got and leaves the news to
+    // the toast: there is a list on screen, and it is not blank.
+    if list.display.is_empty() {
         hit.main_list = body;
-        empty_message(frame, body, "this playlist is empty");
+        match &list.error {
+            Some(e) => error_message(frame, body, e, retries, hit, mouse),
+            None if loading => loading_message(frame, body, "loading…"),
+            None => empty_message(frame, body, "this playlist is empty"),
+        }
         return;
     }
     render_track_table(
@@ -2333,8 +2480,10 @@ fn draw_search(
     results: &crate::app::state::SearchResults,
     loading: bool,
     search_tab: SearchTab,
+    tabs: &[SearchTab],
     main_index: usize,
     list_state: &mut ListState,
+    retries: u32,
     hit: &mut HitAreas,
     marks: &PlayMarks,
     mouse: Option<Position>,
@@ -2404,7 +2553,7 @@ fn draw_search(
             &mut x,
             row,
             mouse,
-            &SearchTab::ALL,
+            tabs,
             search_tab,
             SearchTab::title,
             &mut hit.search_tabs,
@@ -2424,7 +2573,7 @@ fn draw_search(
             &mut x,
             row,
             mouse,
-            &SearchTab::ALL,
+            tabs,
             search_tab,
             SearchTab::title,
             &mut hit.search_tabs,
@@ -2437,8 +2586,24 @@ fn draw_search(
         };
     }
 
-    if tab_len == 0 && !pending {
+    if tab_len == 0 {
         hit.main_list = body;
+        // Each half answers for its own tabs, on the same reasoning that gives
+        // the directory its own `stations_loading`: a tab is empty because the
+        // host *it* asked would not answer, and neither half speaks for the
+        // other.
+        let error = match search_tab {
+            SearchTab::Stations => &results.stations_error,
+            _ => &results.error,
+        };
+        if let Some(e) = error {
+            error_message(frame, body, e, retries, hit, mouse);
+            return;
+        }
+        if pending {
+            loading_message(frame, body, "searching…");
+            return;
+        }
         // "no stations results for" would be the generic template's answer
         // here, so this tab spells its own.
         let text = match search_tab {
@@ -2802,6 +2967,7 @@ mod tests {
             display: Vec::new(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
+            error: None,
         });
         st.push_view();
         st.main = album_state().main;
@@ -3234,11 +3400,12 @@ mod tests {
         assert_eq!(text_at(st.hit.main_album_col, 5), "Album");
     }
 
-    /// The mark or nothing. An unsaved row is blank rather than wearing a
-    /// hollow twin: one shape at two brightnesses reads as one thing lit two
-    /// ways, and the page ends up speckled with a glyph that means "no".
+    /// Every row wears the pair, and the star reads its state as colour: the
+    /// accent when saved, dim when not. The glyph itself never changes, so a
+    /// row that is still being checked looks like one that came back unsaved
+    /// rather than like a third thing.
     #[test]
-    fn the_liked_column_marks_saved_rows_and_leaves_the_rest_blank() {
+    fn the_star_colours_saved_rows_and_dims_the_rest() {
         let mut st = tracks_state(vec![
             track("Alpha", "A"),
             track("Beta", "B"),
@@ -3246,79 +3413,108 @@ mod tests {
         ]);
         st.liked.insert("spotify:track:Alpha".into(), true);
         st.liked.insert("spotify:track:Beta".into(), false);
-        // Label, blank, band(3), header, spacer, then the rows from y7.
-        let lines = render(&mut st, 90, 13);
-        let mark = super::super::table::LIKED_MARK;
-        assert!(lines[9].contains(mark), "{:?}", lines[9]);
-        // Unsaved and unchecked look the same, and neither wears a twin.
-        for row in [10, 11] {
-            assert!(!lines[row].contains(mark), "row {row}: {:?}", lines[row]);
+        let mut terminal = Terminal::new(TestBackend::new(90, 13)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let col = st.hit.main_like_col;
+        // The mark sits one cell into its padded target.
+        let star = |row: u16| {
+            buffer
+                .cell(Position {
+                    x: col.x + 1,
+                    y: col.y + row,
+                })
+                .unwrap()
+        };
+        for row in 0..3 {
+            assert_eq!(star(row).symbol(), super::super::table::LIKED_MARK);
+        }
+        assert_eq!(star(0).fg, theme::accent_color());
+        // Unsaved and still-unchecked are the same dim mark.
+        assert_eq!(star(1).fg, theme::DIM);
+        assert_eq!(star(2).fg, theme::DIM);
+    }
+
+    /// Hovering either control lights that control alone — its whole padded
+    /// cell, so the lit run says how big the target is.
+    #[test]
+    fn hovering_lights_one_control_of_the_pair() {
+        let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
+        // Draw once to find out where the pair landed.
+        render(&mut st, 90, 12);
+        let (like, add) = (st.hit.main_like_col, st.hit.main_add_col);
+        assert!(!like.is_empty() && !add.is_empty());
+
+        let bg_at = |st: &mut AppState, x: u16, y: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+            terminal.draw(|f| screen(st, f)).unwrap();
+            terminal.backend().buffer().cell(Position { x, y }).unwrap().bg
+        };
+
+        // The padding is part of the control, so the pointer catches it a cell
+        // off the mark and the pill covers the whole cell.
+        st.mouse_pos = Some(Position { x: add.x, y: add.y });
+        for x in add.x..add.right() {
+            assert_eq!(bg_at(&mut st, x, add.y), theme::DIM, "the + drew no pill");
+        }
+        for x in like.x..like.right() {
+            assert_ne!(
+                bg_at(&mut st, x, like.y),
+                theme::DIM,
+                "hovering the + lit the ★ too"
+            );
         }
     }
 
-    /// The blank cell has to invite the pointer somehow, so hovering it brings
-    /// the mark up — the same one a saved row wears, on the same hover pill
-    /// every other clickable cell gets.
+    /// Each control is a padded click target of its own, the two flush against
+    /// each other, at the end of the row before the time.
     #[test]
-    fn hovering_the_liked_column_offers_the_mark() {
-        let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
-        // Draw once to find out where the column landed.
-        render(&mut st, 90, 12);
-        let col = st.hit.main_like_col;
-        assert!(!col.is_empty());
-        st.mouse_pos = Some(Position {
-            x: col.x,
-            y: col.y + 1,
-        });
-
-        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
-        terminal.draw(|f| screen(&mut st, f)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let cell = buffer
-            .cell(Position {
-                x: col.x,
-                y: col.y + 1,
-            })
-            .unwrap();
-        assert_eq!(
-            cell.symbol(),
-            super::super::table::LIKED_MARK,
-            "the hover offered no mark"
-        );
-        assert_eq!(cell.bg, theme::DIM, "the hover drew no pill");
-        // The row the pointer is not on stays blank.
-        assert_eq!(
-            buffer
-                .cell(Position { x: col.x, y: col.y })
-                .unwrap()
-                .symbol(),
-            " "
-        );
-    }
-
-    /// The column is a click target, so its rect has to sit over the glyphs it
-    /// covers — the whole two cells, not just the one the mark is drawn in.
-    #[test]
-    fn the_liked_column_records_a_clickable_rect() {
+    fn the_pair_records_two_adjacent_clickable_rects() {
         let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
         st.liked.insert("spotify:track:Alpha".into(), true);
         let mut terminal = Terminal::new(TestBackend::new(90, 14)).unwrap();
         terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        let col = st.hit.main_like_col;
-        assert_eq!(col.width, 2);
-        assert_eq!(col.height, 2, "the column outran the filled rows");
-        assert!(st.hit.main_list.contains(Position { x: col.x, y: col.y }));
-        assert_eq!(
+        let (like, add) = (st.hit.main_like_col, st.hit.main_add_col);
+        for col in [like, add] {
+            assert_eq!(col.width, 3, "the control lost its padding");
+            assert_eq!(col.height, 2, "the column outran the filled rows");
+            assert!(st.hit.main_list.contains(Position { x: col.x, y: col.y }));
+        }
+        // Flush, in the order the deck wears them: no cell between them
+        // belongs to neither control.
+        assert_eq!(add.x, like.right());
+        let symbol = |x: u16| {
             buffer
-                .cell(Position { x: col.x, y: col.y })
+                .cell(Position { x, y: like.y })
                 .unwrap()
-                .symbol(),
-            super::super::table::LIKED_MARK
+                .symbol()
+                .to_string()
+        };
+        // Each mark is centred in its own cell.
+        assert_eq!(symbol(like.x + 1), super::super::table::LIKED_MARK);
+        assert_eq!(symbol(add.x + 1), super::super::table::ADD_MARK);
+        // And the pair comes after the data columns it follows.
+        assert!(like.x > st.hit.main_album_col.right());
+    }
+
+    /// The pair is the last thing a narrowing pane gives up: the year, the
+    /// album and the number all go first.
+    #[test]
+    fn the_pair_outlives_the_data_columns_on_a_narrow_pane() {
+        let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
+        let lines = render(&mut st, 38, 12);
+        let header = lines.iter().find(|l| l.contains("Title")).unwrap();
+        assert!(!header.contains("Year"), "{header:?}");
+        assert!(!header.contains("Album"), "{header:?}");
+        assert!(
+            header.contains(&super::super::table::actions_label()),
+            "{header:?}"
         );
-        // And it stops where the title starts.
-        assert!(col.right() <= st.hit.main_artist_col.x);
+        assert!(!st.hit.main_like_col.is_empty());
+        assert!(!st.hit.main_add_col.is_empty());
     }
 
     #[test]
@@ -3352,6 +3548,152 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("this playlist is empty")));
     }
 
+    /// The reason a page is blank, said on the page.
+    ///
+    /// The whole point of the control: a refused load used to draw the very
+    /// line an empty one draws, so a playlist you know has tracks in it read
+    /// as a playlist with none.
+    #[test]
+    fn a_refused_page_says_so_instead_of_claiming_to_be_empty() {
+        let mut st = tracks_state(Vec::new());
+        if let MainView::Tracks(list) = &mut st.main {
+            list.error = Some(crate::app::state::LoadError::new(
+                "429 Too Many Requests",
+                crate::app::command::AppCommand::LoadPlaylistTracks {
+                    playlist_id: "p1".into(),
+                },
+            ));
+        }
+        let lines = render(&mut st, 60, 14);
+        assert!(lines.iter().any(|l| l.contains("429 Too Many Requests")));
+        assert!(
+            !lines.iter().any(|l| l.contains("this playlist is empty")),
+            "a page that failed claimed to be empty"
+        );
+        assert!(lines.iter().any(|l| l.contains(RETRY_PILL)));
+        assert!(!st.hit.retry_btn.is_empty(), "the control took no clicks");
+    }
+
+    /// A refusal that comes straight back leaves the spinner up for less than
+    /// a frame, so the count is what tells you the press did anything.
+    #[test]
+    fn a_repeated_refusal_says_how_many_times_it_was_asked() {
+        let mut st = tracks_state(Vec::new());
+        if let MainView::Tracks(list) = &mut st.main {
+            list.error = Some(crate::app::state::LoadError::new(
+                "429 Too Many Requests",
+                crate::app::command::AppCommand::LoadLikedSongs,
+            ));
+        }
+        let has_tally = |lines: &[String]| lines.iter().any(|l| l.contains("asked again"));
+        assert!(!has_tally(&render(&mut st, 60, 16)), "counted a first ask");
+
+        st.retries = 1;
+        // What `ui::draw` does at the top of every frame; this helper draws
+        // the pane alone, so the reset has to be spelled here.
+        st.hit = crate::app::state::HitAreas::default();
+        let lines = render(&mut st, 60, 16);
+        assert!(lines.iter().any(|l| l.contains("asked again once")));
+        assert!(lines.iter().any(|l| l.contains(RETRY_PILL)));
+        assert!(!st.hit.retry_btn.is_empty(), "the tally crowded the control");
+
+        st.retries = 3;
+        assert!(
+            render(&mut st, 60, 16)
+                .iter()
+                .any(|l| l.contains("asked again 3 times"))
+        );
+    }
+
+    /// A directory page has nothing above its tab strip but the trail, so the
+    /// word on the row and the spinner under it were the same news twice.
+    #[test]
+    fn a_loading_radio_page_says_so_in_the_pane_and_not_on_the_trail() {
+        let mut st = AppState::new();
+        st.main = MainView::Radio(crate::app::state::RadioView::new(
+            crate::app::state::RadioScope::Popular,
+            1,
+        ));
+        let lines = render(&mut st, 76, 16);
+        assert!(!lines[PATH].contains("LOADING"), "{:?}", lines[PATH]);
+        assert!(lines.iter().any(|l| l.contains("loading stations…")));
+        // The trail going quiet must not take the fast tick with it, or the
+        // spinner steps instead of turning.
+        assert!(super::super::is_animating(&st));
+    }
+
+    /// The control is only ever recorded where it was drawn.
+    #[test]
+    fn a_page_that_did_not_fail_records_no_retry() {
+        let mut st = tracks_state(Vec::new());
+        let lines = render(&mut st, 60, 14);
+        assert!(lines.iter().any(|l| l.contains("this playlist is empty")));
+        assert!(st.hit.retry_btn.is_empty());
+    }
+
+    /// Too short for the pill, so it is not drawn — and therefore not
+    /// recorded either, or a click on the row it would have taken would
+    /// retry a page that never offered it.
+    #[test]
+    fn a_short_pane_drops_the_control_rather_than_recording_it_offscreen() {
+        let mut st = tracks_state(Vec::new());
+        if let MainView::Tracks(list) = &mut st.main {
+            list.error = Some(crate::app::state::LoadError::new(
+                "no",
+                crate::app::command::AppCommand::LoadLikedSongs,
+            ));
+        }
+        render(&mut st, 60, HEAD as u16 + 2);
+        assert!(st.hit.retry_btn.is_empty());
+    }
+
+    /// A page still being fetched turns a spinner, and the frame loop holds
+    /// the fast tick over it so it turns rather than steps.
+    #[test]
+    fn a_loading_page_turns_a_spinner() {
+        let mut st = tracks_state(Vec::new());
+        if let MainView::Tracks(list) = &mut st.main {
+            list.loading = true;
+        }
+        let lines = render(&mut st, 60, 14);
+        assert!(
+            lines
+                .iter()
+                .any(|l| super::super::table::SPINNER.iter().any(|f| l.contains(f))),
+            "no spinner frame on a loading page"
+        );
+        assert!(super::super::is_animating(&st));
+    }
+
+    /// The reason a search came back blank belongs to the half that was
+    /// refused: the directory being unreachable is not Spotify refusing.
+    #[test]
+    fn each_search_half_reports_its_own_refusal() {
+        let mut st = AppState::new();
+        st.main = MainView::Search(crate::app::state::SearchResults {
+            query: "muse".into(),
+            stations_error: Some(crate::app::state::LoadError::new(
+                "directory unreachable",
+                crate::app::command::AppCommand::Search("muse".into()),
+            )),
+            ..Default::default()
+        });
+        st.search_tab = SearchTab::Stations;
+        let lines = render(&mut st, 70, 16);
+        assert!(lines.iter().any(|l| l.contains("directory unreachable")));
+
+        // What `ui::draw` does at the top of every frame; this helper draws
+        // the pane alone, so the reset has to be spelled here.
+        st.hit = crate::app::state::HitAreas::default();
+        st.search_tab = SearchTab::Tracks;
+        let lines = render(&mut st, 70, 16);
+        assert!(
+            lines.iter().any(|l| l.contains("no tracks results")),
+            "the Spotify tabs wore the directory's failure"
+        );
+        assert!(st.hit.retry_btn.is_empty());
+    }
+
     /// The row names the page, not the page's kind.
     ///
     /// The header band under it already tells you the kind, with a sleeve and
@@ -3379,6 +3721,9 @@ mod tests {
 
     fn search_state() -> AppState {
         let mut st = AppState::new();
+        // All five tabs: four of them are Spotify's, and they are on the strip
+        // only for a signed-in Premium account.
+        st.spotify = crate::app::state::SpotifyState::Ready;
         st.main = MainView::Search(SearchResults {
             query: "muse".into(),
             tracks: vec![track("Starlight", "Muse")],
@@ -3642,6 +3987,7 @@ mod tests {
             display: Vec::new(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
+            error: None,
         };
         v.retab();
         st.main = MainView::Artist(v);

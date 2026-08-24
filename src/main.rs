@@ -14,16 +14,19 @@ mod radio;
 mod relaunch;
 mod session;
 mod ui;
+mod update;
 mod viz;
 
 use std::fs::File;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, EventStream};
 use crossterm::terminal::SetTitle;
 use futures::StreamExt;
+use librespot_core::cache::Cache;
+use librespot_playback::mixer::Mixer;
 use librespot_playback::player::{PlayerEvent, PlayerEventChannel};
 use parking_lot::RwLock;
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -31,8 +34,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::api::Api;
 use crate::app::command::AppCommand;
-use crate::app::state::AppState;
-use crate::client::Client;
+use crate::app::state::{AppState, SpotifyState};
+use crate::audio_tap::AudioTap;
+use crate::client::{Client, Engine, Spotify};
 
 /// Below this the browse pane starts shedding columns and art; the UI still
 /// draws, it just has less to say.
@@ -79,6 +83,25 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// The audio path that exists whether or not Spotify does: the on-disk cache,
+/// the soft mixer, and the PCM tap the visualizer reads.
+///
+/// Kept together because a sign-in needs all three to build the streaming
+/// engine, and the frame loop carries them only to hand them on.
+#[derive(Clone)]
+struct AudioPath {
+    cache: Cache,
+    mixer: Arc<dyn Mixer>,
+    tap: Arc<AudioTap>,
+}
+
+impl AudioPath {
+    fn open() -> Result<Self> {
+        let (cache, mixer, tap) = session::audio()?;
+        Ok(Self { cache, mixer, tap })
+    }
+}
+
 async fn run() -> Result<()> {
     init_logging()?;
     // Installed before anything can open an audio device, so closing the
@@ -87,63 +110,61 @@ async fn run() -> Result<()> {
     console_ctrl::install();
     warn_about_terminal();
 
-    // Auth and session setup happen before the TUI takes the terminal, so
-    // the OAuth flow can print instructions and block on the browser.
-    // ASCII only: this prints before the TUI starts, possibly to a legacy
-    // console codepage.
-    if config::load_auth().is_none() {
-        println!(
-            "first run: a browser window will open so you can sign in to Spotify.\n\
-             it happens twice - once for your library, once for playback. after\n\
-             that spot signs itself in.\n"
-        );
-    }
-    println!("spot - authenticating with Spotify...");
-    let token = tokio::task::spawn_blocking(auth::obtain_web_token)
-        .await
-        .context("auth task panicked")??;
-
-    println!("starting playback engine...");
-    let (session, player, audio_tap, mixer, player_events) = session::build().await?;
-
-    let api = Api::new(auth::to_rspotify_token(&token));
-    tokio::spawn(token_refresh_loop(api.clone(), token.expires_at));
+    // No account is needed to reach the first frame. These three are the whole
+    // of the audio path radio plays through, and none of them needs a login;
+    // Spotify is connected from Home afterwards, or never.
+    let audio = AudioPath::open()?;
 
     let state = Arc::new(RwLock::new(AppState::new()));
     {
         let mut st = state.write();
-        st.audio_tap = Arc::clone(&audio_tap);
+        st.audio_tap = Arc::clone(&audio.tap);
         // Read before the first frame, so Home's Radio row can say how many
         // stations are behind it without waiting on anything.
         st.radio_favorites = config::load_radio();
+        // Read before the first `playlists()` call, so a warm start has the
+        // add-to-playlist box's marks before the box can be opened. What is
+        // stale is dropped by `load_playlists` when the snapshots come back.
+        st.playlist_tracks = config::load_playlist_tracks();
+        // A saved refresh token is a sign-in that has already happened. It is
+        // spent in the background below: no browser, and nothing to press.
+        if config::load_auth().is_some() {
+            st.spotify = SpotifyState::Connecting;
+        }
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(player_event_loop(
-        player_events,
-        Arc::clone(&state),
-        tx.clone(),
-    ));
     // The radio player writes into the same tap librespot's sink does, so the
     // visualizer follows whichever engine is playing. The client is also the
     // only holder of the handles that can stop either engine, so quitting has
     // to ask it and wait for the answer — see the shutdown block below.
     let (client, shutdown_done) = Client::new(
-        api,
-        session,
-        player,
-        mixer,
+        audio.cache.clone(),
+        Arc::clone(&audio.mixer),
         Arc::clone(&state),
         rx,
         tx.clone(),
-        audio_tap,
+        Arc::clone(&audio.tap),
     );
     tokio::spawn(client.run());
 
-    let _ = tx.send(AppCommand::LoadPlaylists);
+    // The executable a previous run replaced is still on disk, because Windows
+    // would not let that run delete the image it was executing. This one can.
+    update::clean_previous();
+    let _ = tx.send(AppCommand::CheckForUpdate);
+
+    if state.read().spotify == SpotifyState::Connecting {
+        tokio::spawn(connect_spotify(
+            Arc::clone(&state),
+            tx.clone(),
+            audio.clone(),
+            false,
+        ));
+    }
 
     let terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
-    let result = run_tui(terminal, state, tx.clone()).await;
+    let result = run_tui(terminal, Arc::clone(&state), tx.clone(), audio).await;
+    let restart = state.read().restart_request;
 
     // Before the terminal comes back, not after: the audio has to stop while
     // the UI still says spot is running, or quitting looks finished while a
@@ -163,13 +184,156 @@ async fn run() -> Result<()> {
 
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture, SetTitle(""));
     ratatui::restore();
+
+    // After the terminal is back and before `main` exits: the new copy needs
+    // the console this one is giving up, and it must not start while the old
+    // one still owns the audio device.
+    if restart {
+        #[cfg(windows)]
+        relaunch::restart();
+    }
     result
+}
+
+/// Sign in to Spotify and hand what it got to the client.
+///
+/// Two halves and two outcomes. The Web API comes first and any account has
+/// it: a station's announcement is looked up in it, so a free account still
+/// gets its records named. The streaming engine comes second and only Premium
+/// has it, which is what tells [`SpotifyState::Ready`] from
+/// [`SpotifyState::Limited`].
+///
+/// `interactive` decides whether a browser may open. A run that already has a
+/// refresh token spends it silently at startup; only the Home row asks for a
+/// login the user has to answer.
+async fn connect_spotify(
+    state: Arc<RwLock<AppState>>,
+    tx: UnboundedSender<AppCommand>,
+    audio: AudioPath,
+    interactive: bool,
+) {
+    state.write().spotify = SpotifyState::Connecting;
+
+    let token = if interactive {
+        tokio::task::spawn_blocking(auth::obtain_web_token).await
+    } else {
+        let Some(saved) = config::load_auth() else {
+            state.write().spotify = SpotifyState::Off;
+            return;
+        };
+        tokio::task::spawn_blocking(move || auth::refresh_web(&saved.refresh_token)).await
+    };
+    let token = match token {
+        Ok(Ok(token)) => token,
+        Ok(Err(e)) => {
+            log::error!("Spotify sign-in failed: {e:#}");
+            let mut st = state.write();
+            st.spotify = SpotifyState::Off;
+            st.toast(format!("sign-in failed: {e}"));
+            return;
+        }
+        Err(e) => {
+            log::error!("sign-in task panicked: {e}");
+            state.write().spotify = SpotifyState::Off;
+            return;
+        }
+    };
+
+    let api = Api::new(auth::to_rspotify_token(&token));
+    tokio::spawn(token_refresh_loop(api.clone(), token.expires_at));
+
+    // Spotify has been withdrawing the subscription level from the account
+    // endpoint. When it reports one, a free account is spared a browser window
+    // and a login that would only be refused; when it reports none, the login
+    // itself is the test.
+    //
+    // The id off the same answer is what the Playlists page tells your own
+    // playlists from the ones you follow by.
+    let premium = match api.account().await {
+        Ok(account) => {
+            state.write().me_id = Some(account.id);
+            account.premium
+        }
+        Err(e) => {
+            log::warn!("could not read the account: {e:#}");
+            None
+        }
+    };
+    // The login is only attempted where a refusal cannot cost the terminal.
+    // librespot 0.8's `Session::check_catalogue` calls `process::exit(1)` for
+    // an account it will not stream for, and nothing upstream of it can
+    // intervene — so the attempt is made either with the console already given
+    // back (the Home row, see [`sign_in`]) or on cached credentials, which
+    // exist only because this account has streamed here before. It is the
+    // level above that decides in practice; this is what stands if Spotify
+    // stops reporting one.
+    let may_connect = interactive || audio.cache.credentials().is_some();
+    let (engine, limit) = if premium == Some(false) {
+        (None, Some("no Premium".to_string()))
+    } else if !may_connect {
+        (None, Some("sign in to play".to_string()))
+    } else {
+        match session::connect(&audio.cache, &audio.mixer, &audio.tap).await {
+            Ok((session, player, events)) => {
+                tokio::spawn(player_event_loop(events, Arc::clone(&state), tx.clone()));
+                (Some(Engine { session, player }), None)
+            }
+            Err(e) => {
+                log::error!("playback engine unavailable: {e:#}");
+                let refused = e.to_string().contains("Premium");
+                state.write().toast(format!("no playback: {e}"));
+                let reason = if refused { "no Premium" } else { "no playback" };
+                (None, Some(reason.to_string()))
+            }
+        }
+    };
+
+    let ready = engine.is_some();
+    let _ = tx.send(AppCommand::SpotifyConnected(Spotify { api, engine }));
+    state.write().spotify = match limit {
+        Some(reason) => SpotifyState::Limited(reason),
+        None => SpotifyState::Ready,
+    };
+    if ready {
+        let _ = tx.send(AppCommand::LoadPlaylists);
+    }
+}
+
+/// Run an interactive sign-in with the terminal handed back to the console.
+///
+/// The OAuth flow prints the authorization URL and blocks on the browser, so
+/// the alternate screen has to go for the length of it — a stray `println!`
+/// over a drawn frame scrolls the screen out from under the diff ratatui
+/// draws against. Radio plays throughout; only the picture stops.
+async fn sign_in(
+    terminal: ratatui::DefaultTerminal,
+    state: &Arc<RwLock<AppState>>,
+    tx: &UnboundedSender<AppCommand>,
+    audio: &AudioPath,
+) -> ratatui::DefaultTerminal {
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    drop(terminal);
+    ratatui::restore();
+
+    // ASCII only: this may reach a legacy console codepage.
+    println!(
+        "spot - connecting to Spotify.\n\n\
+         a browser window opens for your library, and a second one for playback.\n\
+         both are Spotify's own login page, and both are one-time. spot comes back\n\
+         when they are done.\n"
+    );
+    connect_spotify(Arc::clone(state), tx.clone(), audio.clone(), true).await;
+
+    let terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    terminal
 }
 
 async fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     state: Arc<RwLock<AppState>>,
     tx: UnboundedSender<AppCommand>,
+    audio: AudioPath,
 ) -> Result<()> {
     // The player view animates its visualizer, so it redraws at ~20 fps;
     // everywhere else the slow tick keeps the app idle-cheap.
@@ -195,29 +359,43 @@ async fn run_tui(
             },
         }
 
-        let mut st = state.write();
-        if st.should_quit {
-            break;
+        // The whole frame under one lock, and the lock ended before the await
+        // below: the sign-in takes seconds, and every other task writes this
+        // state.
+        let (want_fast, connect) = {
+            let mut st = state.write();
+            if st.should_quit {
+                break;
+            }
+            // The playing Spotify track is the queue's current row — but only
+            // once something has actually played (see `AppState::playback`).
+            let playing = st
+                .playback
+                .as_ref()
+                .and(st.queue.as_ref())
+                .and_then(|q| q.current());
+            let title = window_title(playing, st.radio.as_ref());
+            if title != last_title {
+                let _ = crossterm::execute!(std::io::stdout(), SetTitle(&title));
+                last_title = title;
+            }
+            terminal.draw(|frame| ui::draw(frame, &mut st))?;
+            // The nav row's dot rides the audio's loudness on every screen, so
+            // audio arriving is reason enough for the fast tick — at 250 ms it
+            // would visibly step rather than breathe. Nothing playing still
+            // costs four wakeups a second.
+            // A spinner on screen is the third reason, and the only one that
+            // holds while nothing is playing at all — which is exactly when
+            // there is one.
+            let want_fast =
+                st.show_player || st.audio_tap.is_fresh(AUDIO_LIVE) || ui::is_animating(&st);
+            (want_fast, std::mem::take(&mut st.connect_request))
+        };
+        // Here and nowhere else: the sign-in prints to the console, so it can
+        // only run where the terminal can be given back — see [`sign_in`].
+        if connect {
+            terminal = sign_in(terminal, &state, &tx, &audio).await;
         }
-        // The playing Spotify track is the queue's current row — but only
-        // once something has actually played (see `AppState::playback`).
-        let playing = st
-            .playback
-            .as_ref()
-            .and(st.queue.as_ref())
-            .and_then(|q| q.current());
-        let title = window_title(playing, st.radio.as_ref());
-        if title != last_title {
-            let _ = crossterm::execute!(std::io::stdout(), SetTitle(&title));
-            last_title = title;
-        }
-        terminal.draw(|frame| ui::draw(frame, &mut st))?;
-        // The nav row's dot rides the audio's loudness on every screen, so
-        // audio arriving is reason enough for the fast tick — at 250 ms it
-        // would visibly step rather than breathe. Nothing playing still costs
-        // four wakeups a second.
-        let want_fast = st.show_player || st.audio_tap.is_fresh(AUDIO_LIVE);
-        drop(st);
         // Rebuild outside the select! arm, where `tick` isn't borrowed.
         if want_fast != fast {
             fast = want_fast;

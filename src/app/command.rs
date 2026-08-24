@@ -1,4 +1,5 @@
 use crate::app::state::{RadioScope, Station, Track};
+use crate::client::Spotify;
 
 /// A playable source whose rows are not in hand yet — a playlist played from
 /// its row, an album played from its card. The client fetches the pages and
@@ -19,6 +20,9 @@ pub enum FetchSource {
 /// Commands sent from the UI/event layer to the client task.
 #[derive(Debug, Clone)]
 pub enum AppCommand {
+    /// A sign-in finished: take what it got. Sent by the frame loop, which
+    /// owns the sign-in because the browser flow prints to the console.
+    SpotifyConnected(Spotify),
     PlayPause,
     Next,
     Prev,
@@ -70,6 +74,25 @@ pub enum AppCommand {
     SetLiked {
         uri: String,
         liked: bool,
+    },
+    /// A pick in the player's add-to-playlist box: put one track on a
+    /// playlist, or take it off.
+    ///
+    /// `seq` is the opening of the box this answers, so a result that arrives
+    /// after it was closed and opened again cannot act on the new one.
+    SetOnPlaylist {
+        playlist_id: String,
+        uri: String,
+        on: bool,
+        seq: u64,
+    },
+    /// Read what these playlists hold, for the box's marks. Carries no track:
+    /// the whole playlist is cached, so one walk answers every record.
+    ///
+    /// The client drops the ids it already holds or is already walking, so the
+    /// caller may send its whole list without counting the cost.
+    CachePlaylistTracks {
+        playlist_ids: Vec<String>,
     },
     Search(String),
     LoadPlaylists,
@@ -170,6 +193,13 @@ pub enum AppCommand {
     /// after a station took the device. The client answers it, because only
     /// the client knows whether the radio engine is streaming.
     YieldToRadio,
+
+    /// Ask GitHub whether a newer spot has been released. Sent once at
+    /// startup; the answer, if there is one, becomes the Home row.
+    CheckForUpdate,
+    /// Enter on that row: download the release and write it over this
+    /// executable.
+    InstallUpdate,
 
     /// Quit: silence both engines and end the client loop.
     ///

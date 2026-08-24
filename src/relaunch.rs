@@ -85,6 +85,40 @@ fn console_is_legacy_host() -> bool {
     String::from_utf16_lossy(&class[..len as usize]) == "ConsoleWindowClass"
 }
 
+/// Start the executable at this process's own path again, for the copy an
+/// update has just written there.
+///
+/// The console rules are [`relaunch_in_windows_terminal`]'s in reverse. Inside
+/// Windows Terminal the console is already the right kind and the new copy
+/// takes it as this one exits; anywhere else the exe may have been double-
+/// clicked into a legacy host, so it goes to a Windows Terminal window if the
+/// machine has one.
+///
+/// Best effort: a spawn that fails leaves the user with a new spot they start
+/// themselves, which is a far smaller thing than the update it followed.
+pub fn restart() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let in_wt = std::env::var_os("WT_SESSION").is_some();
+    let started = if in_wt {
+        Command::new(&exe).spawn().is_ok()
+    } else {
+        match find_wt() {
+            Some(wt) => Command::new(wt)
+                .args(["-w", "-1", "nt", "--title", "spot"])
+                .arg(&exe)
+                .env(OPT_OUT, "1")
+                .spawn()
+                .is_ok(),
+            None => Command::new(&exe).spawn().is_ok(),
+        }
+    };
+    if !started {
+        log::warn!("could not restart {}", exe.display());
+    }
+}
+
 fn find_wt() -> Option<PathBuf> {
     // The Store package installs an app-execution alias here and puts the
     // directory on PATH, but an Explorer session started before the install

@@ -36,7 +36,7 @@ use ratatui::widgets::Paragraph;
 use super::main_pane;
 use super::main_pane::PageHeader;
 use super::play_state::{self, PlayState};
-use super::table::{brand, right_row};
+use super::table::{brand, right_row, spinner};
 use super::theme;
 use crate::app::state::{AppState, InputMode, MainView};
 
@@ -46,6 +46,9 @@ use crate::app::state::{AppState, InputMode, MainView};
 /// asks both, every time, from every page, and naming the sources is what says
 /// so. Which kinds came back is what the tab strip on the results page is for.
 const PLACEHOLDER: &str = "search Spotify and radio…";
+/// The same, with only one catalogue behind the box. Naming a source the box
+/// cannot ask would offer what pressing `/` will not deliver.
+const RADIO_PLACEHOLDER: &str = "search radio…";
 
 /// Cells between the mark and whatever shares its row. Wider than a word
 /// space, so the two read as separate controls rather than as one phrase, but
@@ -221,10 +224,13 @@ fn status_spans(state: &mut AppState) -> Vec<Span<'static>> {
         return Vec::new();
     };
     match status.state {
-        // The dot does not pulse here. Nothing is arriving to pulse to, and a
-        // moving dot would say the opposite of the word beside it.
+        // A spinner rather than the dot the other two states wear. The dot
+        // rides the audio, and under a load there is no audio for it to ride
+        // — it would sit still and say the opposite of the word beside it.
+        // What is happening here has no progress to report either, which is
+        // exactly what a spinner is for.
         PlayState::Loading => vec![
-            Span::styled("● ", theme::warn()),
+            Span::styled(format!("{} ", spinner()), theme::warn()),
             Span::styled("LOADING", theme::warn()),
         ],
         // Paused is a resting state: one flat grey for the dot and the word
@@ -315,7 +321,10 @@ fn search_row(frame: &mut Frame, row: Rect, state: &mut AppState) {
         // the same keystroke did two different things depending on where you
         // were standing, and you had to read the row to find out which. It
         // queries both now, so it can say one thing everywhere.
-        (false, _) => PLACEHOLDER.to_string(),
+        (false, _) if state.spotify == crate::app::state::SpotifyState::Ready => {
+            PLACEHOLDER.to_string()
+        }
+        (false, _) => RADIO_PLACEHOLDER.to_string(),
     };
 
     // The prompt keeps [`theme::WARN`] whatever the mode, so the glyph reads
@@ -389,6 +398,7 @@ mod tests {
     #[test]
     fn home_draws_no_path_at_all() {
         let mut st = AppState::new();
+        st.spotify = crate::app::state::SpotifyState::Ready;
         let lines = render(&mut st, 80);
         assert_eq!(
             lines[PROMPT_ROW].trim_end(),
@@ -396,6 +406,15 @@ mod tests {
         );
         assert!(lines[PATH_ROW].trim().is_empty(), "{:?}", lines[PATH_ROW]);
         assert!(st.hit.crumbs.is_empty());
+    }
+
+    /// The box names the catalogues it asks. Without an account there is one
+    /// of them, and saying otherwise would offer what `/` will not deliver.
+    #[test]
+    fn the_prompt_names_radio_alone_without_an_account() {
+        let mut st = AppState::new();
+        let lines = render(&mut st, 80);
+        assert_eq!(lines[PROMPT_ROW].trim_end(), "♫ spot    /  search radio…");
     }
 
     /// And it is gone from the *front* of a path too, not just from its own
@@ -520,6 +539,7 @@ mod tests {
 
         // Browsing away from the results puts the prompt back.
         let mut st = AppState::new();
+        st.spotify = crate::app::state::SpotifyState::Ready;
         let lines = render(&mut st, 80);
         assert!(lines[PROMPT_ROW].contains(PLACEHOLDER));
     }
@@ -783,7 +803,7 @@ mod tests {
         st.audio_tap.clear();
         let lines = render(&mut st, 80);
         assert!(
-            lines[PROMPT_ROW].trim_end().ends_with("● LOADING"),
+            super::super::table::ends_with_loading(&lines[PROMPT_ROW]),
             "{:?}",
             lines[PROMPT_ROW]
         );
@@ -800,7 +820,7 @@ mod tests {
         st.audio_tap.clear();
         let lines = render(&mut st, 80);
         assert!(
-            lines[PROMPT_ROW].trim_end().ends_with("● LOADING"),
+            super::super::table::ends_with_loading(&lines[PROMPT_ROW]),
             "{:?}",
             lines[PROMPT_ROW]
         );

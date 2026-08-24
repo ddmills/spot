@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures::StreamExt;
+use librespot_core::cache::Cache as LibrespotCache;
 use librespot_core::session::Session;
 use librespot_core::spotify_uri::SpotifyUri;
 use librespot_playback::mixer::Mixer;
@@ -16,19 +18,27 @@ use crate::app::command::{AppCommand, FetchSource};
 use crate::app::queue::Queue;
 use crate::app::state::{
     self, AppState, ArtistTab, ArtistView, MainView, Playback, SortKey, TrackList, TrackListKind,
+    UpdateState,
 };
 use crate::cover::{Cover, CoverCache};
 use crate::radio::api::RadioApi;
 use crate::radio::player::RadioPlayer;
 
 /// Where a streamed track fetch pulls its pages from.
+///
+/// Holds everything the fetch was asked for, not only what the endpoints
+/// need: an album's artists and sleeve are carried so [`Self::open_command`]
+/// can ask for the page again without reading a view that failed and
+/// therefore has nothing to read.
 enum TrackSource {
     Liked,
     Playlist(String),
     Album {
         id: String,
         name: String,
+        artists: String,
         year: String,
+        cover_url: Option<String>,
     },
 }
 
@@ -42,6 +52,30 @@ impl TrackSource {
             TrackSource::Liked => state::liked_key(),
             TrackSource::Playlist(id) => state::playlist_key(id),
             TrackSource::Album { id, .. } => state::album_key(id),
+        }
+    }
+
+    /// The command that opens this page from nothing — what a failed load
+    /// hands to its `↻ try again`.
+    fn open_command(&self) -> AppCommand {
+        match self {
+            TrackSource::Liked => AppCommand::LoadLikedSongs,
+            TrackSource::Playlist(id) => AppCommand::LoadPlaylistTracks {
+                playlist_id: id.clone(),
+            },
+            TrackSource::Album {
+                id,
+                name,
+                artists,
+                year,
+                cover_url,
+            } => AppCommand::OpenAlbum {
+                id: id.clone(),
+                name: name.clone(),
+                artists: artists.clone(),
+                year: year.clone(),
+                cover_url: cover_url.clone(),
+            },
         }
     }
 }
@@ -76,21 +110,130 @@ const SEEK_ATTEMPTS: u8 = 3;
 const SEEK_CHAIN_WITHIN: Duration = Duration::from_secs(120);
 const COVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COVER_TIMEOUT: Duration = Duration::from_secs(10);
+/// Playlists walked at once by the marks prefetch. Low on purpose: it runs
+/// over a whole library at sign-in, behind whatever you are actually doing.
+const PREFETCH_CONCURRENCY: usize = 4;
+
+/// Write the cached playlist contents to disk, quietly.
+///
+/// Nobody asked for this and nothing on screen depends on it landing — a run
+/// that cannot write its cache walks the playlists again next time, which is
+/// the first-run case and not an error worth a toast.
+fn save_playlist_tracks(st: &AppState) {
+    if let Err(e) = crate::config::save_playlist_tracks(&st.playlist_tracks) {
+        log::warn!("could not save the playlist cache: {e:#}");
+    }
+}
+
+/// Drop the cached contents of every playlist that is gone or has moved on.
+///
+/// A `snapshot_id` that no longer matches is Spotify saying the contents
+/// changed, and what was true of the old contents says nothing about the new.
+/// Answers whether anything went, so the file is rewritten only when it holds
+/// something it should not.
+fn drop_stale_playlist_tracks(
+    cache: &mut HashMap<String, state::PlaylistContents>,
+    playlists: &[state::Playlist],
+) -> bool {
+    let snapshots: HashMap<&str, &str> = playlists
+        .iter()
+        .map(|p| (p.id.as_str(), p.snapshot_id.as_str()))
+        .collect();
+    let before = cache.len();
+    cache.retain(|id, contents| snapshots.get(id.as_str()) == Some(&contents.snapshot_id.as_str()));
+    cache.len() != before
+}
+
+/// The playlists the prefetch still has to walk: the ones you own that
+/// nothing holds the contents of.
+///
+/// Only the ones you own, because those are the only ones the box offers —
+/// Spotify refuses an add to a playlist you merely follow, so walking one
+/// would buy a mark nothing draws.
+fn uncached_playlists(
+    cache: &HashMap<String, state::PlaylistContents>,
+    playlists: &[state::Playlist],
+    me: Option<&str>,
+) -> Vec<String> {
+    let Some(me) = me else {
+        return Vec::new();
+    };
+    playlists
+        .iter()
+        .filter(|p| p.owner_id == me)
+        .filter(|p| !cache.contains_key(&p.id))
+        .map(|p| p.id.clone())
+        .collect()
+}
+
+/// Put a track id into a cached playlist's contents, or take it out.
+///
+/// A playlist nothing has walked is left alone: a set holding one id would
+/// read as a playlist holding one track, and the box would draw every other
+/// record as off it.
+fn set_cached_membership(st: &mut AppState, playlist_id: &str, track_id: &str, on: bool) {
+    let Some(contents) = st.playlist_tracks.get_mut(playlist_id) else {
+        return;
+    };
+    if on {
+        contents.track_ids.insert(track_id.to_string());
+    } else {
+        contents.track_ids.remove(track_id);
+    }
+}
 
 /// The volume a first run starts at, before anything has been saved.
 pub const DEFAULT_VOLUME_PCT: u8 = 50;
 
+/// The Spotify streaming engine. Only a Premium account gets one.
+#[derive(Clone)]
+pub struct Engine {
+    /// Held for the shutdown: stopping the player does not close the
+    /// connection underneath it.
+    pub session: Session,
+    pub player: Arc<Player>,
+}
+
+/// Everything a finished sign-in hands the client.
+///
+/// The two halves arrive together and are of different worth: the Web API is
+/// what a station's announcement is looked up in, and any account has it; the
+/// engine is what plays a record, and only Premium has it.
+#[derive(Clone)]
+pub struct Spotify {
+    pub api: Api,
+    pub engine: Option<Engine>,
+}
+
+impl std::fmt::Debug for Spotify {
+    /// Hand-written because neither librespot's session nor its player is
+    /// `Debug`, and [`crate::app::command::AppCommand`] is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spotify")
+            .field("engine", &self.engine.is_some())
+            .finish()
+    }
+}
+
 /// Background task: consumes UI commands, owns the queue, and drives
 /// librespot's player directly — spot decides the order, the shuffle and the
 /// transport, and Spotify supplies the audio, the metadata and the art.
+///
+/// Spotify is optional and arrives late, or never: spot starts with radio
+/// alone and takes [`AppCommand::SpotifyConnected`] whenever a sign-in
+/// finishes. Every Spotify command therefore begins by asking for the half it
+/// needs, and returns quietly when it is not there — the screen offers no way
+/// to those commands meanwhile.
 pub struct Client {
-    api: Api,
-    /// Held for the shutdown: stopping the player does not close the
-    /// connection underneath it.
-    session: Session,
-    player: Arc<Player>,
+    api: Option<Api>,
+    engine: Option<Engine>,
+    /// librespot's on-disk cache. The client only writes the volume into it;
+    /// the credentials and the audio are librespot's own business. Held
+    /// directly rather than through the session, which need not exist.
+    volume_cache: LibrespotCache,
     /// librespot's soft mixer: the volume actually being applied, readable
-    /// and writable without a round trip.
+    /// and writable without a round trip. It needs no session, so radio has
+    /// one too.
     mixer: Arc<dyn Mixer>,
     state: Arc<RwLock<AppState>>,
     rx: UnboundedReceiver<AppCommand>,
@@ -109,6 +252,9 @@ pub struct Client {
     /// same track twice does not ask twice. It is asked once per track and
     /// the answer only changes when we change it.
     liked_probe: Option<String>,
+    /// The playlists whose contents are being read, so a second ask for one
+    /// already in flight does not walk it twice.
+    membership_probe: HashSet<String>,
     /// The announcement we last ran a Spotify lookup for.
     ///
     /// The radio twin of [`Self::liked_probe`], and set *before* the search
@@ -138,9 +284,7 @@ pub struct Client {
 impl Client {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        api: Api,
-        session: Session,
-        player: Arc<Player>,
+        volume_cache: LibrespotCache,
         mixer: Arc<dyn Mixer>,
         state: Arc<RwLock<AppState>>,
         rx: UnboundedReceiver<AppCommand>,
@@ -160,9 +304,9 @@ impl Client {
             .build()
             .unwrap_or_default();
         let client = Self {
-            api,
-            session,
-            player,
+            api: None,
+            engine: None,
+            volume_cache,
             mixer,
             state,
             rx,
@@ -173,6 +317,7 @@ impl Client {
             http,
             covers: Arc::new(Mutex::new(CoverCache::default())),
             liked_probe: None,
+            membership_probe: HashSet::new(),
             radio_probe: None,
             tune_seq: 0,
             shutdown_ack: Some(shutdown_ack),
@@ -212,9 +357,18 @@ impl Client {
         }
     }
 
+    /// The player, when an account that can stream is signed in.
+    fn player(&self) -> Option<&Arc<Player>> {
+        self.engine.as_ref().map(|e| &e.player)
+    }
+
     async fn handle(&mut self, cmd: AppCommand) -> Result<()> {
         use AppCommand::*;
         match cmd {
+            SpotifyConnected(spotify) => {
+                self.api = Some(spotify.api);
+                self.engine = spotify.engine;
+            }
             // Whichever engine owns the device owns the transport. Radio is
             // checked first everywhere below for that reason: while a station
             // is on, the Spotify player is paused and driving it would start
@@ -254,16 +408,18 @@ impl Client {
                 let AppState {
                     playback, queue, ..
                 } = &mut *st;
-                if let Some(pb) = playback.as_mut() {
+                if let Some(pb) = playback.as_mut()
+                    && let Some(player) = self.player()
+                {
                     let duration = queue
                         .as_ref()
                         .and_then(|q| q.current())
                         .map(|t| t.duration_ms)
                         .unwrap_or(0);
                     if pb.is_playing {
-                        self.player.pause();
+                        player.pause();
                     } else {
-                        self.player.play();
+                        player.play();
                     }
                     // Flip on the keypress; the player's own event re-anchors
                     // a moment later with the exact position.
@@ -385,6 +541,13 @@ impl Client {
                 }
             }
             SetLiked { uri, liked } => self.set_liked(uri, liked).await,
+            SetOnPlaylist {
+                playlist_id,
+                uri,
+                on,
+                seq,
+            } => self.set_on_playlist(playlist_id, uri, on, seq).await,
+            CachePlaylistTracks { playlist_ids } => self.cache_playlist_tracks(playlist_ids).await,
             Search(query) => self.search(query).await,
             LoadPlaylists => self.load_playlists().await,
             LoadLikedSongs => self.load_liked_view(false),
@@ -456,7 +619,32 @@ impl Client {
                             }
                         }
                     }
-                    None => self.state.write().toast("playlists refreshed"),
+                    // The pages that are not track lists ask for themselves
+                    // again from what they already hold. `R` used to stop at
+                    // the playlists on all three, which read as the key doing
+                    // nothing on the very pages a failed fetch leaves blank.
+                    None => {
+                        // Read and released before either call: `search` takes
+                        // the write lock, and holding a read one across it
+                        // would deadlock the client.
+                        let again = {
+                            let st = self.state.read();
+                            match &st.main {
+                                MainView::Search(results) if !results.query.is_empty() => {
+                                    Some(Search(results.query.clone()))
+                                }
+                                MainView::Radio(v) => Some(LoadRadio {
+                                    scope: v.scope.clone(),
+                                }),
+                                _ => None,
+                            }
+                        };
+                        match again {
+                            Some(Search(query)) => self.search(query).await,
+                            Some(LoadRadio { scope }) => self.load_radio(scope),
+                            _ => self.state.write().toast("playlists refreshed"),
+                        }
+                    }
                 }
             }
             LoadRadio { scope } => self.load_radio(scope),
@@ -483,6 +671,8 @@ impl Client {
             } => self.radio_failed(*station, reason, tune_seq),
             ToggleSavedStation(station) => self.toggle_saved_station(*station),
             YieldToRadio => self.yield_to_radio(),
+            CheckForUpdate => self.check_for_update(),
+            InstallUpdate => self.install_update(),
             // Intercepted by `run`, which is the only place that can end the
             // loop. Listed rather than swept into a catch-all so a new command
             // still has to be handled deliberately.
@@ -559,19 +749,46 @@ impl Client {
             }
             st.set_queue(Some(q));
         }
+        self.check_queue_liked();
         self.load_current();
+    }
+
+    /// Ask whether the queue's rows are saved, so the player's list can draw
+    /// an honest `★` on each of them.
+    ///
+    /// Only the playing track is probed elsewhere (see [`Self::load_current`]),
+    /// which would leave every other row of the list reading "not saved". URIs
+    /// already answered are dropped, so replaying a list costs nothing.
+    fn check_queue_liked(&self) {
+        let Some(api) = self.api.clone() else { return };
+        let uris: Vec<String> = {
+            let st = self.state.read();
+            let Some(q) = st.queue.as_ref() else { return };
+            q.rows()
+                .iter()
+                .filter(|t| !st.liked.contains_key(&t.uri))
+                .map(|t| t.uri.clone())
+                .collect()
+        };
+        spawn_liked_check(api, self.state.clone(), uris);
     }
 
     /// Play a source whose rows are not in hand — a playlist row's `x`, an
     /// album card's ▶. The first page is fetched inline so play starts as
     /// soon as it lands; the rest stream into the queue behind it.
     async fn play_fetched(&mut self, source: FetchSource, name: String, shuffle: bool) {
+        let Some(api) = self.api.clone() else { return };
         let source = match source {
             FetchSource::Playlist { id } => TrackSource::Playlist(id),
+            // Artists and sleeve are left blank: this source fills a queue
+            // rather than a page, so nothing here will ever ask it to open
+            // one.
             FetchSource::Album { id, year } => TrackSource::Album {
                 id,
                 name: name.clone(),
+                artists: String::new(),
                 year,
+                cover_url: None,
             },
         };
         let key = source.cache_key();
@@ -586,10 +803,10 @@ impl Client {
         }
 
         let first = match &source {
-            TrackSource::Liked => self.api.liked_songs_page(0).await,
-            TrackSource::Playlist(id) => self.api.playlist_tracks_page(id, 0).await,
-            TrackSource::Album { id, name, year } => {
-                self.api.album_tracks_page(id, name, year, 0).await
+            TrackSource::Liked => api.liked_songs_page(0).await,
+            TrackSource::Playlist(id) => api.playlist_tracks_page(id, 0).await,
+            TrackSource::Album { id, name, year, .. } => {
+                api.album_tracks_page(id, name, year, 0).await
             }
         };
         let (tracks, has_more, _) = match first {
@@ -627,7 +844,6 @@ impl Client {
         // being appended to by this task.
         let generation = self.state.read().queue.as_ref().map(|q| q.generation);
         let Some(generation) = generation else { return };
-        let api = self.api.clone();
         let state = self.state.clone();
         let cache = self.cache.clone();
         let mut all = tracks;
@@ -637,11 +853,14 @@ impl Client {
                 let result = match &source {
                     TrackSource::Liked => api.liked_songs_page(offset).await,
                     TrackSource::Playlist(id) => api.playlist_tracks_page(id, offset).await,
-                    TrackSource::Album { id, name, year } => {
+                    TrackSource::Album { id, name, year, .. } => {
                         api.album_tracks_page(id, name, year, offset).await
                     }
                 };
                 let mut finished = false;
+                // The rows this page brought, so their `★` can be answered the
+                // way the first page's were.
+                let mut fresh: Vec<String>;
                 {
                     let mut st = state.write();
                     let Some(q) = st.queue.as_mut().filter(|q| q.generation == generation) else {
@@ -650,6 +869,7 @@ impl Client {
                     match result {
                         Ok((page, has_more, _)) => {
                             all.extend(page.iter().cloned());
+                            fresh = page.iter().map(|t| t.uri.clone()).collect();
                             q.extend(page);
                             if !has_more {
                                 q.loading = false;
@@ -662,7 +882,9 @@ impl Client {
                             return;
                         }
                     }
+                    fresh.retain(|uri| !st.liked.contains_key(uri));
                 }
+                spawn_liked_check(api.clone(), state.clone(), fresh);
                 if finished {
                     cache.lock().insert(
                         key,
@@ -689,6 +911,9 @@ impl Client {
     /// the new track on the next frame, and the audio follows as fast as
     /// librespot can fetch it.
     fn load_current(&mut self) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
         let track = {
             let mut st = self.state.write();
             let Some(track) = st.queue.as_ref().and_then(|q| q.current()).cloned() else {
@@ -707,7 +932,7 @@ impl Client {
         };
 
         match SpotifyUri::from_uri(&track.uri) {
-            Ok(uri) => self.player.load(uri, true, 0),
+            Ok(uri) => engine.player.load(uri, true, 0),
             Err(e) => {
                 log::error!("unplayable uri {}: {e}", track.uri);
                 self.state.write().toast("that track cannot be played");
@@ -725,9 +950,11 @@ impl Client {
                 && self.liked_probe.as_deref() != Some(track.uri.as_str()))
             .then(|| track.uri.clone())
         };
-        if let Some(uri) = unchecked {
+        if let Some(uri) = unchecked
+            && let Some(api) = self.api.clone()
+        {
             self.liked_probe = Some(uri.clone());
-            spawn_liked_check(self.api.clone(), self.state.clone(), vec![uri]);
+            spawn_liked_check(api, self.state.clone(), vec![uri]);
         }
 
         // The sleeve, when the row carried one; rows off an album's own track
@@ -755,8 +982,9 @@ impl Client {
         };
         if let Some(uri) = next
             && let Ok(uri) = SpotifyUri::from_uri(&uri)
+            && let Some(player) = self.player()
         {
-            self.player.preload(uri);
+            player.preload(uri);
         }
     }
 
@@ -774,7 +1002,8 @@ impl Client {
     }
 
     fn seek_to(&self, target: u64) {
-        self.player.seek(target.min(u32::MAX as u64) as u32);
+        let Some(player) = self.player() else { return };
+        player.seek(target.min(u32::MAX as u64) as u32);
         if let Some(pb) = self.state.write().playback.as_mut() {
             pb.anchor(target);
         }
@@ -783,16 +1012,14 @@ impl Client {
     /// Apply a volume to the mixer, the state and the cache in one move.
     ///
     /// The mixer is the truth the audio path reads; the state is what the
-    /// slider draws; the cache is what the next session starts at.
+    /// slider draws; the cache is what the next run starts at.
     fn set_volume(&self, pct: u8) {
         let raw = pct_to_raw(pct);
         self.mixer.set_volume(raw);
         if let Some(pb) = self.state.write().playback.as_mut() {
             pb.volume_percent = pct;
         }
-        if let Some(cache) = self.session.cache() {
-            cache.save_volume(raw);
-        }
+        self.volume_cache.save_volume(raw);
     }
 
     /// Answer one query out of both catalogues.
@@ -846,11 +1073,27 @@ impl Client {
                 // toast thrown over them would say that it was. The Stations
                 // tab going from "searching…" to "no stations" is where that
                 // news belongs, and it is only news to someone looking at it.
-                Err(e) => log::error!("station search failed: {e:#}"),
+                Err(e) => {
+                    log::error!("station search failed: {e:#}");
+                    results.stations_error = Some(state::LoadError::new(
+                        e.to_string(),
+                        AppCommand::Search(station_query),
+                    ));
+                }
             }
         });
 
-        let result = self.api.search(&query).await;
+        // The four Spotify tabs are on the strip only for an account that can
+        // play what they list — see [`AppState::search_tabs`]. Where they are
+        // not, the station half above is the whole answer, and asking Spotify
+        // would spend a request on a tab nobody can open.
+        let ready = self.state.read().spotify == state::SpotifyState::Ready;
+        let Some(api) = self.api.clone().filter(|_| ready) else {
+            self.state.write().loading = false;
+            return;
+        };
+
+        let result = api.search(&query).await;
         let mut st = self.state.write();
         st.loading = false;
         // The station half may already have landed in the view, so the Spotify
@@ -869,9 +1112,15 @@ impl Client {
                 results.playlists = found.playlists;
                 let uris: Vec<String> = results.tracks.iter().map(|t| t.uri.clone()).collect();
                 drop(st);
-                spawn_liked_check(self.api.clone(), self.state.clone(), uris);
+                spawn_liked_check(api, self.state.clone(), uris);
             }
-            Err(e) => st.toast(format!("search failed: {e}")),
+            Err(e) => {
+                results.error = Some(state::LoadError::new(
+                    e.to_string(),
+                    AppCommand::Search(query),
+                ));
+                st.toast(format!("search failed: {e}"));
+            }
         }
     }
 
@@ -938,6 +1187,10 @@ impl Client {
                 }
                 Err(e) => {
                     log::error!("radio directory load failed: {e:#}");
+                    view.error = Some(state::LoadError::new(
+                        e.to_string(),
+                        AppCommand::LoadRadio { scope },
+                    ));
                     st.toast(format!("could not reach the radio directory: {e}"));
                 }
             }
@@ -959,7 +1212,9 @@ impl Client {
     /// player that answers nothing, and a station that never connects makes a
     /// player that never answers again.
     fn play_station(&mut self, station: state::Station, attempt: u8) {
-        self.player.pause();
+        if let Some(player) = self.player() {
+            player.pause();
+        }
         // The station being left goes silent on the press, not when the one
         // replacing it is ready. Connecting takes seconds — a directory
         // address, a stream to reach, five seconds of prefetch — and hearing
@@ -991,7 +1246,7 @@ impl Client {
             }
         }
 
-        let player = Arc::clone(&self.player);
+        let player = self.player().cloned();
         let radio = self.radio_player.clone();
         let api = self.radio_api.clone();
         let state = Arc::clone(&self.state);
@@ -1030,7 +1285,9 @@ impl Client {
             // still working through can start making sound after the pause
             // above, and this is the last point before the stream at which to
             // catch it.
-            player.pause();
+            if let Some(player) = &player {
+                player.pause();
+            }
             let outcome = radio.play(&url, volume).await;
             let ours = ours();
             if let Err(e) = outcome {
@@ -1057,7 +1314,9 @@ impl Client {
             // can have handed the device back to Spotify meanwhile, and this
             // pause would silence it under a bar that says it is playing.
             if ours {
-                player.pause();
+                if let Some(player) = &player {
+                    player.pause();
+                }
                 let mut st = state.write();
                 if let Some(r) = st.radio.as_mut() {
                     // The walk that reached this station is over, and nothing
@@ -1134,7 +1393,9 @@ impl Client {
         };
         match resumed {
             Some(name) => {
-                self.player.play();
+                if let Some(player) = self.player() {
+                    player.play();
+                }
                 self.state.write().toast(format!("back to {name}"));
             }
             None => self
@@ -1337,9 +1598,12 @@ impl Client {
         // Radio first: it is the one that outlives the process, and it blocks
         // until the output device is actually closed.
         self.radio_player.shutdown();
-        // Stop the audio, then close the connection underneath it.
-        self.player.stop();
-        self.session.shutdown();
+        // Stop the audio, then close the connection underneath it. There is
+        // neither to stop when no account was ever connected.
+        if let Some(engine) = &self.engine {
+            engine.player.stop();
+            engine.session.shutdown();
+        }
         if let Some(ack) = self.shutdown_ack.take() {
             let _ = ack.send(());
         }
@@ -1352,6 +1616,11 @@ impl Client {
     /// reacted to there. [`Self::radio_probe`] is what stops the three-second
     /// tick re-asking the same question for the length of a record.
     fn resolve_radio_track(&mut self) {
+        // Nothing to look a record up in. The deck then draws the station's
+        // own words, exactly as it does for an announcement that parses into
+        // no track at all.
+        let Some(api) = self.api.clone() else { return };
+
         // Scoped: parking_lot's lock is not reentrant and the arms below take
         // it for writing.
         let announced = self.state.read().radio.as_ref().and_then(|r| r.now_title());
@@ -1393,7 +1662,6 @@ impl Client {
             r.matched = state::RadioMatch::Searching;
         }
 
-        let api = self.api.clone();
         let state = self.state.clone();
         let uuid = station.uuid.clone();
         // Spawned rather than awaited: rspotify is built from a bare token with
@@ -1542,7 +1810,9 @@ impl Client {
             return;
         }
         log::warn!("Spotify started under a live station; pausing it");
-        self.player.pause();
+        if let Some(player) = self.player() {
+            player.pause();
+        }
         // The Spotify bar must not claim to be playing behind the station —
         // the `Playing` event that got us here has just set it.
         if let Some(pb) = self.state.write().playback.as_mut() {
@@ -1580,8 +1850,9 @@ impl Client {
     /// that lies about your library. Errors are handled here rather than
     /// returned for that reason.
     async fn set_liked(&self, uri: String, liked: bool) {
+        let Some(api) = self.api.clone() else { return };
         let previous = self.state.write().liked.insert(uri.clone(), liked);
-        match self.api.set_track_liked(&uri, liked).await {
+        match api.set_track_liked(&uri, liked).await {
             Ok(()) => {
                 self.state.write().toast(if liked {
                     "added to Liked Songs"
@@ -1603,19 +1874,166 @@ impl Client {
         }
     }
 
+    /// Put the box's record on a playlist, or take it off, and tell the box
+    /// which way it went.
+    ///
+    /// Errors are handled here rather than returned, like [`Self::set_liked`]
+    /// above: the mark is flipped before the request goes out so the row
+    /// answers the click, and a refusal has to put it back. `seq` guards that
+    /// — the box can be closed and opened again on another record while this
+    /// is in flight, and a late answer must not touch the new one.
+    async fn set_on_playlist(&self, playlist_id: String, uri: String, on: bool, seq: u64) {
+        let Some(api) = self.api.clone() else { return };
+        let id = state::track_id(&uri).to_string();
+        set_cached_membership(&mut self.state.write(), &playlist_id, &id, on);
+        let result = api.set_track_on_playlist(&playlist_id, &uri, on).await;
+        let mut st = self.state.write();
+        if let Some(picker) = st.picker_for(seq) {
+            picker.pending.remove(&playlist_id);
+        }
+        match result {
+            Ok(snapshot_id) => {
+                // Both halves are needed. The cache keys a playlist's tracks
+                // on the snapshot the fetch saw, and `start_track_fetch`
+                // compares that against the copy in `playlists` — leaving the
+                // old hash there would serve the list back as it stood.
+                if let Some(p) = st.playlists.iter_mut().find(|p| p.id == playlist_id) {
+                    p.snapshot_id = snapshot_id.clone();
+                }
+                self.cache.lock().remove(&state::playlist_key(&playlist_id));
+                // The contents held here are still right — this change is the
+                // one thing that moved them, and it is already applied — so
+                // the new snapshot is stamped on rather than the set dropped.
+                if let Some(contents) = st.playlist_tracks.get_mut(&playlist_id) {
+                    contents.snapshot_id = snapshot_id;
+                }
+                save_playlist_tracks(&st);
+                let name = st
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == playlist_id)
+                    .map_or_else(|| "the playlist".to_string(), |p| p.name.clone());
+                st.toast(match on {
+                    true => format!("added to {name}"),
+                    false => format!("removed from {name}"),
+                });
+            }
+            Err(e) => {
+                set_cached_membership(&mut st, &playlist_id, &id, !on);
+                if let Some(picker) = st.picker_for(seq) {
+                    picker.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    /// Read what these playlists hold, for the box's marks.
+    ///
+    /// Only what is not already cached and not already being read: the whole
+    /// library is offered every time the playlists load, and a walk costs one
+    /// request per hundred tracks. A few at a time rather than all of them —
+    /// a library of two hundred playlists let go at once is two hundred
+    /// concurrent requests, which is a rate limit and a stalled UI.
+    async fn cache_playlist_tracks(&mut self, playlist_ids: Vec<String>) {
+        let Some(api) = self.api.clone() else { return };
+        let wanted: Vec<(String, String)> = {
+            let st = self.state.read();
+            playlist_ids
+                .into_iter()
+                .filter(|id| !st.playlist_tracks.contains_key(id))
+                // The snapshot is read before the walk, so a playlist changed
+                // while it runs comes back with a hash the next load rejects
+                // and gets walked again.
+                .filter_map(|id| {
+                    let snapshot = st.playlists.iter().find(|p| p.id == id)?.snapshot_id.clone();
+                    Some((id, snapshot))
+                })
+                .filter(|(id, _)| self.membership_probe.insert(id.clone()))
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let answers: Vec<_> = futures::stream::iter(wanted.into_iter().map(|(id, snapshot)| {
+            let api = api.clone();
+            async move {
+                let answer = api.playlist_track_ids(&id).await;
+                (id, snapshot, answer)
+            }
+        }))
+        .buffer_unordered(PREFETCH_CONCURRENCY)
+        .collect()
+        .await;
+
+        let mut st = self.state.write();
+        for (id, snapshot_id, answer) in answers {
+            self.membership_probe.remove(&id);
+            match answer {
+                Ok(track_ids) => {
+                    st.playlist_tracks.insert(
+                        id,
+                        state::PlaylistContents {
+                            snapshot_id,
+                            track_ids,
+                        },
+                    );
+                }
+                // Left uncached rather than guessed at: the box draws a row it
+                // cannot answer for as neither on nor off, and refuses to
+                // flip it, which is the honest outcome of a failed read.
+                Err(e) => log::warn!("playlist {id} contents read failed: {e}"),
+            }
+        }
+        save_playlist_tracks(&st);
+    }
+
+    /// Load the playlist list, and start the walk that fills the box's marks.
+    ///
+    /// The prefetch rides this load rather than deciding for itself when to
+    /// start: this already runs at sign-in and on `R`, and it is the only
+    /// place that knows both which playlists exist and which snapshots they
+    /// are at. A warm start finds every snapshot unchanged and asks for
+    /// nothing.
     async fn load_playlists(&self) {
+        let Some(api) = self.api.clone() else { return };
         // Who you are, the first time only: it cannot change within a session,
         // and `R` re-runs this whole function.
         if self.state.read().me_id.is_none()
-            && let Ok(id) = self.api.me_id().await
+            && let Ok(account) = api.account().await
         {
-            self.state.write().me_id = Some(id);
+            self.state.write().me_id = Some(account.id);
         }
-        let result = self.api.playlists().await;
+        let result = api.playlists().await;
         let mut st = self.state.write();
-        match result {
-            Ok(playlists) => st.playlists = playlists,
-            Err(e) => st.toast(format!("failed to load playlists: {e}")),
+        let playlists = match result {
+            Ok(playlists) => playlists,
+            Err(e) => {
+                st.playlists_error = Some(state::LoadError::new(
+                    e.to_string(),
+                    AppCommand::LoadPlaylists,
+                ));
+                st.toast(format!("failed to load playlists: {e}"));
+                return;
+            }
+        };
+        st.playlists_error = None;
+        // A playlist whose snapshot moved was changed somewhere else, so what
+        // was cached of its contents is stale. One whose id is gone entirely
+        // is a playlist you no longer have.
+        if drop_stale_playlist_tracks(&mut st.playlist_tracks, &playlists) {
+            save_playlist_tracks(&st);
+        }
+        let uncached = uncached_playlists(&st.playlist_tracks, &playlists, st.me_id.as_deref());
+        st.playlists = playlists;
+        // The rows the open box holds are indices into the list just replaced.
+        st.picker = None;
+        drop(st);
+        if !uncached.is_empty() {
+            let _ = self
+                .tx
+                .send(AppCommand::CachePlaylistTracks {
+                    playlist_ids: uncached,
+                });
         }
     }
 
@@ -1678,7 +2096,13 @@ impl Client {
         list.header.cover_url = cover_url.clone();
         self.start_track_fetch(
             list,
-            TrackSource::Album { id, name, year },
+            TrackSource::Album {
+                id,
+                name,
+                artists,
+                year,
+                cover_url: cover_url.clone(),
+            },
             None,
             preserve_view,
         );
@@ -1691,6 +2115,12 @@ impl Client {
     /// fetch (photo + top tracks + albums). Guarded by the same generation
     /// scheme as track fetches.
     fn load_artist_view(&self, id: String, uri: String, name: String, preserve_view: bool) {
+        let Some(api) = self.api.clone() else { return };
+        let reopen = AppCommand::OpenArtist {
+            id: id.clone(),
+            uri: uri.clone(),
+            name: name.clone(),
+        };
         let view = ArtistView {
             id: id.clone(),
             uri,
@@ -1702,6 +2132,7 @@ impl Client {
             display: Vec::new(),
             tab: ArtistTab::Albums,
             loading: true,
+            error: None,
         };
         let generation = {
             let mut st = self.state.write();
@@ -1712,7 +2143,6 @@ impl Client {
             }
             st.load_generation
         };
-        let api = self.api.clone();
         let state = self.state.clone();
         let http = self.http.clone();
         tokio::spawn(async move {
@@ -1769,6 +2199,7 @@ impl Client {
                         (uris, art)
                     }
                     Err(e) => {
+                        v.error = Some(state::LoadError::new(e.to_string(), reopen));
                         st.toast(format!("failed to load artist: {e}"));
                         return;
                     }
@@ -1817,6 +2248,7 @@ impl Client {
         expected_snapshot: Option<String>,
         preserve_view: bool,
     ) {
+        let Some(api) = self.api.clone() else { return };
         let key = source.cache_key();
         list.cache_key = Some(key.clone());
 
@@ -1849,7 +2281,6 @@ impl Client {
             }
             st.load_generation
         };
-        let api = self.api.clone();
         let state = self.state.clone();
         let cache = self.cache.clone();
         tokio::spawn(async move {
@@ -1858,7 +2289,7 @@ impl Client {
                 let result = match &source {
                     TrackSource::Liked => api.liked_songs_page(offset).await,
                     TrackSource::Playlist(id) => api.playlist_tracks_page(id, offset).await,
-                    TrackSource::Album { id, name, year } => {
+                    TrackSource::Album { id, name, year, .. } => {
                         api.album_tracks_page(id, name, year, offset).await
                     }
                 };
@@ -1905,6 +2336,8 @@ impl Client {
                         }
                         Err(e) => {
                             list.loading = false;
+                            list.error =
+                                Some(state::LoadError::new(e.to_string(), source.open_command()));
                             if let Some(q) = queue.as_mut()
                                 && q.source_key.as_deref() == Some(key.as_str())
                             {
@@ -1931,6 +2364,25 @@ impl Client {
                     }
                 }
                 if let Some(tracks) = finished {
+                    // Opening a playlist has just read every track in it, so
+                    // the box's marks come free: a walk of a list already in
+                    // memory, against a round trip the prefetch would make.
+                    if let (TrackSource::Playlist(id), Some(snapshot_id)) =
+                        (&source, expected_snapshot.clone())
+                    {
+                        let mut st = state.write();
+                        st.playlist_tracks.insert(
+                            id.clone(),
+                            state::PlaylistContents {
+                                snapshot_id,
+                                track_ids: tracks
+                                    .iter()
+                                    .map(|t| state::track_id(&t.uri).to_string())
+                                    .collect(),
+                            },
+                        );
+                        save_playlist_tracks(&st);
+                    }
                     cache.lock().insert(
                         key,
                         CachedTracks {
@@ -1941,6 +2393,61 @@ impl Client {
                     return;
                 }
                 offset += PAGE_LIMIT;
+            }
+        });
+    }
+
+    /// Ask GitHub for the newest release and, if it beats this build, put it
+    /// on Home.
+    ///
+    /// Logged rather than toasted on failure, for the reason
+    /// [`resolve_radio_track`] gives: nobody asked for this check, and a
+    /// machine that is offline would otherwise open with an error over the
+    /// first screen.
+    fn check_for_update(&self) {
+        let http = self.http.clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            match crate::update::latest(&http).await {
+                Ok(Some(release)) => {
+                    log::info!("update available: {}", release.tag);
+                    state.write().update = Some(UpdateState::Available(release));
+                }
+                Ok(None) => {}
+                Err(e) => log::warn!("update check failed: {e:#}"),
+            }
+        });
+    }
+
+    /// Download the release Home is offering and write it over this
+    /// executable.
+    ///
+    /// Ignored unless a release is actually waiting, so a second Enter during
+    /// the download does nothing and one on a finished install cannot start it
+    /// again.
+    fn install_update(&self) {
+        let release = {
+            let mut st = self.state.write();
+            let Some(UpdateState::Available(release)) = st.update.clone() else {
+                return;
+            };
+            st.update = Some(UpdateState::Installing);
+            release
+        };
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let outcome = crate::update::install(&release).await;
+            let mut st = state.write();
+            match outcome {
+                Ok(()) => {
+                    st.update = Some(UpdateState::Installed);
+                    st.toast(format!("{} is installed — restart spot", release.tag));
+                }
+                Err(e) => {
+                    log::error!("update to {} failed: {e:#}", release.tag);
+                    st.update = Some(UpdateState::Failed);
+                    st.toast(format!("update failed: {e}"));
+                }
             }
         });
     }
@@ -2236,6 +2743,82 @@ pub fn raw_to_pct(raw: u16) -> u8 {
 mod tests {
     use super::*;
     use librespot_playback::mixer::{self, MixerConfig};
+
+    fn listed(id: &str, snapshot: &str, owner_id: &str) -> state::Playlist {
+        state::Playlist {
+            id: id.into(),
+            name: id.into(),
+            track_count: 1,
+            owner: owner_id.into(),
+            owner_id: owner_id.into(),
+            snapshot_id: snapshot.into(),
+        }
+    }
+
+    fn holding(snapshot: &str, ids: &[&str]) -> state::PlaylistContents {
+        state::PlaylistContents {
+            snapshot_id: snapshot.into(),
+            track_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    /// A playlist changed somewhere else comes back with a new snapshot, and
+    /// its cached contents go with the old one. The rest stand — a run that
+    /// dropped everything would walk the whole library again.
+    #[test]
+    fn a_moved_snapshot_drops_that_playlist_and_no_other() {
+        let mut cache = HashMap::from([
+            ("p1".to_string(), holding("s1", &["a"])),
+            ("p2".to_string(), holding("s2", &["b"])),
+            ("gone".to_string(), holding("s3", &["c"])),
+        ]);
+        let playlists = vec![listed("p1", "moved", "me"), listed("p2", "s2", "me")];
+        assert!(drop_stale_playlist_tracks(&mut cache, &playlists));
+        assert!(!cache.contains_key("p1"), "the changed playlist stood");
+        assert!(cache.contains_key("p2"), "an unchanged playlist was dropped");
+        assert!(!cache.contains_key("gone"), "a playlist you no longer have");
+        assert!(
+            !drop_stale_playlist_tracks(&mut cache, &playlists),
+            "a warm cache rewrote the file for nothing"
+        );
+    }
+
+    /// The prefetch asks only for what it does not hold, so a warm start asks
+    /// for nothing — and never for a playlist you only follow, which the box
+    /// does not offer.
+    #[test]
+    fn the_prefetch_asks_only_for_uncached_playlists_you_own() {
+        let cache = HashMap::from([("p1".to_string(), holding("s1", &["a"]))]);
+        let playlists = vec![
+            listed("p1", "s1", "me"),
+            listed("p2", "s2", "me"),
+            listed("p3", "s3", "them"),
+        ];
+        assert_eq!(
+            uncached_playlists(&cache, &playlists, Some("me")),
+            vec!["p2".to_string()]
+        );
+        assert!(
+            uncached_playlists(&cache, &playlists, None).is_empty(),
+            "nothing is yours before the account is known"
+        );
+    }
+
+    /// The client puts a refused change back, and a playlist nothing has
+    /// walked is left alone — a set holding one id would read as a playlist
+    /// holding one track.
+    #[test]
+    fn a_membership_change_flips_back_and_skips_the_unwalked() {
+        let mut st = AppState::new();
+        st.playlist_tracks.insert("p1".into(), holding("s1", &[]));
+        set_cached_membership(&mut st, "p1", "x", true);
+        assert!(st.playlist_tracks["p1"].track_ids.contains("x"));
+        set_cached_membership(&mut st, "p1", "x", false);
+        assert!(!st.playlist_tracks["p1"].track_ids.contains("x"));
+
+        set_cached_membership(&mut st, "p9", "x", true);
+        assert!(!st.playlist_tracks.contains_key("p9"));
+    }
 
     /// Every percent the UI can produce has to survive a trip through the
     /// mixer unchanged, or the slider drifts a step at a time: `VolumeRel`

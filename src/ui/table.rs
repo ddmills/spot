@@ -2,8 +2,11 @@
 //! column fitting, selection styling, hoverable segments, scrollbars, cover
 //! art, and the transport controls the player view and the bottom bar share.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use ratatui::Frame;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
@@ -216,18 +219,146 @@ pub const BRAND_W: u16 = 6;
 /// matters anyway.
 pub const LIKED_MARK: &str = "★";
 
+/// The add-to-playlist mark, wearing the `+` the deck's `+ add` wears.
+pub const ADD_MARK: &str = "+";
+
+/// Liked cell of a track row's action pair: the mark with a space either
+/// side, so the control is a target rather than a single cell to hit.
+pub const LIKE_W: usize = 3;
+/// Add-to-playlist cell of the pair, padded to match.
+pub const ADD_W: usize = 3;
+/// The `★ +` pair at the end of a track row. The two cells sit flush: each
+/// already carries its own padding, and a separator between them would put a
+/// gap belonging to neither control back in the middle.
+pub const ACTIONS_W: usize = LIKE_W + ADD_W;
+/// Narrowest list that still carries the pair. The last thing a narrowing
+/// list drops: these are controls, and a row you cannot act on is worth less
+/// than a row missing its year.
+pub const ACTIONS_MIN: usize = 30;
+
+/// The header's label for the pair: the two marks it heads, spelled the way
+/// the rows spell them.
+pub fn actions_label() -> String {
+    format!(" {LIKED_MARK}  {ADD_MARK} ")
+}
+
+/// The `★ +` pair for one row, in [`ACTIONS_W`] cells.
+///
+/// The star is always drawn — dim when the track is unsaved or its state is
+/// still unknown, accent when saved. It is one of a pair now, and a control
+/// that appeared only under the pointer would leave a hole beside its
+/// neighbour and shift what the row looks like as the mouse crosses it.
+///
+/// Each mark carries a space either side, and the hover pill takes that
+/// padding with it: the lit run is what says how big the target is, and a
+/// pill hugging a single glyph would understate a control you can hit from a
+/// cell away. Unlike [`super::main_pane`]'s text cells, which light the text
+/// and leave their padding bare — there the padding is a column's leftover,
+/// here it is the control.
+///
+/// Both views draw the pair from here so the queue and the browse table
+/// cannot drift into two spellings of the same control.
+pub fn action_spans(liked: Option<bool>, hover_like: bool, hover_add: bool) -> Vec<Span<'static>> {
+    let lit = |style: Style, hovered: bool| {
+        if hovered {
+            hover_style(style)
+        } else {
+            style
+        }
+    };
+    let like_style = if liked == Some(true) {
+        theme::accent()
+    } else {
+        theme::dim()
+    };
+    vec![
+        Span::styled(format!(" {LIKED_MARK} "), lit(like_style, hover_like)),
+        Span::styled(format!(" {ADD_MARK} "), lit(theme::dim(), hover_add)),
+    ]
+}
+
+/// The spinner's frames, in the order they are shown: a weight travelling
+/// round a braille cell.
+///
+/// Every frame is one cell wide, so a row carrying one does not move as it
+/// turns. Braille needs a font that has the U+28xx block — most terminal fonts
+/// do, but Consolas does not, and there it will come out blank.
+pub const SPINNER: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
+/// How long each frame of [`SPINNER`] holds. Eight frames at this rate is
+/// about a turn a second, which reads as motion without becoming a flicker.
+const SPINNER_FRAME: u128 = 110;
+
+/// The spinner frame for right now.
+///
+/// Phase comes from one process-wide start, so every spinner on screen turns
+/// together — two that had each started their own clock would wobble against
+/// each other.
+///
+/// The frame loop has to be told to keep drawing for this to turn: see
+/// [`super::is_animating`].
+pub fn spinner() -> &'static str {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    SPINNER[(elapsed / SPINNER_FRAME) as usize % SPINNER.len()]
+}
+
+/// Whether `line` ends in the nav row's spinning `LOADING`, on whichever
+/// frame the spinner happens to be.
+///
+/// The frame comes from the clock, so a test cannot pin it and must ask this
+/// instead. Shared, because both the nav row's own tests and the whole-screen
+/// ones look for the same row.
+#[cfg(test)]
+pub fn ends_with_loading(line: &str) -> bool {
+    let line = line.trim_end();
+    SPINNER
+        .iter()
+        .any(|frame| line.ends_with(&format!("{frame} LOADING")))
+}
+
+/// A box of `width` × `height` in the middle of `area`, clamped to fit.
+///
+/// Where the overlays go: the help box and the add-to-playlist box are both
+/// laid out this way, so the two land in the same place and read as one kind
+/// of thing.
+pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(height.min(area.height)),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(width.min(area.width)),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    h[1]
+}
+
 /// Lay hoverable segments out flush with `row`'s right edge and draw them as
 /// one line, returning each group's hit rect. A row too narrow to hold them
 /// draws nothing and returns empty rects, which can never be hit — so a
 /// control pinned this way is either fully usable or absent, never clipped
 /// into a slider whose click mapping has silently lost its far end.
+///
+/// Neighbouring groups sit one blank cell apart. That cell belongs to no
+/// group, so it stays unlit as the pointer crosses it and no label has to
+/// carry padding that its own hover pill would then cover.
 pub fn right_row(
     frame: &mut Frame,
     row: Rect,
     mouse: Option<Position>,
     groups: Vec<Vec<Span<'static>>>,
 ) -> Vec<Rect> {
-    let total: usize = groups.iter().flatten().map(|s| s.width()).sum();
+    let gaps = groups.len().saturating_sub(1);
+    let total: usize = groups.iter().flatten().map(|s| s.width()).sum::<usize>() + gaps;
     let total = total as u16;
     if total > row.width {
         return vec![Rect::default(); groups.len()];
@@ -237,7 +368,15 @@ pub fn right_row(
     let mut x = start;
     let rects: Vec<Rect> = groups
         .into_iter()
-        .map(|g| segment(&mut spans, &mut x, row, mouse, g))
+        .enumerate()
+        .map(|(i, g)| {
+            let rect = segment(&mut spans, &mut x, row, mouse, g);
+            if i < gaps {
+                spans.push(Span::raw(" "));
+                x = x.saturating_add(1);
+            }
+            rect
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
@@ -489,7 +628,7 @@ pub fn draw_volume(
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{SPINNER, SPINNER_FRAME, fit, spinner, width};
 
     #[test]
     fn fit_pads_short_strings_to_width() {
@@ -518,5 +657,29 @@ mod tests {
         assert_eq!(fit("abc", 0), "");
         assert_eq!(fit("abc", 1), "…");
         assert_eq!(fit("残", 1), "…");
+    }
+
+    /// Every frame is one cell, so a row carrying the spinner keeps its width
+    /// as it turns and nothing beside it steps sideways.
+    #[test]
+    fn every_spinner_frame_is_one_cell() {
+        for frame in SPINNER {
+            assert_eq!(width(frame), 1, "{frame:?}");
+        }
+    }
+
+    /// Whatever the clock says, the glyph is one of the frames.
+    #[test]
+    fn the_spinner_reads_off_its_own_frames() {
+        assert!(SPINNER.contains(&spinner()), "{:?}", spinner());
+    }
+
+    /// The frame is a function of elapsed time, so the phase advances rather
+    /// than sitting on whichever frame the process started on.
+    #[test]
+    fn the_spinner_turns() {
+        let first = spinner();
+        std::thread::sleep(std::time::Duration::from_millis(SPINNER_FRAME as u64 + 20));
+        assert_ne!(first, spinner());
     }
 }

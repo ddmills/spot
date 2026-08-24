@@ -38,25 +38,14 @@ fn explain_session_failure(e: librespot_core::Error) -> anyhow::Error {
     anyhow::anyhow!("failed to start the playback engine: {detail}{hint}")
 }
 
-/// Build the librespot session and the audio player spot drives directly.
-/// Returns the session, the player, the PCM tap feeding the visualizer, the
-/// soft mixer, and the player's event channel.
+/// Build the parts of the audio path that no account is needed for: the
+/// on-disk cache, the soft mixer holding the volume, and the PCM tap the
+/// visualizer reads.
 ///
-/// There is no Spirc and no Connect device: spot owns the queue and the
-/// transport, so the session only has to stream audio and metadata. The
-/// mixer holds the volume actually being applied, and the player events say
-/// when playback really started, stopped or moved — all local and immediate.
-///
-/// Credentials come from librespot's cache when available (stored on the
-/// first successful connect); otherwise this runs a one-time interactive
-/// OAuth flow with the keymaster client ID.
-pub async fn build() -> Result<(
-    Session,
-    Arc<Player>,
-    Arc<AudioTap>,
-    Arc<dyn Mixer>,
-    PlayerEventChannel,
-)> {
+/// Radio plays through the tap and the mixer with no Spotify at all, so these
+/// are built at startup and [`connect`] is handed them later — if it is ever
+/// called.
+pub fn audio() -> Result<(Cache, Arc<dyn Mixer>, Arc<AudioTap>)> {
     let cache_root = config::cache_dir()?;
     let cache = Cache::new(
         Some(cache_root.join("creds")),
@@ -67,10 +56,37 @@ pub async fn build() -> Result<(
     )
     .context("failed to create librespot cache")?;
 
+    let mixer_fn = mixer::find(None).context("no mixer available")?;
+    let mixer = mixer_fn(MixerConfig::default()).context("failed to open mixer")?;
+    mixer.set_volume(
+        cache
+            .volume()
+            .unwrap_or_else(|| client::pct_to_raw(client::DEFAULT_VOLUME_PCT)),
+    );
+
+    Ok((cache, mixer, Arc::new(AudioTap::new())))
+}
+
+/// Log in and build the audio player spot drives directly. Returns the
+/// session, the player and the player's event channel.
+///
+/// There is no Spirc and no Connect device: spot owns the queue and the
+/// transport, so the session only has to stream audio and metadata. The
+/// player events say when playback really started, stopped or moved — all
+/// local and immediate.
+///
+/// Credentials come from librespot's cache when available (stored on the
+/// first successful connect); otherwise this runs a one-time interactive
+/// OAuth flow with the keymaster client ID. Spotify refuses the login itself
+/// for accounts without Premium — see [`explain_session_failure`].
+pub async fn connect(
+    cache: &Cache,
+    mixer: &Arc<dyn Mixer>,
+    tap: &Arc<AudioTap>,
+) -> Result<(Session, Arc<Player>, PlayerEventChannel)> {
     let credentials = match cache.credentials() {
         Some(creds) => creds,
         None => {
-            println!("first run: authorizing the playback engine...");
             let token = tokio::task::spawn_blocking(auth::login_session_interactive)
                 .await
                 .context("auth task panicked")??;
@@ -78,15 +94,8 @@ pub async fn build() -> Result<(
         }
     };
 
-    // The volume the last session left, read before the session is built —
-    // the cache moves into it.
-    let saved_volume = cache
-        .volume()
-        .unwrap_or_else(|| client::pct_to_raw(client::DEFAULT_VOLUME_PCT));
-
     // The default carries the keymaster client_id on desktop.
-    let session_config = SessionConfig::default();
-    let session = Session::new(session_config, Some(cache));
+    let session = Session::new(SessionConfig::default(), Some(cache.clone()));
 
     // Without this login the session has no connection for the player to fetch
     // audio over.
@@ -95,12 +104,7 @@ pub async fn build() -> Result<(
         .await
         .map_err(explain_session_failure)?;
 
-    let mixer_fn = mixer::find(None).context("no mixer available")?;
-    let mixer = mixer_fn(MixerConfig::default()).context("failed to open mixer")?;
-    mixer.set_volume(saved_volume);
-
-    let tap = Arc::new(AudioTap::new());
-    let sink_tap = Arc::clone(&tap);
+    let sink_tap = Arc::clone(tap);
     // Second soft-volume handle for the tap, so it can undo the attenuation
     // the player applies before samples reach the sink.
     let tap_volume = mixer.get_soft_volume();
@@ -125,5 +129,5 @@ pub async fn build() -> Result<(
 
     let player_events = player.get_player_event_channel();
 
-    Ok((session, player, tap, mixer, player_events))
+    Ok((session, player, player_events))
 }

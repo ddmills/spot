@@ -4,6 +4,7 @@ mod main_pane;
 mod now_playing;
 mod play_state;
 mod player;
+mod playlist_picker;
 mod table;
 mod theme;
 mod top_row;
@@ -34,8 +35,9 @@ const SEARCH_H: u16 = 2;
 /// view spells these rows out for itself: the whole point is that toggling the
 /// player moves nothing. Drawn by [`top_row`] either way.
 const HEAD_H: u16 = NAV_H + SEARCH_H;
-/// Rows the bottom bar takes: a rule, the deck's seven rows beside the
-/// sleeve, then a blank. See [`now_playing`].
+/// Rows the bottom bar takes when it has a subject: a rule, the deck's seven
+/// rows beside the sleeve, then a blank. With nothing playing the bar takes no
+/// rows at all. See [`now_playing`].
 const BAR_H: u16 = 1 + deck::DECK_H + 1;
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
@@ -60,6 +62,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         // The one-cell side margin is what `player::draw` insets itself by, so
         // the two views' content sits in the same columns and toggling `v`
         // does not shift anything sideways.
+        let bar_h = match now_playing::has_subject(state) {
+            true => BAR_H,
+            false => 0,
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .horizontal_margin(1)
@@ -68,7 +74,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                 // so entering and leaving search mode moves nothing below it.
                 Constraint::Length(HEAD_H),
                 Constraint::Min(1),
-                Constraint::Length(BAR_H),
+                Constraint::Length(bar_h),
             ])
             .split(frame.area());
 
@@ -85,9 +91,40 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         now_playing::draw(frame, rows[2], state);
     }
 
-    if state.show_help {
-        help::draw(frame);
+    // Under the help box: help is the one overlay that answers "what does any
+    // of this do", so nothing may cover it.
+    if state.picker.is_some() {
+        playlist_picker::draw(frame, state);
     }
+
+    if state.show_help {
+        help::draw(frame, state);
+    }
+}
+
+/// Whether anything on screen is mid-animation and needs the next frame.
+///
+/// A spinner only turns if something keeps drawing it, and at the idle tick it
+/// would step about four times a second rather than spin. This is what the
+/// frame loop reads to hold the fast tick over a load — see `run_tui`.
+///
+/// The visualizer is not here: the player view asks for the fast tick
+/// outright, whatever is on it.
+pub fn is_animating(state: &AppState) -> bool {
+    // The nav row's `LOADING`, on either screen.
+    if play_state::status(state).is_some_and(|s| s.state == play_state::PlayState::Loading) {
+        return true;
+    }
+    // The main pane's own spinner, while the page it is drawing is still
+    // being fetched.
+    if state.main_loading() {
+        return true;
+    }
+    // The add-to-playlist box's `checking…`, while a row's mark is still out.
+    state
+        .picker_visible()
+        .into_iter()
+        .any(|i| state.picker_has(&state.playlists[i].id).is_none())
 }
 
 /// Keep a manually managed scroll offset in bounds when content shrinks.
@@ -113,6 +150,9 @@ mod tests {
 
     fn browse_state() -> AppState {
         let mut st = AppState::new();
+        // A signed-in Premium account, which is what the library screens are
+        // about; the app itself starts on radio alone.
+        st.spotify = crate::app::state::SpotifyState::Ready;
         st.playlists = (0..8)
             .map(|i| Playlist {
                 id: format!("p{i}"),
@@ -277,6 +317,7 @@ mod tests {
                 display: Vec::new(),
                 tab: crate::app::state::ArtistTab::Albums,
                 loading: false,
+                error: None,
             });
             st.push_view();
             st.main = MainView::Tracks(TrackList::new("Black Holes", "", None));
@@ -302,8 +343,8 @@ mod tests {
             browse.hit.status, player.hit.status,
             "the status moved when the player opened"
         );
-        assert!(a[0].trim_end().ends_with("● LOADING"), "{:?}", a[0]);
-        assert!(b[0].trim_end().ends_with("● LOADING"), "{:?}", b[0]);
+        assert!(table::ends_with_loading(&a[0]), "{:?}", a[0]);
+        assert!(table::ends_with_loading(&b[0]), "{:?}", b[0]);
         assert!(a[1].trim().is_empty(), "{:?}", a[1]);
 
         // Between them the rows part ways: the prompt on the browse screen,
@@ -359,7 +400,7 @@ mod tests {
         // Home draws no crumb: the mark is already the way there. The
         // playback status is opposite it, as on every other page.
         assert!(lines[0].starts_with(" ♫ spot "), "{:?}", lines[0]);
-        assert!(lines[0].trim_end().ends_with("● LOADING"), "{:?}", lines[0]);
+        assert!(table::ends_with_loading(&lines[0]), "{:?}", lines[0]);
         assert!(!lines[0].contains('›'), "{:?}", lines[0]);
         assert!(lines[4].contains("Liked Songs"), "{:?}", lines[4]);
         // No count: its length is not known until it is opened.
@@ -410,6 +451,52 @@ mod tests {
         let lines = screen(&mut st, 100, 34);
         let row = lines.iter().find(|l| l.contains("Radio")).unwrap();
         assert!(row.contains("2 saved stations"), "{row:?}");
+    }
+
+    /// The update row is on Home only while there is an update, and it names
+    /// the release it offers.
+    #[test]
+    fn the_update_row_appears_only_with_a_release_waiting() {
+        use crate::app::state::UpdateState;
+
+        let mut st = browse_state();
+        st.main = crate::app::state::MainView::Home;
+        let quiet = screen(&mut st, 100, 34).join("\n");
+        assert!(!quiet.contains("Update available"), "{quiet}");
+
+        st.update = Some(UpdateState::Available(crate::update::Release {
+            tag: "v9.9.9".into(),
+            url: "https://example.test/spot.exe".into(),
+        }));
+        let lines = screen(&mut st, 100, 34);
+        let row = lines
+            .iter()
+            .find(|l| l.contains("Update available"))
+            .expect("the update row should be on Home");
+        assert!(row.contains("v9.9.9"), "{row:?}");
+
+        st.update = Some(UpdateState::Installed);
+        let done = screen(&mut st, 100, 34).join("\n");
+        assert!(done.contains("press Enter to restart into it"), "{done}");
+    }
+
+    /// The help overlay is the only place the running version is written down.
+    #[test]
+    fn the_help_overlay_names_the_version() {
+        use crate::app::state::UpdateState;
+
+        let mut st = browse_state();
+        st.show_help = true;
+        let running = format!("spot v{}", env!("CARGO_PKG_VERSION"));
+        let quiet = screen(&mut st, 100, 44).join("\n");
+        assert!(quiet.contains(&running), "{quiet}");
+
+        st.update = Some(UpdateState::Available(crate::update::Release {
+            tag: "v9.9.9".into(),
+            url: "https://example.test/spot.exe".into(),
+        }));
+        let offered = screen(&mut st, 100, 44).join("\n");
+        assert!(offered.contains("v9.9.9 available"), "{offered}");
     }
 
     pub(super) fn station(uuid: &str, name: &str) -> crate::app::state::Station {
@@ -582,6 +669,7 @@ mod tests {
             display: Vec::new(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
+            error: None,
         };
         view.retab();
         st.main = crate::app::state::MainView::Artist(view);
@@ -768,6 +856,94 @@ mod tests {
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
         }
+    }
+
+    /// A spinner only turns if something keeps drawing it, and a load is
+    /// exactly when nothing else is asking the frame loop to.
+    #[test]
+    fn a_spinner_holds_the_frame_loop_awake() {
+        let mut st = browse_state();
+        // Paused: nothing is being waited for, so nothing is turning.
+        st.playback.as_mut().unwrap().is_playing = false;
+        assert!(!is_animating(&st));
+
+        // Claims to play, but no sound out of it yet — the buffering window
+        // the nav row says LOADING through.
+        st.playback.as_mut().unwrap().is_playing = true;
+        st.audio_tap.clear();
+        let lines = screen(&mut st, 100, 34);
+        assert!(table::ends_with_loading(&lines[0]), "{:?}", lines[0]);
+        assert!(is_animating(&st));
+    }
+
+    /// And the box's own spinner, which is up only while a row's mark is out.
+    #[test]
+    fn the_box_holds_it_awake_while_a_mark_is_unanswered() {
+        let mut st = browse_state();
+        st.show_player = true;
+        st.me_id = Some("me".into());
+        // Paused, so the nav row's own spinner is not what is answering here.
+        st.playback.as_mut().unwrap().is_playing = false;
+        let uri = "spotify:track:t3".to_string();
+        st.picker = Some(crate::app::state::PlaylistPicker {
+            order: st.picker_order(&uri),
+            uri,
+            query: String::new(),
+            selected: 0,
+            offset: 0,
+            pending: Default::default(),
+            error: None,
+            seq: 1,
+        });
+        assert!(is_animating(&st), "no playlist has been walked");
+
+        for i in st.picker_rows() {
+            let id = st.playlists[i].id.clone();
+            st.playlist_tracks.insert(
+                id,
+                crate::app::state::PlaylistContents {
+                    snapshot_id: "s".into(),
+                    track_ids: Default::default(),
+                },
+            );
+        }
+        assert!(!is_animating(&st), "every visible row is answered");
+    }
+
+    /// `+ add` rides beside the `★` on both screens, in the same corner of the
+    /// same title row — the pair is one control set, and one that appeared
+    /// only after pressing `v` would be a control that moves.
+    #[test]
+    fn both_views_offer_add_to_playlist() {
+        for player in [false, true] {
+            let mut st = browse_state();
+            st.show_player = player;
+            st.liked.insert("spotify:track:t3".into(), true);
+            let lines = screen(&mut st, 100, 34);
+            // Beside the ★, not instead of it, and one space apart.
+            assert!(
+                lines.iter().any(|l| l.contains("★ liked + add")),
+                "player={player} {lines:#?}"
+            );
+            assert!(!st.hit.add_btn.is_empty(), "player={player}");
+            assert_eq!(
+                st.hit.add_btn.x,
+                st.hit.like_btn.right() + 1,
+                "player={player}"
+            );
+        }
+    }
+
+    /// Without an account there are no playlists to add to, so the control
+    /// that would open an empty box is not drawn at all.
+    #[test]
+    fn add_to_playlist_needs_spotify() {
+        let mut st = browse_state();
+        st.show_player = true;
+        st.spotify = crate::app::state::SpotifyState::Off;
+        let lines = screen(&mut st, 100, 34);
+        assert!(!lines.iter().any(|l| l.contains("+ add")), "{lines:#?}");
+        assert!(st.hit.add_btn.is_empty());
     }
 
     #[test]

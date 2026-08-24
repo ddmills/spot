@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -121,6 +122,31 @@ pub struct ArtistItem {
     pub name: String,
 }
 
+/// A load that came back an error, and the command that asks for it again.
+///
+/// A page that failed reads exactly like a page that is genuinely empty
+/// unless it keeps the reason, and the toast cannot carry it: the toast
+/// expires in seconds and the bottom bar it draws on is not there at all
+/// while nothing is playing.
+///
+/// The retry command is captured where the load starts rather than rebuilt
+/// from the view, because a view that failed has nothing left to rebuild it
+/// from — a failed album page holds no track to read its year off.
+#[derive(Debug, Clone)]
+pub struct LoadError {
+    pub message: String,
+    pub retry: crate::app::command::AppCommand,
+}
+
+impl LoadError {
+    pub fn new(message: impl Into<String>, retry: crate::app::command::AppCommand) -> Self {
+        Self {
+            message: message.into(),
+            retry,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
     pub query: String,
@@ -143,6 +169,15 @@ pub struct SearchResults {
     /// to prove it belongs to the results on screen and not to a query the
     /// user has already replaced.
     pub generation: u64,
+    /// Why the Spotify half of this query came back with nothing. Its four
+    /// tabs report this one; [`Self::stations_error`] speaks for the fifth.
+    pub error: Option<LoadError>,
+    /// Why the directory half came back with nothing.
+    ///
+    /// Its own field for the reason [`Self::stations_loading`] is: the two
+    /// halves are two hosts, and one of them being unreachable is not this
+    /// query failing.
+    pub stations_error: Option<LoadError>,
 }
 
 /// The five cuts of one query.
@@ -248,42 +283,78 @@ pub enum TrackListKind {
 /// [`AppState::home_items`] — is the only place that has to learn about them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeItem {
+    Update,
     LikedSongs,
     DiscoverWeekly,
     Playlists,
     Radio,
+    Spotify,
 }
 
 impl HomeItem {
     /// Every destination, in the order Home lists them. The two named records
     /// lead, because they are the ones you open by name; Playlists is the
     /// catch-all under them, and Radio is last because it is the one row that
-    /// leaves Spotify behind.
-    pub const ALL: [HomeItem; 4] = [
+    /// leaves Spotify behind. [`HomeItem::Spotify`] follows it: the three rows
+    /// above only exist once it has been used, and it is not there once they
+    /// are — see [`AppState::home_items`].
+    ///
+    /// [`HomeItem::Update`] leads because it is the one row that is about the
+    /// app rather than about music, and it is absent on almost every run.
+    pub const ALL: [HomeItem; 6] = [
+        HomeItem::Update,
         HomeItem::LikedSongs,
         HomeItem::DiscoverWeekly,
         HomeItem::Playlists,
         HomeItem::Radio,
+        HomeItem::Spotify,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
+            HomeItem::Update => "Update available",
             HomeItem::LikedSongs => "Liked Songs",
             HomeItem::DiscoverWeekly => "Discover Weekly",
             HomeItem::Playlists => "Playlists",
             HomeItem::Radio => "Radio",
+            HomeItem::Spotify => "Spotify",
         }
     }
 
     /// The dim line under the name, saying what the destination holds.
+    ///
+    /// The Spotify row's line depends on how far the connection got, so it is
+    /// [`AppState::home_blurb`] that the screen asks.
     pub fn blurb(self) -> &'static str {
         match self {
+            HomeItem::Update => "press Enter to download and install it",
             HomeItem::LikedSongs => "everything you have saved",
             HomeItem::DiscoverWeekly => "thirty new tracks every Monday",
             HomeItem::Playlists => "saved and followed",
             HomeItem::Radio => "live stations from around the world",
+            HomeItem::Spotify => "connect an account to play your library",
         }
     }
+}
+
+/// How much of Spotify spot has.
+///
+/// Radio needs none of it, so this starts at [`SpotifyState::Off`] and the app
+/// is usable there. Everything Spotify appears or disappears from the screen
+/// on this one value — see [`AppState::home_items`] and
+/// [`AppState::search_tabs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpotifyState {
+    /// No account: no library, no lookups, radio only.
+    Off,
+    /// A sign-in is running.
+    Connecting,
+    /// The Web API answers, but nothing can be streamed. The string is the
+    /// short reason the Home row shows. A radio station still gets its record
+    /// named, its sleeve drawn and its Like control.
+    Limited(String),
+    /// Signed in with Premium: the whole application.
+    Ready,
 }
 
 /// A radio station, as the directory describes it and the deck draws it.
@@ -445,6 +516,8 @@ pub struct RadioView {
     /// Matches `AppState.load_generation` while a fetch owns this view, on the
     /// same reasoning as [`TrackList::generation`].
     pub generation: u64,
+    /// Why the directory came back with nothing — see [`LoadError`].
+    pub error: Option<LoadError>,
 }
 
 impl RadioView {
@@ -454,6 +527,7 @@ impl RadioView {
             rows: Vec::new(),
             loading: true,
             generation,
+            error: None,
         }
     }
 }
@@ -633,6 +707,10 @@ pub struct TrackList {
     /// Key of this view in the client's track cache (`"liked"`,
     /// `"playlist:<id>"`, …); Refresh reads it to evict and re-fetch.
     pub cache_key: Option<String>,
+    /// Why the pages stopped arriving — see [`LoadError`]. Set on the page
+    /// that failed, so a list that got half-way through says so with the rows
+    /// it did get still on screen.
+    pub error: Option<LoadError>,
 }
 
 impl TrackList {
@@ -651,6 +729,7 @@ impl TrackList {
             loading: false,
             generation: 0,
             cache_key: None,
+            error: None,
         }
     }
 
@@ -763,6 +842,8 @@ pub struct ArtistView {
     pub display: Vec<usize>,
     pub tab: ArtistTab,
     pub loading: bool,
+    /// Why the overview came back with nothing — see [`LoadError`].
+    pub error: Option<LoadError>,
 }
 
 impl ArtistView {
@@ -965,6 +1046,24 @@ pub fn album_key(id: &str) -> String {
     format!("album:{id}")
 }
 
+/// The bare id at the tail of a Spotify URI.
+///
+/// One spelling of the rule, because a cached id and the box's URI have to be
+/// comparable, and a second copy of it is a second thing to get wrong.
+pub fn track_id(uri: &str) -> &str {
+    uri.rsplit(':').next().unwrap_or(uri)
+}
+
+/// What one playlist holds, as of the snapshot it was read at.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaylistContents {
+    pub snapshot_id: String,
+    /// Bare track ids, not URIs: the same set costs about a third as much on
+    /// disk, and the `spotify:track:` on the front of every one of them says
+    /// nothing a playlist of tracks does not already say.
+    pub track_ids: HashSet<String>,
+}
+
 /// A radio page's identity. Every scope spells to something different, so
 /// Countries and one country are two pages on the path rather than one page
 /// that replaces itself.
@@ -1048,6 +1147,49 @@ pub enum InputMode {
     Search,
 }
 
+/// Playlists the add-to-playlist box shows at once. Past this it scrolls,
+/// which is what its search field is there to spare you.
+///
+/// Here rather than beside the drawing, because the key handler has to move
+/// the selection by the same window the box shows.
+pub const PICKER_ROWS: usize = 10;
+
+/// The open "add to playlist" box: which record it is about, what has been
+/// typed into it, and which of its rows are mid-change.
+///
+/// It is a list of checkboxes rather than a list of destinations — a row says
+/// whether the record is on that playlist, and picking one flips it — so the
+/// box stays up until it is clicked off. Adding to three playlists is three
+/// picks, not three trips through the same control.
+#[derive(Debug, Clone)]
+pub struct PlaylistPicker {
+    /// The record the pick applies to, fixed when the box opens. The deck can
+    /// move on under an open box, and the pick has to mean what it meant when
+    /// the pointer went down.
+    pub uri: String,
+    pub query: String,
+    /// Row of [`AppState::picker_rows`], not index into
+    /// [`AppState::playlists`].
+    pub selected: usize,
+    pub offset: usize,
+    /// Playlists with a change in flight, by id. A set rather than one id,
+    /// because the box outlives a pick and several rows can be waiting.
+    pub pending: HashSet<String>,
+    /// The last change that came back refused. The player view draws no
+    /// toasts, so the box is the only surface that can report one.
+    pub error: Option<String>,
+    /// Identifies this opening, so a result arriving after the box was closed
+    /// and opened again cannot act on the new one.
+    pub seq: u64,
+    /// The rows the box shows, as indices into [`AppState::playlists`], in the
+    /// order it shows them — settled when the box opens.
+    ///
+    /// Fixed rather than derived per frame: the playlists the record is
+    /// already on sort to the top, and a list that re-sorts under the pointer
+    /// as rows are checked is worse than one that waits until next time.
+    pub order: Vec<usize>,
+}
+
 /// Screen regions recorded during draw, used to resolve mouse events.
 /// Reset at the start of every frame; a region not drawn that frame stays
 /// zero-sized and can never be hit.
@@ -1102,6 +1244,10 @@ pub struct HitAreas {
     /// The shuffle button in a view's header band; plays the whole context
     /// shuffled.
     pub header_shuffle_btn: Rect,
+    /// The `↻ try again` control on a page whose load failed. Empty on every
+    /// page that did not draw one, so a click can never reach a page that has
+    /// nothing to retry.
+    pub retry_btn: Rect,
     /// The trail on a page's section row, one entry per crumb, in the order
     /// they are drawn. A trail rather than a single `← <page>` pill: a pill
     /// sitting after the section label takes its column from the label's width
@@ -1117,11 +1263,16 @@ pub struct HitAreas {
     pub main_artist_col: Rect,
     /// Album column of the track table; clicking a cell opens the album.
     pub main_album_col: Rect,
-    /// Liked column of the track table; clicking a cell likes or unlikes that
-    /// row. The whole two-cell column, not the glyph: an unliked row draws
-    /// nothing at all until the pointer is over it, so the cell is the only
-    /// target there is.
+    /// Liked column of the track table, the first of the `★ +` pair that ends
+    /// a row; clicking a cell likes or unlikes that row. One cell wide — the
+    /// star is always drawn, so the glyph *is* the target, and the space
+    /// separating it from [`Self::main_add_col`] belongs to neither control.
     pub main_like_col: Rect,
+    /// Add column of the track table, beside [`Self::main_like_col`]; clicking
+    /// a cell opens the add-to-playlist box for that row. The row's own answer
+    /// to the deck's [`Self::add_btn`], which is only ever about the record
+    /// that is playing.
+    pub main_add_col: Rect,
     /// Artist name in the now-playing info row.
     pub now_artist: Rect,
     /// Album name in the now-playing info row.
@@ -1138,6 +1289,22 @@ pub struct HitAreas {
     /// playing track. Empty while its saved state is still unknown — a control
     /// that cannot say which way it would go is worse than no control.
     pub like_btn: Rect,
+    /// The `+ add` control beside [`Self::like_btn`], which opens the
+    /// add-to-playlist box for the same record. On both screens and in the
+    /// same corner, like the control it sits against: a pair that appeared
+    /// only after pressing `v` would be a pair that moves.
+    ///
+    /// One space apart, and that space belongs to this control — a gap
+    /// belonging to neither lights under the pointer and reads as a third
+    /// control that does nothing.
+    pub add_btn: Rect,
+    /// The add-to-playlist box's search field. Clicking it keeps the box open,
+    /// the way the browse screen's search row does — a click that missed the
+    /// caret and closed the box would take the query with it.
+    pub picker_field: Rect,
+    /// The add-to-playlist box's rows. One line each, so the row is
+    /// `offset + (pos.y - rect.y)` against [`AppState::picker_rows`].
+    pub picker_list: Rect,
     /// The playing station's country, on the deck's station row. Opens the
     /// directory's page for that country. Empty when the directory gave us no
     /// code to ask by — the name is still printed, it just leads nowhere, the
@@ -1156,6 +1323,11 @@ pub struct HitAreas {
     pub queue_name: Rect,
     /// Queue list rows in the player view (inside the borders).
     pub player_queue: Rect,
+    /// The queue's liked column, the twin of [`Self::main_like_col`] on the
+    /// player's own list.
+    pub queue_like_col: Rect,
+    /// The queue's add column, the twin of [`Self::main_add_col`].
+    pub queue_add_col: Rect,
     /// The player view's visualizer band; clicking it toggles playback. The
     /// whole band is live, not just the lit bars — it is the biggest target
     /// on the screen and nothing else is drawn there.
@@ -1218,6 +1390,18 @@ pub struct AppState {
     /// where. `None` until the first play, which is when the deck appears.
     pub playback: Option<Playback>,
     pub playlists: Vec<Playlist>,
+    /// Why the playlist load came back with nothing — see [`LoadError`]. Here
+    /// rather than on a view because the Playlists page carries no state of
+    /// its own: it draws [`Self::playlists`], and so does the left rail.
+    pub playlists_error: Option<LoadError>,
+    /// How many times the page on screen has been asked for by hand, counting
+    /// only `↻ try again` — 0 until one is pressed, and reset by opening any
+    /// page.
+    ///
+    /// A refusal that comes straight back, which is what a rate limit does,
+    /// leaves the spinner up for less than a frame: without a count that
+    /// moves, pressing the control looks exactly like pressing nothing.
+    pub retries: u32,
     /// Saved ("liked") state by track URI. Absent = not checked yet, so
     /// unknown renders blank rather than as not-liked.
     pub liked: std::collections::HashMap<String, bool>,
@@ -1225,6 +1409,12 @@ pub struct AppState {
     /// it. The Playlists view leaves the Owner column blank for playlists this
     /// matches, so the column says "these are the ones you follow".
     pub me_id: Option<String>,
+    /// How much of Spotify is available. Radio does not read it at all.
+    pub spotify: SpotifyState,
+    /// Set by the Spotify Home row and cleared by the frame loop, which is
+    /// the one place that may run the sign-in: the browser flow prints to the
+    /// console, so the terminal has to be given back for the length of it.
+    pub connect_request: bool,
 
     /// The station playing, when one is.
     ///
@@ -1267,6 +1457,27 @@ pub struct AppState {
     pub input_mode: InputMode,
     pub input_buffer: String,
 
+    /// The "add to playlist" box, while one is open. It owns the keyboard and
+    /// the pointer for as long as it is up.
+    pub picker: Option<PlaylistPicker>,
+    /// Stamped onto the next box that opens; see [`PlaylistPicker::seq`].
+    pub picker_seq: u64,
+    /// What each playlist holds, by playlist id — the marks in the box are
+    /// read out of this.
+    ///
+    /// Spotify has no endpoint that answers "is this record on that playlist",
+    /// so the only way to know is to read the playlist. Caching the whole
+    /// contents rather than the one answer means that walk happens once per
+    /// playlist instead of once per playlist per record, membership is a set
+    /// lookup, and the box can sort by it the moment it opens.
+    ///
+    /// Absent = not walked yet, which the box draws as neither on nor off —
+    /// the same rule [`Self::liked`] follows. Persisted across runs and
+    /// validated by `snapshot_id`: that hash is Spotify saying the contents
+    /// changed, and what was true of the old contents says nothing about the
+    /// new.
+    pub playlist_tracks: HashMap<String, PlaylistContents>,
+
     /// Player view (current track + visualizer + queue) replaces the
     /// library/main panes while set.
     pub show_player: bool,
@@ -1284,9 +1495,9 @@ pub struct AppState {
     pub last_queue_click: Option<(usize, Instant)>,
     /// PCM tap for the visualizer; replaced with the live tap at startup.
     pub audio_tap: Arc<AudioTap>,
-    /// Spectrum analysis and bar/glow/peak envelopes, persisted across frames
-    /// for the visualizer's attack/decay animation.
-    pub viz: crate::viz::VizState,
+    /// The chosen visualizer mode and every analyzer's rolling state,
+    /// persisted across frames for the attack/decay animation.
+    pub viz: crate::viz::Viz,
     /// Loudness envelope for the nav row's playing dot. Its own state rather
     /// than a band of [`Self::viz`]: the visualizer is only updated while the
     /// player view is drawn, and the dot is on both screens.
@@ -1330,7 +1541,25 @@ pub struct AppState {
     pub loading: bool,
     pub toast: Option<(String, Instant)>,
     pub show_help: bool,
+    /// How far the app has got towards replacing itself. `None` on almost
+    /// every run: the startup check only fills it when GitHub has something
+    /// newer than this build.
+    pub update: Option<UpdateState>,
     pub should_quit: bool,
+    /// Set with [`Self::should_quit`] to start the new binary as this one
+    /// exits. Only the frame loop may honour it, because the terminal has to
+    /// be restored before another spot can take it.
+    pub restart_request: bool,
+}
+
+/// The stages a self-update passes through, each of which the Home row says
+/// out loud.
+#[derive(Debug, Clone)]
+pub enum UpdateState {
+    Available(crate::update::Release),
+    Installing,
+    Installed,
+    Failed,
 }
 
 impl AppState {
@@ -1342,8 +1571,12 @@ impl AppState {
             listen_back: Vec::new(),
             listen_forward: Vec::new(),
             playlists: Vec::new(),
+            playlists_error: None,
+            retries: 0,
             liked: std::collections::HashMap::new(),
             me_id: None,
+            spotify: SpotifyState::Off,
+            connect_request: false,
             main: MainView::Home,
             view_stack: Vec::new(),
             main_index: 0,
@@ -1354,6 +1587,9 @@ impl AppState {
             mouse_pos: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
+            picker: None,
+            picker_seq: 0,
+            playlist_tracks: HashMap::new(),
             show_player: false,
             queue: None,
             queue_index: 0,
@@ -1361,7 +1597,7 @@ impl AppState {
             queue_generation: 0,
             last_queue_click: None,
             audio_tap: Arc::new(AudioTap::new()),
-            viz: crate::viz::VizState::new(),
+            viz: crate::viz::Viz::new(),
             pulse: crate::viz::Pulse::new(),
             cover: None,
             cover_generation: 0,
@@ -1372,24 +1608,63 @@ impl AppState {
             loading: false,
             toast: None,
             show_help: false,
+            update: None,
             should_quit: false,
+            restart_request: false,
         }
     }
 
     /// The Home rows that exist right now.
     ///
+    /// The library rows are there only while Spotify can play; the Spotify row
+    /// is there only while it cannot. Radio is always there — it is the half
+    /// of the app that needs no account.
+    ///
     /// Discover Weekly is Spotify's, not yours: it is only a row when you
     /// actually follow it. A dim "you don't have this" line would be a worse
     /// screen than three real destinations.
     pub fn home_items(&self) -> Vec<HomeItem> {
+        let ready = self.spotify == SpotifyState::Ready;
         HomeItem::ALL
             .iter()
             .copied()
             .filter(|item| match item {
-                HomeItem::DiscoverWeekly => self.discover_weekly().is_some(),
-                _ => true,
+                HomeItem::Update => self.update.is_some(),
+                HomeItem::DiscoverWeekly => ready && self.discover_weekly().is_some(),
+                HomeItem::LikedSongs | HomeItem::Playlists => ready,
+                HomeItem::Spotify => !ready,
+                HomeItem::Radio => true,
             })
             .collect()
+    }
+
+    /// The dim line under a Home row's name. The Spotify and Update rows are
+    /// the ones whose lines move; the rest speak for themselves.
+    pub fn home_blurb(&self, item: HomeItem) -> &'static str {
+        if item == HomeItem::Update {
+            return match self.update {
+                Some(UpdateState::Available(_)) | None => HomeItem::Update.blurb(),
+                Some(UpdateState::Installing) => "downloading…",
+                Some(UpdateState::Installed) => "press Enter to restart into it",
+                Some(UpdateState::Failed) => "the download failed — see the log",
+            };
+        }
+        match (item, &self.spotify) {
+            (HomeItem::Spotify, SpotifyState::Connecting) => "signing in…",
+            (HomeItem::Spotify, SpotifyState::Limited(_)) => {
+                "signed in, but nothing can be played — radio still can"
+            }
+            _ => item.blurb(),
+        }
+    }
+
+    /// The search tabs that exist right now: all five with Spotify, and the
+    /// directory's own tab alone without it.
+    pub fn search_tabs(&self) -> Vec<SearchTab> {
+        match self.spotify {
+            SpotifyState::Ready => SearchTab::ALL.to_vec(),
+            _ => vec![SearchTab::Stations],
+        }
     }
 
     /// The followed copy of Discover Weekly, if there is one.
@@ -1402,6 +1677,95 @@ impl AppState {
             .find(|p| p.owner_id == SPOTIFY_OWNER && p.name.eq_ignore_ascii_case("Discover Weekly"))
     }
 
+    /// The order a box opening now would show its rows in, as indices into
+    /// [`Self::playlists`].
+    ///
+    /// Only the ones you own: Spotify refuses an add to a playlist you merely
+    /// follow, and a row that can only fail is worse than no row. Indices
+    /// rather than references so a caller holding `&mut self` can act on the
+    /// answer.
+    ///
+    /// The playlists the record is already on come first, each group keeping
+    /// the order [`Self::playlists`] is already in. A playlist not walked yet
+    /// sorts with the "not on it" group rather than getting a third — it is
+    /// about to become one or the other, and a group that exists for a moment
+    /// is a group that moves.
+    pub fn picker_order(&self, uri: &str) -> Vec<usize> {
+        let Some(me) = self.me_id.as_deref() else {
+            return Vec::new();
+        };
+        let owned: Vec<usize> = self
+            .playlists
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.owner_id == me)
+            .map(|(i, _)| i)
+            .collect();
+        let holds = |i: &usize| {
+            self.playlist_tracks
+                .get(&self.playlists[*i].id)
+                .is_some_and(|c| c.track_ids.contains(track_id(uri)))
+        };
+        let (on, off): (Vec<usize>, Vec<usize>) = owned.into_iter().partition(|i| holds(i));
+        on.into_iter().chain(off).collect()
+    }
+
+    /// The rows the open box offers, as indices into [`Self::playlists`].
+    ///
+    /// The order it opened with, cut by whatever has been typed into it —
+    /// which is what makes that order hold for the life of the box. One
+    /// function rather than two, so the box's rows and the clicks against
+    /// them cannot disagree about what row 3 is.
+    pub fn picker_rows(&self) -> Vec<usize> {
+        let Some(picker) = self.picker.as_ref() else {
+            return Vec::new();
+        };
+        let query = picker.query.trim().to_lowercase();
+        picker
+            .order
+            .iter()
+            .copied()
+            // A reloaded `playlists` leaves these indices pointing at nothing.
+            .filter(|i| *i < self.playlists.len())
+            .filter(|i| query.is_empty() || self.playlists[*i].name.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    /// The rows the open box is actually showing, as indices into
+    /// [`Self::playlists`].
+    ///
+    /// The window [`Self::picker_rows`] is scrolled to. What the `checking…`
+    /// line answers for: a playlist off the bottom of the box may still be
+    /// unwalked, and nothing on screen would show it.
+    pub fn picker_visible(&self) -> Vec<usize> {
+        let Some(picker) = self.picker.as_ref() else {
+            return Vec::new();
+        };
+        self.picker_rows()
+            .into_iter()
+            .skip(picker.offset)
+            .take(PICKER_ROWS)
+            .collect()
+    }
+
+    /// Whether the open box's record is on `playlist_id`, or `None` while that
+    /// playlist has not been walked yet.
+    pub fn picker_has(&self, playlist_id: &str) -> Option<bool> {
+        let uri = &self.picker.as_ref()?.uri;
+        let contents = self.playlist_tracks.get(playlist_id)?;
+        Some(contents.track_ids.contains(track_id(uri)))
+    }
+
+    /// The open add-to-playlist box, but only if it is the opening `seq`
+    /// identifies.
+    ///
+    /// What an answer from the client has to go through: the box can be closed
+    /// and opened again on another record while a request is out, and a late
+    /// answer must not close, clear or blame the new one.
+    pub fn picker_for(&mut self, seq: u64) -> Option<&mut PlaylistPicker> {
+        self.picker.as_mut().filter(|p| p.seq == seq)
+    }
+
     /// The right-aligned tail of a Home row: how much the destination holds.
     ///
     /// Liked Songs has none — its length is not known until it is opened, and
@@ -1409,6 +1773,12 @@ impl AppState {
     pub fn home_count(&self, item: HomeItem) -> String {
         let plural = |n: u32, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
         match item {
+            // The tail carries the version, so the name can stay a constant
+            // and the row still says which release it offers.
+            HomeItem::Update => match &self.update {
+                Some(UpdateState::Available(release)) => release.tag.clone(),
+                _ => String::new(),
+            },
             HomeItem::LikedSongs => String::new(),
             HomeItem::DiscoverWeekly => self
                 .discover_weekly()
@@ -1420,6 +1790,12 @@ impl AppState {
             // say how much of yours is behind the door.
             HomeItem::Radio if self.radio_favorites.is_empty() => String::new(),
             HomeItem::Radio => plural(self.radio_favorites.len() as u32, "saved station"),
+            HomeItem::Spotify => match &self.spotify {
+                SpotifyState::Off => "not connected".to_string(),
+                SpotifyState::Connecting => "connecting…".to_string(),
+                SpotifyState::Limited(reason) => reason.clone(),
+                SpotifyState::Ready => String::new(),
+            },
         }
     }
 
@@ -1461,6 +1837,75 @@ impl AppState {
 
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Whether the page on screen is still being fetched.
+    ///
+    /// The frame loop reads this to hold the fast tick over the pane's
+    /// spinner. Deliberately not the header's `loading`, which answers the
+    /// different question of whether the *trail* should say so — a page whose
+    /// pane spins says it there instead, and the two must be free to disagree.
+    pub fn main_loading(&self) -> bool {
+        match &self.main {
+            MainView::Home => false,
+            MainView::Playlists => self.loading && self.playlists.is_empty(),
+            MainView::Tracks(list) => self.loading || list.loading,
+            MainView::Search(results) => match self.search_tab {
+                SearchTab::Stations => results.stations_loading,
+                _ => self.loading,
+            },
+            MainView::Artist(v) => v.loading,
+            MainView::Radio(v) => v.loading && v.rows.is_empty(),
+        }
+    }
+
+    /// Put the page on screen back in flight, clearing the refusal it is
+    /// showing.
+    ///
+    /// Done on the press rather than left to the client, which installs a
+    /// fresh view a beat later: a refusal that comes straight back — which is
+    /// what a rate limit does — can land before the next frame is drawn, so
+    /// waiting for the client would mean the spinner was never on screen at
+    /// all and the control looked inert.
+    pub fn mark_reloading(&mut self) {
+        let tab = self.search_tab;
+        // Split borrow: the view is written while the two page-wide flags
+        // beside it are.
+        let AppState {
+            main,
+            loading,
+            playlists_error,
+            ..
+        } = self;
+        match main {
+            MainView::Playlists => {
+                *playlists_error = None;
+                *loading = true;
+            }
+            MainView::Tracks(list) => {
+                list.error = None;
+                list.loading = true;
+            }
+            MainView::Artist(v) => {
+                v.error = None;
+                v.loading = true;
+            }
+            MainView::Radio(v) => {
+                v.error = None;
+                v.loading = true;
+            }
+            MainView::Search(results) => match tab {
+                SearchTab::Stations => {
+                    results.stations_error = None;
+                    results.stations_loading = true;
+                }
+                _ => {
+                    results.error = None;
+                    *loading = true;
+                }
+            },
+            MainView::Home => {}
+        }
     }
 
     /// The record the deck is currently about.
@@ -1690,6 +2135,207 @@ pub fn format_duration(ms: u64) -> String {
 mod tests {
     use super::*;
 
+    fn owned(id: &str, name: &str, owner_id: &str) -> Playlist {
+        Playlist {
+            id: id.into(),
+            name: name.into(),
+            track_count: 1,
+            owner: owner_id.into(),
+            owner_id: owner_id.into(),
+            snapshot_id: "s".into(),
+        }
+    }
+
+    fn picking(query: &str) -> AppState {
+        let mut st = AppState::new();
+        st.me_id = Some("me".into());
+        st.playlists = vec![
+            owned("a", "Late Night", "me"),
+            owned("b", "Someone Else's", "them"),
+            owned("c", "late lunch", "me"),
+        ];
+        let uri = "spotify:track:x".to_string();
+        st.picker = Some(PlaylistPicker {
+            order: st.picker_order(&uri),
+            uri,
+            query: query.into(),
+            selected: 0,
+            offset: 0,
+            pending: Default::default(),
+            error: None,
+            seq: 1,
+        });
+        st
+    }
+
+    fn holding(snapshot: &str, ids: &[&str]) -> PlaylistContents {
+        PlaylistContents {
+            snapshot_id: snapshot.into(),
+            track_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    /// Spotify refuses an add to a playlist you only follow, so the box never
+    /// offers one: a row that can only fail is worse than no row.
+    #[test]
+    fn the_picker_offers_only_playlists_you_own() {
+        let st = picking("");
+        assert_eq!(st.picker_rows(), vec![0, 2]);
+    }
+
+    /// The query cuts the rows without regard to case, the way any other
+    /// search in the app does.
+    #[test]
+    fn the_pickers_query_ignores_case() {
+        assert_eq!(picking("LATE").picker_rows(), vec![0, 2]);
+        assert_eq!(picking("lunch").picker_rows(), vec![2]);
+        assert!(picking("nothing here").picker_rows().is_empty());
+    }
+
+    /// A box that was closed and opened again on another record is a different
+    /// box, and an answer to the first one has nothing to say to it.
+    #[test]
+    fn a_late_answer_cannot_act_on_a_reopened_box() {
+        let mut st = picking("");
+        assert!(st.picker_for(1).is_some());
+        st.picker = None;
+        assert!(st.picker_for(1).is_none());
+        st.picker_seq = 2;
+        st.picker = Some(PlaylistPicker {
+            seq: 2,
+            ..picking("").picker.unwrap()
+        });
+        assert!(st.picker_for(1).is_none());
+        assert!(st.picker_for(2).is_some());
+    }
+
+    /// Who you are is not known until the playlist load has been round the
+    /// account endpoint, and until then nothing can be said to be yours.
+    #[test]
+    fn the_picker_offers_nothing_before_the_account_is_known() {
+        let mut st = picking("");
+        st.me_id = None;
+        assert!(st.picker_order("spotify:track:x").is_empty());
+    }
+
+    /// The marks come out of the cached contents, so one walk of a playlist
+    /// answers for every record rather than for the one it was opened on.
+    #[test]
+    fn a_cached_playlist_answers_for_the_record_in_the_box() {
+        let mut st = picking("");
+        st.playlist_tracks.insert("a".into(), holding("s", &["x"]));
+        st.playlist_tracks.insert("c".into(), holding("s", &["y"]));
+        assert_eq!(st.picker_has("a"), Some(true));
+        assert_eq!(st.picker_has("c"), Some(false));
+    }
+
+    /// A playlist nothing has walked yet is neither on nor off, which is the
+    /// third state the box draws as `·`.
+    #[test]
+    fn an_unwalked_playlist_stays_unknown() {
+        let st = picking("");
+        assert_eq!(st.picker_has("a"), None);
+    }
+
+    /// The URI in the box and the ids on disk have to be comparable, and this
+    /// is the one place that rule is written.
+    #[test]
+    fn a_track_id_is_the_tail_of_its_uri() {
+        assert_eq!(track_id("spotify:track:abc"), "abc");
+        assert_eq!(track_id("abc"), "abc");
+    }
+
+    /// The playlists the record is already on open at the top, and the ones
+    /// nothing has walked sit with the rest rather than in a group of their
+    /// own.
+    #[test]
+    fn the_box_opens_with_the_playlists_youre_on_first() {
+        let mut st = picking("");
+        st.playlist_tracks.insert("c".into(), holding("s", &["x"]));
+        assert_eq!(st.picker_order("spotify:track:x"), vec![2, 0]);
+    }
+
+    /// The order is settled when the box opens: checking a row must not move
+    /// it out from under the pointer.
+    #[test]
+    fn the_order_holds_while_the_query_cuts_it() {
+        let mut st = picking("");
+        st.playlist_tracks.insert("c".into(), holding("s", &["x"]));
+        assert_eq!(st.picker_rows(), vec![0, 2], "the order it opened with");
+        st.picker.as_mut().unwrap().query = "late".into();
+        assert_eq!(st.picker_rows(), vec![0, 2]);
+    }
+
+    /// `R` replaces the list the box's indices point into, so any that now
+    /// point past the end are dropped rather than panicking a draw.
+    #[test]
+    fn rows_past_a_replaced_playlist_list_are_dropped() {
+        let mut st = picking("");
+        st.playlists.truncate(1);
+        assert_eq!(st.picker_rows(), vec![0]);
+    }
+
+    /// Without an account spot is a radio player, and it says so: one Home row
+    /// to listen with and one to sign in with, and the directory's own search
+    /// tab alone. Nothing on the screen promises what cannot be done.
+    #[test]
+    fn home_and_search_offer_only_radio_until_spotify_is_ready() {
+        let mut st = AppState::new();
+        st.playlists = vec![Playlist {
+            id: "dw".into(),
+            name: "Discover Weekly".into(),
+            track_count: 30,
+            owner: "Spotify".into(),
+            owner_id: SPOTIFY_OWNER.into(),
+            snapshot_id: "s".into(),
+        }];
+
+        for state in [
+            SpotifyState::Off,
+            SpotifyState::Connecting,
+            SpotifyState::Limited("no Premium".into()),
+        ] {
+            st.spotify = state.clone();
+            assert_eq!(
+                st.home_items(),
+                vec![HomeItem::Radio, HomeItem::Spotify],
+                "{state:?}"
+            );
+            assert_eq!(st.search_tabs(), vec![SearchTab::Stations], "{state:?}");
+        }
+
+        st.spotify = SpotifyState::Ready;
+        assert_eq!(
+            st.home_items(),
+            vec![
+                HomeItem::LikedSongs,
+                HomeItem::DiscoverWeekly,
+                HomeItem::Playlists,
+                HomeItem::Radio
+            ]
+        );
+        assert_eq!(st.search_tabs(), SearchTab::ALL.to_vec());
+    }
+
+    /// The Spotify row's tail and line report how far the connection got, so
+    /// an account that cannot stream says why rather than leaving Home short.
+    #[test]
+    fn the_spotify_row_reports_the_connection() {
+        let mut st = AppState::new();
+        assert_eq!(st.home_count(HomeItem::Spotify), "not connected");
+
+        st.spotify = SpotifyState::Connecting;
+        assert_eq!(st.home_count(HomeItem::Spotify), "connecting…");
+        assert_eq!(st.home_blurb(HomeItem::Spotify), "signing in…");
+
+        st.spotify = SpotifyState::Limited("no Premium".into());
+        assert_eq!(st.home_count(HomeItem::Spotify), "no Premium");
+        assert!(st.home_blurb(HomeItem::Spotify).contains("radio still can"));
+
+        // Radio's own line never moves with it.
+        assert_eq!(st.home_blurb(HomeItem::Radio), HomeItem::Radio.blurb());
+    }
+
     fn track(name: &str, dur: u64) -> Track {
         Track {
             uri: format!("spotify:track:{name}"),
@@ -1730,6 +2376,7 @@ mod tests {
             display: Vec::new(),
             tab: ArtistTab::Albums,
             loading: false,
+            error: None,
         };
         v.retab();
         v

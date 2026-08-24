@@ -17,7 +17,7 @@
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
@@ -25,12 +25,15 @@ use ratatui::widgets::{List, ListItem, Paragraph};
 use super::deck;
 use super::main_pane;
 use super::play_state;
-use super::table::{apply_selection, art_w, draw_scrollbar, fit};
+use super::table::{
+    ACTIONS_MIN, ACTIONS_W, ADD_W, LIKE_W, action_spans, apply_selection, art_w, draw_scrollbar,
+    fit,
+};
 use super::theme;
 use crate::app::queue::Queue;
 use crate::app::state::{AppState, HitAreas, Track, format_duration};
 use crate::cover::Cover;
-use crate::viz::VizState;
+use crate::viz::{Viz, VizMode};
 
 /// Samples older than this mean audio is paused or playing elsewhere.
 const FRESH_WITHIN: Duration = Duration::from_millis(500);
@@ -258,6 +261,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Read for the same reason and in the same place: what the radio row can
     // offer is state the split borrow below gives up.
     let steps = play_state::radio_steps(state);
+    let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
 
     // Split borrows: queue/playback are read while list state, hit areas
     // and the visualizer's smoothing state are written.
@@ -307,7 +311,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if let Some(r) = radio.as_ref() {
         if rows.header > 0 {
             let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
-            deck::radio_masthead(frame, header_area, r, like, mouse, hit);
+            deck::radio_masthead(frame, header_area, r, like, spotify_ready, mouse, hit);
             hit.now_playing = Rect {
                 height: header_area.height.min(deck::MASTHEAD_H),
                 ..header_area
@@ -381,8 +385,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .and(queue.as_ref())
         .and_then(|q| q.current());
     let (Some(pb), Some(track)) = (playback.as_ref(), track) else {
-        deck::no_playback_hint(frame, header_area);
-        draw_queue(frame, queue_area, queue.as_ref(), 0, queue_list, hit);
+        deck::no_playback_hint(frame, header_area, spotify_ready);
+        draw_queue(
+            frame, queue_area, queue.as_ref(), 0, queue_list, hit, liked, mouse,
+        );
         return;
     };
 
@@ -394,6 +400,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             track,
             pb.volume_percent,
             like,
+            spotify_ready,
             mouse,
             hit,
         );
@@ -472,6 +479,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         *queue_index,
         queue_list,
         hit,
+        liked,
+        mouse,
     );
 }
 
@@ -588,20 +597,42 @@ fn viz_cell(col: &Column, slot: u16, rows: u16) -> (char, Style) {
     }
 }
 
-fn draw_visualizer(
+/// Paint the field in whatever the current mode is.
+///
+/// Each mode reads the geometry for itself, because what the field's width and
+/// height *mean* differs: bands and rows for the spectrum, columns of history
+/// for the waveform, braille pixels for the scope. The two rules they share are
+/// here — a rect too small to hold the mode is declined rather than spilled
+/// over, and a stale tap keeps the shape but drops the colour.
+fn draw_visualizer(frame: &mut Frame, area: Rect, tap: &crate::audio_tap::AudioTap, viz: &mut Viz) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let fresh = tap.is_fresh(FRESH_WITHIN);
+    let now = Instant::now();
+    match viz.mode {
+        VizMode::Bars => draw_bars(frame, area, tap, viz, fresh, now),
+        VizMode::Wave => draw_wave(frame, area, tap, viz, fresh, now),
+        VizMode::Scope => draw_scope(frame, area, tap, viz, fresh, now),
+    }
+}
+
+/// The spectrum, standing on the floor of the field.
+fn draw_bars(
     frame: &mut Frame,
     area: Rect,
     tap: &crate::audio_tap::AudioTap,
-    viz: &mut VizState,
+    viz: &mut Viz,
+    fresh: bool,
+    now: Instant,
 ) {
     let bands = band_layout(area.width);
     // The band count is clamped, so a very narrow rect asks for more cells than
     // it has; drawing anyway would spill the field past its own right edge.
-    if bands.used > area.width || area.height == 0 {
+    if bands.used > area.width {
         return;
     }
-    let fresh = tap.is_fresh(FRESH_WITHIN);
-    viz.update(tap, bands.n, fresh, Instant::now());
+    let spectrum = viz.spectrum(tap, bands.n, fresh, now);
 
     let rows = area.height;
     let h = rows as f32;
@@ -610,8 +641,8 @@ fn draw_visualizer(
     let buf = frame.buffer_mut();
     for b in 0..bands.n {
         let col = Column {
-            bar: viz.bars()[b] * h,
-            glow: viz.glow()[b] * h,
+            bar: spectrum.bars()[b] * h,
+            glow: spectrum.glow()[b] * h,
         };
         // The gap column after each bar is simply never written.
         let x = area.x + bands.x(b);
@@ -630,19 +661,161 @@ fn draw_visualizer(
     }
 }
 
-/// Column widths for the queue table: marker + number + title + artist + time.
+/// Where the waveform's centerline sits inside a cell. Half-block glyphs give
+/// two pixels per row, so the line falls on a cell boundary and the two halves
+/// of a bar are the same height as each other.
+const WAVE_PIXELS_PER_ROW: usize = 2;
+/// Pixels a column is drawn with even at rest. Silence is a hairline through
+/// the middle of the field rather than a gap, which is what makes the quiet
+/// stretches of a record read as part of the same picture as the loud ones.
+const WAVE_FLOOR: usize = 1;
+/// How far up the colour ramp a column at rest sits. The ramp's own floor is
+/// nearly black, and a pause in speech still has to be visible as a mark on the
+/// same picture as the words either side of it.
+const WAVE_RAMP_FLOOR: f32 = 0.22;
+
+/// The scrolling waveform: one bar per slice of time, standing either side of a
+/// centerline, walking left as new slices arrive at the right edge.
+///
+/// Blocks rather than braille. A waveform's information is in the *height* of
+/// each bar, not in the shape of a curve, and a solid column reads as a bar
+/// where a braille one reads as a smear.
+///
+/// A bar takes the *left* half of its cell, so a half-cell gap falls after each
+/// one and neighbours of similar height stay separate instead of merging into a
+/// blob. That is why the tips are quadrants rather than a plain `▌` over a
+/// blank: they carry the same half-row resolution the full-width glyphs did.
+fn draw_wave(
+    frame: &mut Frame,
+    area: Rect,
+    tap: &crate::audio_tap::AudioTap,
+    viz: &mut Viz,
+    fresh: bool,
+    now: Instant,
+) {
+    let columns = area.width as usize;
+    let rows = area.height as usize;
+    let pixels = rows * WAVE_PIXELS_PER_ROW;
+    // The centerline is the boundary between these two pixels, so a bar of `n`
+    // pixels either side covers `middle - n .. middle + n`.
+    let middle = pixels / 2;
+    let reach = middle.max(WAVE_FLOOR);
+    let history = viz.wave(tap, columns, fresh, now);
+
+    let buf = frame.buffer_mut();
+    for column in 0..columns {
+        let level = history.level(column, columns);
+        let n = ((level * reach as f32).round() as usize).clamp(WAVE_FLOOR, reach);
+
+        // Colour is the *column's* own level, so a bar is one flat colour and a
+        // loud slice is a hot one. Keying it on the row instead — the way the
+        // spectrum keys its ramp on height — paints the same rows in every
+        // column, and since almost every column reaches the middle of the field
+        // that reads as horizontal bands rather than as bars.
+        let pos = WAVE_RAMP_FLOOR + (1.0 - WAVE_RAMP_FLOOR) * level;
+        let style = match fresh {
+            true => Style::default().fg(theme::viz_color(pos, theme::Led::Lit)),
+            false => theme::dim(),
+        };
+
+        let lit = |pixel: usize| pixel + n >= middle && pixel < middle + n;
+        for row in 0..rows {
+            let ch = match (lit(row * 2), lit(row * 2 + 1)) {
+                (false, false) => ' ',
+                (true, false) => '▘',
+                (false, true) => '▖',
+                (true, true) => '▌',
+            };
+            if let Some(cell) = buf.cell_mut((area.x + column as u16, area.y + row as u16)) {
+                cell.set_char(ch).set_style(style);
+            }
+        }
+    }
+}
+
+/// Braille dot masks, indexed `sub_column * 4 + sub_row`. A braille cell is a
+/// 2x4 pixel grid, which is what buys the scope eight times the vertical
+/// resolution a half-block has — enough for a waveform to be a curve rather
+/// than a staircase.
+const BRAILLE: [u8; 8] = [0x01, 0x02, 0x04, 0x40, 0x08, 0x10, 0x20, 0x80];
+const BRAILLE_BASE: u32 = 0x2800;
+
+/// The waveform itself, drawn as a filled trace.
+///
+/// Filled rather than a single line per column: one column covers many samples,
+/// and drawing only the last of them turns anything above a few hundred hertz
+/// into a phantom low tone. The extent between the column's quietest and
+/// loudest sample is what a scope actually shows.
+fn draw_scope(
+    frame: &mut Frame,
+    area: Rect,
+    tap: &crate::audio_tap::AudioTap,
+    viz: &mut Viz,
+    fresh: bool,
+    now: Instant,
+) {
+    let (width, height) = (area.width as usize, area.height as usize);
+    let columns = width * 2;
+    let pixels = height * 4;
+    let trace = viz.scope(tap, columns, fresh, now).trace();
+
+    // The centerline, and the travel from it to either edge of the field.
+    let mid = (pixels - 1) as f32 / 2.0;
+    // Accumulate whole cells before painting: a cell holds up to eight pixels
+    // and can only carry one glyph and one colour.
+    let mut cells = vec![(0u8, 0.0f32); width * height];
+    for (column, &(low, high)) in trace.iter().enumerate() {
+        let row_of = |v: f32| (mid - v.clamp(-1.0, 1.0) * mid).round() as usize;
+        let (top, bottom) = (row_of(high), row_of(low).min(pixels - 1));
+        for pixel in top..=bottom {
+            let (mask, reach) = &mut cells[(pixel / 4) * width + column / 2];
+            *mask |= BRAILLE[(column % 2) * 4 + pixel % 4];
+            // The cell's colour comes from how far its farthest pixel is from
+            // the centerline, so the trace runs hot at its extremes the way a
+            // bar does at its tip.
+            *reach = reach.max((pixel as f32 - mid).abs() / mid);
+        }
+    }
+
+    let buf = frame.buffer_mut();
+    for (i, &(mask, reach)) in cells.iter().enumerate() {
+        let (ch, style) = match mask {
+            0 => (' ', Style::default()),
+            mask => (
+                char::from_u32(BRAILLE_BASE + mask as u32).unwrap_or(' '),
+                match fresh {
+                    true => Style::default().fg(theme::viz_color(reach, theme::Led::Lit)),
+                    false => theme::dim(),
+                },
+            ),
+        };
+        let (x, y) = (area.x + (i % width) as u16, area.y + (i / width) as u16);
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_char(ch).set_style(style);
+        }
+    }
+}
+
+/// Column widths for the queue table: marker + number + title + artist +
+/// the `★ +` pair + time.
 struct QueueCols {
     /// Right-aligned row number, wide enough for the longest one.
     num: usize,
     name: usize,
     /// 0 = hidden (narrow panes).
     artist: usize,
+    /// The `★ +` pair before the time. Dropped last, as in the browse table.
+    actions: bool,
 }
 
 impl QueueCols {
     fn new(width: usize, len: usize) -> Self {
         let num = len.to_string().len().max(2);
-        let fixed = PREFIX_W + num + COL_GAP.len() + DUR_W + COL_GAP.len();
+        let actions = width >= ACTIONS_MIN;
+        let mut fixed = PREFIX_W + num + COL_GAP.len() + DUR_W + COL_GAP.len();
+        if actions {
+            fixed += ACTIONS_W + COL_GAP.len();
+        }
         let flex = width.saturating_sub(fixed);
         if width >= 40 + num {
             let flex = flex.saturating_sub(COL_GAP.len());
@@ -654,15 +827,43 @@ impl QueueCols {
                 num,
                 name,
                 artist: flex - name,
+                actions,
             }
         } else {
             Self {
                 num,
                 name: flex,
                 artist: 0,
+                actions,
             }
         }
     }
+
+    /// Column offset (from the row start) of the liked cell of the pair.
+    ///
+    /// Chained from the columns before it for the reason the browse table's
+    /// offsets are: a click rect that disagrees with the glyph it covers is
+    /// the bug this arithmetic exists to prevent.
+    fn like_offset(&self) -> usize {
+        let mut x = PREFIX_W + self.num + COL_GAP.len() + self.name;
+        if self.artist > 0 {
+            x += COL_GAP.len() + self.artist;
+        }
+        x + COL_GAP.len()
+    }
+
+    /// Column offset of the add cell, flush against the liked one: each cell
+    /// carries its own padding, so the two targets meet.
+    fn add_offset(&self) -> usize {
+        self.like_offset() + LIKE_W
+    }
+}
+
+/// Which control of a queue row the mouse is over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueueHover {
+    Like,
+    Add,
 }
 
 /// Columns the queue list keeps clear on its right: a blank one, then the
@@ -670,6 +871,7 @@ impl QueueCols {
 /// duration flush against the bar reads as one mark rather than two.
 const QUEUE_GUTTER: u16 = 2;
 
+#[allow(clippy::too_many_arguments)]
 fn draw_queue(
     frame: &mut Frame,
     area: Rect,
@@ -677,6 +879,8 @@ fn draw_queue(
     queue_index: usize,
     queue_list: &mut ratatui::widgets::ListState,
     hit: &mut crate::app::state::HitAreas,
+    liked: &std::collections::HashMap<String, bool>,
+    mouse: Option<Position>,
 ) {
     if area.height == 0 {
         return;
@@ -712,6 +916,35 @@ fn draw_queue(
     let playing = Some(q.index());
 
     let cols = QueueCols::new(rows_area.width as usize, q.len());
+
+    // The pair's click targets, clipped to the rows actually filled. The same
+    // shape the browse table builds, for the same reason: the row comes from
+    // the pointer's y, the control from its x.
+    let filled_rows = (q.len().saturating_sub(queue_list.offset()) as u16).min(rows_area.height);
+    let cell_col = |off: usize, width: usize| {
+        Rect {
+            x: rows_area.x.saturating_add(off as u16),
+            y: rows_area.y,
+            width: width as u16,
+            height: filled_rows,
+        }
+        .intersection(rows_area)
+    };
+    if cols.actions {
+        hit.queue_like_col = cell_col(cols.like_offset(), LIKE_W);
+        hit.queue_add_col = cell_col(cols.add_offset(), ADD_W);
+    }
+    let hover_cell: Option<(usize, QueueHover)> = mouse.and_then(|m| {
+        let row = |y: u16| queue_list.offset() + (y - rows_area.y) as usize;
+        if hit.queue_like_col.contains(m) {
+            Some((row(m.y), QueueHover::Like))
+        } else if hit.queue_add_col.contains(m) {
+            Some((row(m.y), QueueHover::Add))
+        } else {
+            None
+        }
+    });
+
     let accent_bold = theme::accent().add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = q
         .rows()
@@ -751,6 +984,20 @@ fn draw_queue(
                 spans.push(Span::raw(COL_GAP));
                 spans.push(Span::styled(fit(&t.artists, cols.artist), theme::dim()));
             }
+            // Where the star lands, so the selection restyle below can put its
+            // accent back.
+            let mut star_at = None;
+            let saved = liked.get(&t.uri).copied();
+            if cols.actions {
+                let hover = hover_cell.and_then(|(row, col)| (row == i).then_some(col));
+                spans.push(Span::raw(COL_GAP));
+                star_at = Some(spans.len());
+                spans.extend(action_spans(
+                    saved,
+                    hover == Some(QueueHover::Like),
+                    hover == Some(QueueHover::Add),
+                ));
+            }
             spans.push(Span::raw(COL_GAP));
             spans.push(Span::styled(
                 format!("{:>DUR_W$}", format_duration(t.duration_ms)),
@@ -766,6 +1013,13 @@ fn draw_queue(
                     for span in line.spans.iter_mut().take(2) {
                         span.style = accent_bold;
                     }
+                }
+                // And the same for the star, which would otherwise read as
+                // unsaved on the one row you cannot step off to check.
+                if let Some(at) = star_at.filter(|_| saved == Some(true))
+                    && let Some(span) = line.spans.get_mut(at)
+                {
+                    span.style = accent_bold;
                 }
             }
             ListItem::new(line)
@@ -874,6 +1128,7 @@ mod tests {
             display: Vec::new(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
+            error: None,
         }
     }
 
@@ -1173,6 +1428,161 @@ mod tests {
             .collect()
     }
 
+    /// Every cell of the field in `mode`, after `frames` of broadband content
+    /// at the fast tick's rate. More than one frame because the waterfall only
+    /// closes a column every 110 ms and the scope's reference has to settle;
+    /// a single draw would report an empty field for both.
+    fn field_in(mode: VizMode, frames: usize) -> (Rect, Vec<ratatui::buffer::Cell>) {
+        let mut st = playing_state();
+        st.viz.mode = mode;
+        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        for _ in 0..frames {
+            st.audio_tap.push(&broadband(), 1.0);
+            terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        }
+        let buffer = terminal.backend().buffer().clone();
+        let field = st.hit.viz;
+        let cells = (field.y..field.bottom())
+            .flat_map(|y| (field.x..field.right()).map(move |x| Position { x, y }))
+            .map(|p| buffer.cell(p).unwrap().clone())
+            .collect();
+        (field, cells)
+    }
+
+    /// `V` walks the modes and comes back round, and every one of them paints
+    /// the same field rect — so the click target does not move with the mode.
+    #[test]
+    fn every_mode_fills_the_same_field() {
+        let mut mode = VizMode::default();
+        let (first, _) = field_in(mode, 40);
+        for _ in 0..3 {
+            let (rect, cells) = field_in(mode, 40);
+            assert_eq!(rect, first, "{mode:?} moved the field");
+            assert!(
+                cells.iter().any(|c| c.symbol() != " "),
+                "{mode:?} painted nothing"
+            );
+            mode = mode.next();
+        }
+        assert_eq!(mode, VizMode::default(), "the cycle does not come round");
+    }
+
+    /// The waveform stands either side of a centerline, and every column is on
+    /// it — silence is a hairline through the middle, not a gap, so the quiet
+    /// stretches of a record stay part of the same picture.
+    #[test]
+    fn the_waveform_is_symmetric_about_a_centerline() {
+        let (field, cells) = field_in(VizMode::Wave, 40);
+        let (w, h) = (field.width as usize, field.height as usize);
+        let cell = |x: usize, y: usize| cells[y * w + x].symbol().to_string();
+        let middle = h / 2;
+
+        for x in 0..w {
+            // The two rows either side of the line are always lit, and facing
+            // it: `▖` closes the row above, `▘` opens the row below.
+            assert!(cell(x, middle - 1) == "▖" || cell(x, middle - 1) == "▌");
+            assert!(cell(x, middle) == "▘" || cell(x, middle) == "▌");
+            // And a column's two halves reach the same distance.
+            let up = (0..middle).filter(|&y| cell(x, y) != " ").count();
+            let down = (middle..h).filter(|&y| cell(x, y) != " ").count();
+            assert_eq!(up, down, "column {x} is lopsided");
+        }
+    }
+
+    /// It scrolls in from the right, so a field opened moments ago is loud on
+    /// that side and still at rest on the other.
+    #[test]
+    fn the_waveform_fills_from_the_right() {
+        let (field, cells) = field_in(VizMode::Wave, 12);
+        let (w, h) = (field.width as usize, field.height as usize);
+        let height = |x: usize| (0..h).filter(|&y| cells[y * w + x].symbol() != " ").count();
+        assert!(height(w - 1) > 2, "the newest column is at rest");
+        assert_eq!(
+            height(0),
+            2,
+            "the field started full instead of scrolling in"
+        );
+    }
+
+    /// And it paints in braille dots rather than blocks, which is where the
+    /// scope gets its vertical resolution.
+    #[test]
+    fn the_scope_draws_in_braille() {
+        let (_, cells) = field_in(VizMode::Scope, 40);
+        let braille = |c: &ratatui::buffer::Cell| {
+            c.symbol()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch))
+        };
+        assert!(cells.iter().filter(|c| braille(c)).count() > 20, "no trace");
+    }
+
+    /// A stale tap keeps every mode's shape and drops its colour, so a paused
+    /// player reads as paused rather than as a blank rectangle.
+    #[test]
+    fn a_stale_tap_greys_every_mode() {
+        for mode in [VizMode::Bars, VizMode::Wave, VizMode::Scope] {
+            let mut st = playing_state();
+            st.viz.mode = mode;
+            let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+            for _ in 0..40 {
+                st.audio_tap.push(&broadband(), 1.0);
+                terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+            }
+            st.audio_tap.clear();
+            terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let field = st.hit.viz;
+            let painted: Vec<_> = (field.y..field.bottom())
+                .flat_map(|y| (field.x..field.right()).map(move |x| Position { x, y }))
+                .map(|p| buffer.cell(p).unwrap().clone())
+                .filter(|c| c.symbol() != " ")
+                .collect();
+            assert!(!painted.is_empty(), "{mode:?} blanked on one stale frame");
+            assert!(
+                painted.iter().all(|c| c.fg == theme::DIM),
+                "{mode:?} kept its colour while stale"
+            );
+        }
+    }
+
+    /// Every mode, at every shape the row budget can hand it — the tall art
+    /// tier, the short one, the stacked field, and panes too small for a field
+    /// at all. A mode has to decline rather than spill: nothing may be painted
+    /// outside the rect it recorded as `hit.viz`.
+    #[test]
+    fn no_mode_paints_outside_its_own_field() {
+        for mode in [VizMode::Bars, VizMode::Wave, VizMode::Scope] {
+            for (w, h) in [
+                (94u16, 36u16),
+                (80, 26),
+                (55, 24),
+                (44, 30),
+                (100, 17),
+                (30, 12),
+                (12, 6),
+            ] {
+                let mut st = playing_state();
+                st.viz.mode = mode;
+                st.audio_tap.push(&broadband(), 1.0);
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+                let field = st.hit.viz;
+                assert!(
+                    field.right() <= w && field.bottom() <= h,
+                    "{mode:?} at {w}x{h}: field {field:?} is off the pane"
+                );
+                // Drawing again over the same terminal is what a resize does,
+                // and a mode holding a buffer sized to the old shape would
+                // panic or paint the wrong cells here.
+                terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+                assert_eq!(st.hit.viz, field, "{mode:?} at {w}x{h} moved its field");
+            }
+        }
+    }
+
     /// The field's rect, and the x positions painted on its bottom row. Every
     /// band is lit, so the painted columns are exactly the bar columns — and
     /// the unpainted ones exactly the gaps.
@@ -1266,6 +1676,12 @@ mod tests {
         );
     }
 
+    /// A band at rest: the glow has landed on the bar, which is what every
+    /// steady column looks like.
+    fn resting(bar: f32) -> Column {
+        Column { bar, glow: bar }
+    }
+
     #[test]
     fn viz_cell_lights_leds_under_a_fading_trail() {
         let rows = 8;
@@ -1285,66 +1701,24 @@ mod tests {
         assert_ne!(fg(3), fg(5), "trail is not dimmer than the bar");
         assert_ne!(
             fg(4),
-            viz_cell(
-                &Column {
-                    bar: 4.0,
-                    glow: 4.0
-                },
-                4,
-                rows
-            )
-            .1
-            .fg
-            .unwrap(),
+            viz_cell(&resting(4.0), 4, rows).1.fg.unwrap(),
             "trail matches a fully lit LED at the same height"
         );
 
         // A cell the bar only reaches into lights at half brightness; less
         // than half a row of signal leaves it dark.
         assert_ne!(
-            viz_cell(
-                &Column {
-                    bar: 2.7,
-                    glow: 2.7
-                },
-                3,
-                rows
-            )
-            .1
-            .fg,
-            viz_cell(
-                &Column {
-                    bar: 3.0,
-                    glow: 3.0
-                },
-                3,
-                rows
-            )
-            .1
-            .fg
+            viz_cell(&resting(2.7), 3, rows).1.fg,
+            viz_cell(&resting(3.0), 3, rows).1.fg
         );
-        assert_eq!(
-            viz_cell(
-                &Column {
-                    bar: 2.2,
-                    glow: 2.2
-                },
-                3,
-                rows
-            )
-            .0,
-            ' '
-        );
+        assert_eq!(viz_cell(&resting(2.2), 3, rows).0, ' ');
     }
 
     /// Silence leaves the field empty — there is no dim baseline row along the
     /// floor for the bars to sit on.
     #[test]
     fn viz_cell_paints_nothing_when_silent() {
-        let col = Column {
-            bar: 0.0,
-            glow: 0.0,
-        };
+        let col = resting(0.0);
         assert_eq!(viz_cell(&col, 1, 8), (' ', Style::default()));
         assert_eq!(viz_cell(&col, 2, 8).0, ' ');
     }
@@ -1353,9 +1727,45 @@ mod tests {
     /// every bar — the field reads as banded green/yellow/red, not confetti.
     #[test]
     fn bar_color_depends_only_on_height() {
-        let color = |bar: f32, slot| viz_cell(&Column { bar, glow: bar }, slot, 8).1.fg;
+        let color = |bar: f32, slot| viz_cell(&resting(bar), slot, 8).1.fg;
         assert_eq!(color(8.0, 4), color(4.0, 4), "same row, different color");
         assert_ne!(color(8.0, 1), color(8.0, 8), "no gradient up the bar");
+    }
+
+    /// The waveform's colour belongs to the *column*, not the row.
+    ///
+    /// This is the regression test for a field that read as horizontal bands
+    /// rather than as bars: colouring by distance from the centerline paints
+    /// row N the same in every column, and since nearly every column reaches
+    /// the middle of the field, the inner rows became solid stripes.
+    #[test]
+    fn each_waveform_bar_is_one_colour_and_bars_differ() {
+        let (field, cells) = field_in(VizMode::Wave, 40);
+        let (w, h) = (field.width as usize, field.height as usize);
+        let colour = |x: usize, y: usize| cells[y * w + x].fg;
+        let height = |x: usize| (0..h).filter(|&y| cells[y * w + x].symbol() != " ").count();
+
+        // Down any one bar there is a single colour.
+        for x in 0..w {
+            let lit: Vec<_> = (0..h)
+                .filter(|&y| cells[y * w + x].symbol() != " ")
+                .map(|y| colour(x, y))
+                .collect();
+            assert!(
+                lit.windows(2).all(|p| p[0] == p[1]),
+                "column {x} is banded: {lit:?}"
+            );
+        }
+
+        // And across bars it varies — the field has scrolled in from the right,
+        // so the resting left edge and the loudest bar cannot be the same.
+        let tallest = (0..w).max_by_key(|&x| height(x)).unwrap();
+        assert!(height(tallest) > height(0), "nothing has scrolled in yet");
+        assert_ne!(
+            colour(0, h / 2),
+            colour(tallest, h / 2),
+            "a resting bar and the loudest one are the same colour"
+        );
     }
 
     #[test]
@@ -1547,6 +1957,48 @@ mod tests {
         let lines = render(&mut st, 80, 26);
         assert!(lines[21].contains(" 1   Gamma"), "{:?}", lines[21]);
         assert!(lines[23].contains(" 3   Alpha"), "{:?}", lines[23]);
+    }
+
+    /// The queue's rows carry the same pair the browse table's do, in the same
+    /// order, before the time.
+    #[test]
+    fn the_queue_rows_wear_the_action_pair() {
+        let mut st = playing_state();
+        st.liked.insert("spotify:track:Alpha".into(), true);
+        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (like, add) = (st.hit.queue_like_col, st.hit.queue_add_col);
+        assert_eq!(like.width, 3, "the control lost its padding");
+        assert_eq!(add.x, like.right(), "the pair is not flush");
+        assert!(st.hit.player_queue.contains(Position { x: like.x, y: like.y }));
+
+        // Each mark is centred in its own padded cell.
+        let cell = |x: u16, row: u16| {
+            buffer
+                .cell(Position {
+                    x: x + 1,
+                    y: like.y + row,
+                })
+                .unwrap()
+        };
+        for row in 0..3 {
+            assert_eq!(cell(like.x, row).symbol(), super::super::table::LIKED_MARK);
+            assert_eq!(cell(add.x, row).symbol(), super::super::table::ADD_MARK);
+        }
+        // "Alpha" is row 0 and saved; the rest are unknown and stay dim.
+        assert_eq!(cell(like.x, 0).fg, theme::accent_color());
+        assert_eq!(cell(like.x, 1).fg, theme::DIM);
+    }
+
+    /// A narrow pane gives up the artist column before the pair.
+    #[test]
+    fn the_queues_pair_outlives_its_artist_column() {
+        let mut st = playing_state();
+        render(&mut st, 44, 26);
+        assert!(!st.hit.queue_like_col.is_empty());
+        assert!(!st.hit.queue_add_col.is_empty());
     }
 
     #[test]

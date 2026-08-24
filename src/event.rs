@@ -11,8 +11,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
     self as state, AppState, ArtistRow, BackTarget, CrumbTarget, HomeItem, InputMode, MainView,
-    RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SortKey, Station, Track, TrackList,
-    ViewKey,
+    PICKER_ROWS, RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SortKey, SpotifyState,
+    Station, Track, TrackList, UpdateState, ViewKey,
 };
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -28,6 +28,13 @@ pub fn handle_event(event: Event, state: &Arc<RwLock<AppState>>, tx: &UnboundedS
             // quits from the search prompt, where a bare `q` is just a letter.
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 state.write().should_quit = true;
+                return;
+            }
+            // The add-to-playlist box owns every remaining key while it is
+            // up: it has a field of its own, so a bare letter is a letter and
+            // nothing underneath may read it as a command.
+            if state.read().picker.is_some() {
+                handle_picker_key(key, state, tx);
                 return;
             }
             let mode = state.read().input_mode;
@@ -65,6 +72,24 @@ fn handle_mouse(
 fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppCommand>) {
     if st.show_help {
         st.show_help = false;
+        return;
+    }
+    // The add-to-playlist box, while one is up. Every branch returns: unlike
+    // the help box above, a click that dismisses this one does *not* go on to
+    // work whatever was under it — the box covers the deck's own controls, and
+    // closing it is the whole of what that click meant.
+    if st.picker.is_some() {
+        // Before the dismiss below, for the reason the search row is checked
+        // before it too: a click that missed the caret in the box you are
+        // typing in must not close it and take the query with it.
+        if st.hit.picker_field.contains(pos) {
+            return;
+        }
+        if st.hit.picker_list.contains(pos) {
+            click_picker_row(st, pos, tx);
+            return;
+        }
+        st.picker = None;
         return;
     }
     // The mark is on every screen, in both views, and it is the one control
@@ -184,6 +209,15 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
+    // Before the main list, which a failed page's control sits *inside*: the
+    // pane records the whole body as the list so it still scrolls, and the
+    // list's own branch swallows a click it cannot resolve to a row rather
+    // than falling through.
+    if st.hit.retry_btn.contains(pos) {
+        retry_current_view(st, tx);
+        return;
+    }
+
     // Main list: click selects, double-click plays; clicks on the artist
     // or album cell drill into that page.
     if st.hit.main_list.contains(pos) {
@@ -199,6 +233,11 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
             if st.hit.main_like_col.contains(pos) {
                 st.last_main_click = None;
                 toggle_like_selection(st, tx);
+                return;
+            }
+            if st.hit.main_add_col.contains(pos) {
+                st.last_main_click = None;
+                add_selection_to_playlist(st, tx);
                 return;
             }
             if st.hit.main_artist_col.contains(pos) {
@@ -272,11 +311,34 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
-    // Player-view queue: click selects, double-click plays.
+    // Player-view queue: click selects, double-click plays. The row's own
+    // `★` and `+` come first, as they do on the browse table.
     if st.hit.player_queue.contains(pos) {
         let index = st.queue_list.offset() + (pos.y - st.hit.player_queue.y) as usize;
         if index < st.queue_len() {
             st.queue_index = index;
+            let like = st.hit.queue_like_col.contains(pos);
+            let add = st.hit.queue_add_col.contains(pos);
+            if like || add {
+                st.last_queue_click = None;
+                // The row under the pointer, not the playing one: the queue is
+                // a list of records you can act on, and the deck's own pair
+                // two panes down is what speaks for what is playing.
+                let Some(uri) = st
+                    .queue
+                    .as_ref()
+                    .and_then(|q| q.rows().get(index))
+                    .map(|t| t.uri.clone())
+                else {
+                    return;
+                };
+                if like {
+                    send_like(st, uri, tx);
+                } else {
+                    open_playlist_picker_for(st, uri, tx);
+                }
+                return;
+            }
             let double = st
                 .last_queue_click
                 .take()
@@ -337,6 +399,11 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         toggle_like_deck(st, tx);
         return;
     }
+    // Its neighbour on the same row, about the same record.
+    if st.hit.add_btn.contains(pos) {
+        open_playlist_picker(st, tx);
+        return;
+    }
 
     if st.hit.play_btn.contains(pos) {
         let _ = tx.send(AppCommand::PlayPause);
@@ -363,6 +430,13 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
 }
 
 fn handle_scroll(st: &mut AppState, pos: Position, delta: i64, tx: &UnboundedSender<AppCommand>) {
+    // The box covers the view, so the wheel belongs to it wherever it is
+    // turned: scrolling a list you cannot see is worse than scrolling nothing.
+    if st.picker.is_some() {
+        scroll_picker(st, delta);
+        cache_visible_playlists(st, tx);
+        return;
+    }
     if st.hit.main_list.contains(pos) {
         scroll_main(st, delta);
     } else if st.hit.player_queue.contains(pos) {
@@ -422,7 +496,9 @@ fn handle_search_input(
                 // Before the tab reset, so the snapshot keeps the tab the page
                 // you are leaving was on.
                 navigate(&mut st, AppCommand::Search(query), tx);
-                st.search_tab = SearchTab::Tracks;
+                // The first tab the strip has: Tracks with Spotify behind the
+                // box, and Stations when the directory is the whole of it.
+                st.search_tab = st.search_tabs()[0];
             }
         }
         KeyCode::Backspace => {
@@ -431,6 +507,195 @@ fn handle_search_input(
         KeyCode::Char(c) => st.input_buffer.push(c),
         _ => {}
     }
+}
+
+/// Keys while the add-to-playlist box is open.
+///
+/// Arrows rather than `j`/`k`: the box has a text field, so a letter has to
+/// stay a letter. Everything it does not name falls through to nothing, which
+/// is what keeps `q` and `?` from reaching the app behind it.
+fn handle_picker_key(
+    key: KeyEvent,
+    state: &Arc<RwLock<AppState>>,
+    tx: &UnboundedSender<AppCommand>,
+) {
+    let mut st = state.write();
+    let rows = st.picker_rows().len();
+    match key.code {
+        KeyCode::Esc => {
+            st.picker = None;
+            return;
+        }
+        KeyCode::Enter => {
+            toggle_picker_row(&mut st, tx);
+            return;
+        }
+        _ => {}
+    }
+    let Some(picker) = st.picker.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+            picker.offset = picker.offset.min(picker.selected);
+        }
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(rows.saturating_sub(1));
+            let last = picker.offset + PICKER_ROWS - 1;
+            if picker.selected > last {
+                picker.offset = picker.selected + 1 - PICKER_ROWS;
+            }
+        }
+        KeyCode::Backspace => {
+            picker.query.pop();
+            picker.selected = 0;
+            picker.offset = 0;
+        }
+        KeyCode::Char(c) => {
+            picker.query.push(c);
+            picker.selected = 0;
+            picker.offset = 0;
+        }
+        _ => return,
+    }
+    cache_visible_playlists(&st, tx);
+}
+
+/// Ask for the contents of any row on screen that has not been walked yet.
+///
+/// The prefetch at sign-in normally leaves nothing to do here, so this is the
+/// catch: a playlist made since that load, or one whose walk failed, is asked
+/// about when it comes into view. The whole window goes every time and the
+/// client drops what it already holds — one place decides what is visible
+/// ([`AppState::picker_visible`]) and one place decides what is worth asking.
+fn cache_visible_playlists(st: &AppState, tx: &UnboundedSender<AppCommand>) {
+    let playlist_ids: Vec<String> = st
+        .picker_visible()
+        .into_iter()
+        .filter(|i| st.picker_has(&st.playlists[*i].id).is_none())
+        .map(|i| st.playlists[i].id.clone())
+        .collect();
+    if playlist_ids.is_empty() {
+        return;
+    }
+    let _ = tx.send(AppCommand::CachePlaylistTracks { playlist_ids });
+}
+
+/// Open the add-to-playlist box for whatever the deck is about.
+///
+/// Reads [`AppState::deck_track`] rather than `playback`, as the liked control
+/// beside it does, so a station's matched record is the subject where there is
+/// one.
+fn open_playlist_picker(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(uri) = st.deck_track().map(|t| t.uri.clone()) else {
+        return radio_has_no_track(st, "track");
+    };
+    open_playlist_picker_for(st, uri, tx);
+}
+
+/// Open the box for one named record. The deck's control resolves the record
+/// first and a track row already knows its own, so the resolution stays with
+/// the caller and the box only ever handles a URI it has been handed.
+fn open_playlist_picker_for(st: &mut AppState, uri: String, tx: &UnboundedSender<AppCommand>) {
+    // The box short-circuits above the branch that cancels a half-typed
+    // search, so it has to do that itself — as the mark and the status do.
+    st.input_mode = InputMode::Normal;
+    st.input_buffer.clear();
+    st.picker_seq += 1;
+    st.picker = Some(state::PlaylistPicker {
+        order: st.picker_order(&uri),
+        uri,
+        query: String::new(),
+        selected: 0,
+        offset: 0,
+        pending: Default::default(),
+        error: None,
+        seq: st.picker_seq,
+    });
+    cache_visible_playlists(st, tx);
+}
+
+/// Walk the box's window without moving its selection — the wheel is how you
+/// look, and the selection is what you have chosen.
+fn scroll_picker(st: &mut AppState, delta: i64) {
+    let rows = st.picker_rows().len();
+    let Some(picker) = st.picker.as_mut() else {
+        return;
+    };
+    let max = rows.saturating_sub(PICKER_ROWS) as i64;
+    picker.offset = (picker.offset as i64 + delta * SCROLL_LINES).clamp(0, max) as usize;
+}
+
+/// A click on one of the box's rows: select it and flip it, so one click is
+/// the whole gesture. The rows are one line each, so the row is the line.
+fn click_picker_row(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppCommand>) {
+    let line = (pos.y - st.hit.picker_list.y) as usize;
+    let rows = st.picker_rows().len();
+    let Some(picker) = st.picker.as_mut() else {
+        return;
+    };
+    let row = picker.offset + line;
+    if row >= rows {
+        return;
+    }
+    picker.selected = row;
+    toggle_picker_row(st, tx);
+}
+
+/// Put the box's record on the selected playlist, or take it off — whichever
+/// the row is not already.
+///
+/// The box stays up either way: the rows are checkboxes, so one visit can
+/// change several of them, and a box that closed on the first pick would make
+/// the second a whole trip through the control again.
+fn toggle_picker_row(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let rows = st.picker_rows();
+    let Some(picker) = st.picker.as_ref() else {
+        return;
+    };
+    let Some(playlist_id) = rows
+        .get(picker.selected)
+        .map(|i| st.playlists[*i].id.clone())
+    else {
+        return;
+    };
+    // A row already mid-change has nothing to flip to that is not the flip
+    // already out; a second press would put the record on twice.
+    if picker.pending.contains(&playlist_id) {
+        return;
+    }
+    // A row whose mark is still unknown is inert. Reading it as "not on the
+    // playlist" and adding is what the liked control does with an unknown
+    // track, but a wrong guess there costs a duplicate on a real playlist,
+    // where a wrong guess about liked costs nothing — the box says
+    // "checking…" and this is over in a moment.
+    let Some(on) = st.picker_has(&playlist_id) else {
+        return;
+    };
+    let uri = picker.uri.clone();
+    let seq = picker.seq;
+    // Flipped before the request goes out so the row answers the press; the
+    // client puts it back if the change is refused. The row stays where it
+    // is: the order was settled when the box opened.
+    if let Some(contents) = st.playlist_tracks.get_mut(&playlist_id) {
+        let id = state::track_id(&uri).to_string();
+        if on {
+            contents.track_ids.remove(&id);
+        } else {
+            contents.track_ids.insert(id);
+        }
+    }
+    if let Some(picker) = st.picker.as_mut() {
+        picker.pending.insert(playlist_id.clone());
+        picker.error = None;
+    }
+    let _ = tx.send(AppCommand::SetOnPlaylist {
+        playlist_id,
+        uri,
+        on: !on,
+        seq,
+    });
 }
 
 fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSender<AppCommand>) {
@@ -558,6 +823,14 @@ fn handle_player_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('v') => state.write().show_player = false,
+        // The field is only on screen here, so the key that changes what it
+        // shows lives here too. The toast is the only thing naming the mode —
+        // the field itself carries no label.
+        KeyCode::Char('V') => {
+            let mut st = state.write();
+            let mode = st.viz.cycle();
+            st.toast(format!("visualizer: {}", mode.label()));
+        }
         KeyCode::Esc => {
             // Close the help overlay first if it is on top.
             let mut st = state.write();
@@ -738,6 +1011,8 @@ fn make_way(st: &mut AppState, target: Option<ViewKey>, tx: &UnboundedSender<App
 /// on the path. Every navigation site goes through here.
 fn navigate(st: &mut AppState, cmd: AppCommand, tx: &UnboundedSender<AppCommand>) {
     if make_way(st, target_key(&cmd), tx) {
+        // The count belongs to the page you were on, not to the one opening.
+        st.retries = 0;
         let _ = tx.send(cmd);
     }
 }
@@ -752,6 +1027,8 @@ fn go_back(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// Re-fetch what a restored view needs but did not bring with it. Shared by
 /// the one-step back and by a crumb click, which pops several at once.
 fn after_pop(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    // Going back is arriving at a page, so the count starts over here too.
+    st.retries = 0;
     // The restored view brings its own header back, but the decoded sleeve in
     // `view_cover` belongs to whatever was opened *after* it. Re-request the
     // one this page wants; a cache hit installs it on the spot, and a page
@@ -921,12 +1198,10 @@ fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand
     }
     match &st.main {
         MainView::Search(_) => {
-            let pos = SearchTab::ALL
-                .iter()
-                .position(|t| *t == st.search_tab)
-                .unwrap_or(0) as i64;
-            let n = SearchTab::ALL.len() as i64;
-            st.search_tab = SearchTab::ALL[((pos + delta).rem_euclid(n)) as usize];
+            let tabs = st.search_tabs();
+            let pos = tabs.iter().position(|t| *t == st.search_tab).unwrap_or(0) as i64;
+            let n = tabs.len() as i64;
+            st.search_tab = tabs[((pos + delta).rem_euclid(n)) as usize];
             st.main_to_top();
         }
         MainView::Radio(v) => {
@@ -950,6 +1225,12 @@ fn open_radio_tab(st: &mut AppState, tab: RadioTab, tx: &UnboundedSender<AppComm
 
 /// Enter / click: drill into the selected row, or play it.
 fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    // A page that was refused has no row for Enter to mean anything else by,
+    // so Enter is its `↻ try again` — the keyboard's half of the control the
+    // pane draws.
+    if retry_current_view(st, tx) {
+        return;
+    }
     // Home and Playlists are navigation rather than playback, and both push
     // the page they leave so the pill on the next one leads back to it.
     match &st.main {
@@ -958,6 +1239,18 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 return;
             };
             match item {
+                // The row is a control, not a destination: it stays on Home
+                // and reports through its own blurb. The client does the work
+                // and decides whether the press means anything.
+                HomeItem::Update => match st.update {
+                    Some(UpdateState::Installed) => {
+                        st.restart_request = true;
+                        st.should_quit = true;
+                    }
+                    _ => {
+                        let _ = tx.send(AppCommand::InstallUpdate);
+                    }
+                },
                 HomeItem::LikedSongs => navigate(st, AppCommand::LoadLikedSongs, tx),
                 HomeItem::DiscoverWeekly => {
                     // Resolved before the view is pushed: a row that leads
@@ -987,6 +1280,15 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                     },
                     tx,
                 ),
+                // The row asks; the frame loop answers, because the sign-in
+                // needs the terminal back for the browser flow. Pressed while
+                // one is already running, this does nothing.
+                HomeItem::Spotify => {
+                    if st.spotify != SpotifyState::Connecting {
+                        st.connect_request = true;
+                        st.spotify = SpotifyState::Connecting;
+                    }
+                }
             }
             return;
         }
@@ -1192,6 +1494,45 @@ fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCom
     });
 }
 
+/// Why the page on screen has nothing on it, when the reason is a refusal.
+///
+/// The Stations tab of a search answers for the directory and the other four
+/// for Spotify, because that is which host each of them asked.
+fn current_load_error(st: &AppState) -> Option<&state::LoadError> {
+    // A page with rows on it is a page that answered, whatever else went
+    // wrong later: the control is only ever drawn over a blank pane.
+    if st.main_len() > 0 {
+        return None;
+    }
+    match &st.main {
+        MainView::Playlists => st.playlists_error.as_ref(),
+        MainView::Tracks(list) => list.error.as_ref(),
+        MainView::Artist(v) => v.error.as_ref(),
+        MainView::Radio(v) => v.error.as_ref(),
+        MainView::Search(results) => match st.search_tab {
+            SearchTab::Stations => results.stations_error.as_ref(),
+            _ => results.error.as_ref(),
+        },
+        MainView::Home => None,
+    }
+}
+
+/// Ask for the failed page again.
+///
+/// Sent bare rather than through [`navigate`]: the page is already on screen,
+/// and pushing it would leave a crumb pointing at the page you never left.
+/// The client's own load prologue bumps `load_generation`, so a late answer
+/// from the attempt that failed still exits at its guard.
+fn retry_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>) -> bool {
+    let Some(cmd) = current_load_error(st).map(|e| e.retry.clone()) else {
+        return false;
+    };
+    st.retries += 1;
+    st.mark_reloading();
+    let _ = tx.send(cmd);
+    true
+}
+
 fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>, shuffle: bool) {
     let cmd = match &st.main {
         MainView::Tracks(list) if !list.display.is_empty() => Some(play_list(list, 0, shuffle)),
@@ -1267,9 +1608,32 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     }
 }
 
+/// Whether a Spotify page is worth opening, and what to say when it is not.
+///
+/// The library screens only exist for an account that can play, so this only
+/// ever bites on the radio deck: a station's matched record names an album and
+/// an artist whatever the account is, and a page nothing can be played from is
+/// a dead end rather than a destination.
+fn spotify_pages_open(st: &mut AppState) -> bool {
+    match &st.spotify {
+        SpotifyState::Ready => true,
+        SpotifyState::Limited(_) => {
+            st.toast("this account cannot play Spotify tracks");
+            false
+        }
+        _ => {
+            st.toast("connect Spotify from Home to open its pages");
+            false
+        }
+    }
+}
+
 /// `b`: browse into the selected item's album (track lists, search tracks,
 /// or a search-album result).
 fn open_album_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    if !spotify_pages_open(st) {
+        return;
+    }
     let from_track = |t: &crate::app::state::Track| {
         t.album_id.as_ref().map(|id| AppCommand::OpenAlbum {
             id: id.clone(),
@@ -1438,6 +1802,9 @@ fn open_album_item(a: &crate::app::state::AlbumItem) -> AppCommand {
 /// `B`: browse into the selected item's artist (first credited artist for
 /// tracks, or a search-artist result).
 fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    if !spotify_pages_open(st) {
+        return;
+    }
     let from_track = |t: &crate::app::state::Track| {
         t.artist_id.as_ref().map(|id| AppCommand::OpenArtist {
             id: id.clone(),
@@ -1530,7 +1897,17 @@ fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         }
         return;
     }
-    let uri = match &st.main {
+    match selected_track_uri(st) {
+        Some(uri) => send_like(st, uri, tx),
+        None => toggle_like_deck(st, tx),
+    }
+}
+
+/// The track under the cursor on a browse page, if the page lists tracks at
+/// all. Shared by the row's `★` and its `+` so the two controls can never
+/// disagree about which record the row is.
+fn selected_track_uri(st: &AppState) -> Option<String> {
+    match &st.main {
         MainView::Tracks(list) => list
             .display
             .get(st.main_index)
@@ -1543,10 +1920,18 @@ fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             _ => None,
         },
         _ => None,
-    };
-    match uri {
-        Some(uri) => send_like(st, uri, tx),
-        None => toggle_like_deck(st, tx),
+    }
+}
+
+/// The `+` on a track row: the add-to-playlist box for that row's record.
+///
+/// Falls back to the deck's record when the page has no track under the
+/// cursor, the way `L` does — the control is only drawn on rows that have
+/// one, so the fallback is for the keyboard path rather than the click.
+fn add_selection_to_playlist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    match selected_track_uri(st) {
+        Some(uri) => open_playlist_picker_for(st, uri, tx),
+        None => open_playlist_picker(st, tx),
     }
 }
 
@@ -1617,7 +2002,7 @@ mod tests {
     }
 
     fn artist_state() -> AppState {
-        let mut st = AppState::new();
+        let mut st = connected();
         let mut top = TrackList::new("Muse", "top tracks", None);
         top.append(vec![track("Uprising", Some("a1"))]);
         st.main = MainView::Artist(ArtistView {
@@ -1640,12 +2025,22 @@ mod tests {
             display: vec![0],
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
+            error: None,
         });
         st
     }
 
     fn channel() -> (UnboundedSender<AppCommand>, UnboundedReceiver<AppCommand>) {
         unbounded_channel()
+    }
+
+    /// State as a signed-in Premium account sees it: the library rows on Home
+    /// and all five search tabs. `AppState::new` is the radio-only app, which
+    /// is what spot starts as.
+    fn connected() -> AppState {
+        let mut st = AppState::new();
+        st.spotify = SpotifyState::Ready;
+        st
     }
 
     /// Put "Uprising" on: install the queue and transport state the client
@@ -1873,6 +2268,124 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// The failed page's own control, reached by pointer.
+    #[test]
+    fn clicking_try_again_asks_for_the_page_again() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        let mut list = TrackList::new("Muse", "", None);
+        list.error = Some(state::LoadError::new(
+            "429 Too Many Requests",
+            AppCommand::LoadPlaylistTracks {
+                playlist_id: "p1".into(),
+            },
+        ));
+        st.main = MainView::Tracks(list);
+        st.hit.retry_btn = Rect::new(20, 6, 11, 1);
+
+        // The pane records the whole body as the list so it still scrolls, so
+        // the control sits *inside* `main_list`. The list's branch resolves a
+        // click on a page with no rows to nothing and returns, so a retry
+        // tested after it would never be reached.
+        st.hit.main_list = Rect::new(0, 2, 60, 12);
+
+        handle_click(&mut st, Position { x: 22, y: 6 }, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadPlaylistTracks { playlist_id }) if playlist_id == "p1"
+        ));
+        assert!(
+            st.view_stack.is_empty(),
+            "the retry pushed the page it never left"
+        );
+        assert_eq!(st.retries, 1, "the press was not counted");
+    }
+
+    /// The spinner has to be up before the client has done anything: a rate
+    /// limit refuses in less time than a frame takes, so a page left showing
+    /// its old refusal until the client answers never shows a spinner at all.
+    #[test]
+    fn the_press_puts_the_page_back_in_flight_on_the_spot() {
+        let (tx, _rx) = channel();
+        let mut st = connected();
+        let mut list = TrackList::new("Muse", "", None);
+        list.error = Some(state::LoadError::new(
+            "429 Too Many Requests",
+            AppCommand::LoadLikedSongs,
+        ));
+        st.main = MainView::Tracks(list);
+
+        assert!(retry_current_view(&mut st, &tx));
+        let MainView::Tracks(list) = &st.main else {
+            unreachable!()
+        };
+        assert!(list.loading, "the page did not go back in flight");
+        assert!(list.error.is_none(), "the old refusal stood over the retry");
+    }
+
+    /// The count is about the page you are on, so arriving at another one
+    /// starts it over.
+    #[test]
+    fn opening_a_page_forgets_the_previous_one_s_retries() {
+        let (tx, _rx) = channel();
+        let mut st = connected();
+        st.retries = 4;
+        navigate(&mut st, AppCommand::LoadLikedSongs, &tx);
+        assert_eq!(st.retries, 0);
+    }
+
+    /// And by keyboard: a page with no rows has nothing else Enter could
+    /// mean, so Enter is the same control.
+    #[test]
+    fn enter_on_a_refused_page_asks_for_it_again() {
+        let (tx, mut rx) = channel();
+        let mut st = artist_state();
+        let MainView::Artist(v) = &mut st.main else {
+            unreachable!()
+        };
+        v.top = TrackList::new("Muse", "top tracks", None);
+        v.albums.clear();
+        v.display.clear();
+        v.error = Some(state::LoadError::new(
+            "no route to host",
+            AppCommand::OpenArtist {
+                id: "r1".into(),
+                uri: "spotify:artist:r1".into(),
+                name: "Muse".into(),
+            },
+        ));
+
+        activate_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::OpenArtist { id, .. }) if id == "r1"
+        ));
+
+        // And a page that answered keeps Enter for its rows.
+        let (tx, mut rx) = channel();
+        let mut st = artist_state();
+        activate_selection(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Play { .. })));
+    }
+
+    /// A page that came back with rows is a page that answered: a failure
+    /// recorded part-way through must not take Enter away from them.
+    #[test]
+    fn a_half_loaded_page_keeps_enter_for_its_rows() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        let mut list = TrackList::new("Muse", "", None);
+        list.append(vec![track("Uprising", Some("a1"))]);
+        list.error = Some(state::LoadError::new(
+            "the rest of the pages never came",
+            AppCommand::LoadLikedSongs,
+        ));
+        st.main = MainView::Tracks(list);
+
+        activate_selection(&mut st, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Play { .. })));
+    }
+
     /// Clicking the liked column likes that row — and only likes it: the
     /// click must not also arm the double-click that would start playback.
     #[test]
@@ -1880,7 +2393,7 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = liked_state();
         st.hit.main_list = Rect::new(0, 0, 90, 10);
-        st.hit.main_like_col = Rect::new(4, 0, 2, 2);
+        st.hit.main_like_col = Rect::new(4, 0, 1, 2);
 
         handle_click(&mut st, Position { x: 4, y: 1 }, &tx);
         assert_eq!(st.main_index, 1, "the click did not select the row");
@@ -1897,6 +2410,67 @@ mod tests {
         handle_click(&mut st, Position { x: 20, y: 1 }, &tx);
         assert!(rx.try_recv().is_err());
         assert!(st.last_main_click.is_some());
+    }
+
+    /// The `+` beside it opens the box for that row's record, not for whatever
+    /// is playing — and like the star, it does not arm a double-click.
+    #[test]
+    fn clicking_the_add_column_opens_the_box_for_that_row() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        // Something else is playing, so a box opened for the deck's record
+        // would name the wrong track.
+        start_playing(&mut st);
+        st.hit.main_list = Rect::new(0, 0, 90, 10);
+        st.hit.main_add_col = Rect::new(80, 0, 1, 2);
+
+        handle_click(&mut st, Position { x: 80, y: 1 }, &tx);
+        assert_eq!(st.main_index, 1, "the click did not select the row");
+        assert_eq!(
+            st.picker.as_ref().map(|p| p.uri.as_str()),
+            Some("spotify:track:Hysteria")
+        );
+        assert!(
+            st.last_main_click.is_none(),
+            "the add cell armed a double-click"
+        );
+        // Opening the box asks for the marks of the playlists it will show.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::CachePlaylistTracks { .. }) | Err(_)
+        ));
+    }
+
+    /// The queue's own pair acts on the row under the pointer. The player view
+    /// is about the playing record, but its list is not — a `+` on row three
+    /// that added row one would be a control that lies.
+    #[test]
+    fn the_queues_pair_acts_on_the_row_not_the_playing_track() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.show_player = true;
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            vec![track("Starlight", Some("a1")), track("Hysteria", Some("a1"))],
+            0,
+            "My Mix",
+        )));
+        st.hit.player_queue = Rect::new(0, 0, 80, 10);
+        st.hit.queue_like_col = Rect::new(60, 0, 1, 2);
+        st.hit.queue_add_col = Rect::new(62, 0, 1, 2);
+
+        handle_click(&mut st, Position { x: 60, y: 1 }, &tx);
+        assert_eq!(st.queue_index, 1);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
+                if uri == "spotify:track:Hysteria" && liked)
+        );
+        assert!(st.last_queue_click.is_none());
+
+        handle_click(&mut st, Position { x: 62, y: 0 }, &tx);
+        assert_eq!(
+            st.picker.as_ref().map(|p| p.uri.as_str()),
+            Some("spotify:track:Starlight")
+        );
     }
 
     /// The deck's liked control is about the playing track, whichever page is
@@ -2065,7 +2639,7 @@ mod tests {
     #[test]
     fn revisiting_a_page_walks_back_to_it() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         // Home → the album, from a track row.
         st.push_view();
         let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
@@ -2208,7 +2782,7 @@ mod tests {
     #[test]
     fn an_album_page_does_not_reopen_itself() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
         list.kind = TrackListKind::Album;
         // The identity is the cache key, not the context URI: the latter is
@@ -2289,7 +2863,7 @@ mod tests {
     #[test]
     fn drilling_down_from_home_leaves_a_trail() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         st.playlists = vec![playlist("p1", "trendy", "dm")];
 
         assert!(matches!(st.main, MainView::Home));
@@ -2323,7 +2897,7 @@ mod tests {
     #[test]
     fn home_lists_discover_weekly_only_when_you_follow_it() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         assert_eq!(
             st.home_items(),
             vec![HomeItem::LikedSongs, HomeItem::Playlists, HomeItem::Radio]
@@ -2366,7 +2940,7 @@ mod tests {
     #[test]
     fn a_single_click_anywhere_on_a_home_row_opens_it() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         st.playlists = vec![playlist("p1", "trendy", "dm")];
         // What the draw records for two entries at rows 4..6 and 7..9.
         st.hit.home_rows = vec![(Rect::new(1, 4, 90, 2), 0), (Rect::new(1, 7, 90, 2), 1)];
@@ -2384,7 +2958,7 @@ mod tests {
         );
 
         // The gap between two entries belongs to neither.
-        let mut st = AppState::new();
+        let mut st = connected();
         st.hit.home_rows = vec![(Rect::new(1, 4, 90, 2), 0), (Rect::new(1, 7, 90, 2), 1)];
         handle_click(&mut st, Position { x: 3, y: 6 }, &tx);
         assert!(matches!(st.main, MainView::Home));
@@ -2577,7 +3151,7 @@ mod tests {
     #[test]
     fn the_home_radio_row_opens_the_chart() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         st.main_index = st.home_items().len() - 1;
         assert_eq!(st.home_items()[st.main_index], HomeItem::Radio);
 
@@ -2805,7 +3379,7 @@ mod tests {
     #[test]
     fn left_and_right_reach_the_stations_tab() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         st.main = station_search(test_station("a", "Radio Paradise"));
         st.search_tab = SearchTab::Tracks;
 
@@ -2995,6 +3569,57 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AppCommand::VolumeRel(5))));
     }
 
+    /// `V` walks the visualizer modes without leaving the view, and says which
+    /// one it landed on — the field carries no label of its own.
+    #[test]
+    fn shift_v_cycles_the_visualizer() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        state.write().show_player = true;
+
+        let start = state.read().viz.mode;
+        let mut seen = vec![start];
+        for _ in 0..3 {
+            assert!(handle_player_key(
+                KeyEvent::from(KeyCode::Char('V')),
+                &state,
+                &tx
+            ));
+            let st = state.read();
+            assert!(st.show_player, "the key closed the view");
+            let mode = st.viz.mode;
+            assert!(
+                st.toast
+                    .as_ref()
+                    .is_some_and(|(msg, _)| msg.contains(mode.label())),
+                "{mode:?} was not named: {:?}",
+                st.toast
+            );
+            seen.push(mode);
+        }
+        assert_eq!(seen.last(), Some(&start), "the cycle does not come round");
+        let mut distinct = seen[..3].to_vec();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "a mode repeated inside one cycle: {seen:?}"
+        );
+    }
+
+    /// And it is the player view's key alone: on a browse page `V` is free for
+    /// whatever the normal handler makes of it, not a silent no-op on a field
+    /// that is not drawn.
+    #[test]
+    fn shift_v_does_nothing_from_the_browse_screen() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        let before = state.read().viz.mode;
+        handle_normal(KeyEvent::from(KeyCode::Char('V')), &state, &tx);
+        assert_eq!(state.read().viz.mode, before);
+        assert!(state.read().toast.is_none());
+    }
+
     /// Whichever engine owns the device owns the transport. While a station is
     /// on, previous and next mean the station either side of it, and the
     /// client is where that is decided — so the keys go through untouched.
@@ -3033,7 +3658,7 @@ mod tests {
     #[test]
     fn the_prompt_searches_both_catalogues_from_every_page() {
         let (tx, mut rx) = channel();
-        let state = Arc::new(RwLock::new(AppState::new()));
+        let state = Arc::new(RwLock::new(connected()));
 
         // A radio page, where the page's own catalogue is the station
         // directory.
@@ -3056,6 +3681,409 @@ mod tests {
         }
         handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "jazz"));
+    }
+
+    /// Without an account the answer has one tab, so the results open on it.
+    /// Landing on Tracks would put an empty page in front of a search that
+    /// found stations.
+    #[test]
+    fn a_search_without_an_account_opens_on_stations() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        {
+            let mut st = state.write();
+            st.input_mode = InputMode::Search;
+            st.input_buffer = "jazz".into();
+        }
+        handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "jazz"));
+        assert_eq!(state.read().search_tab, SearchTab::Stations);
+    }
+
+    /// Playing, signed in, with two playlists of your own and the box's
+    /// controls where the player would have drawn them.
+    fn adding() -> AppState {
+        let mut st = connected();
+        st.show_player = true;
+        st.me_id = Some("me".into());
+        st.playlists = vec![
+            state::Playlist {
+                id: "p1".into(),
+                name: "Late Night".into(),
+                track_count: 1,
+                owner: "me".into(),
+                owner_id: "me".into(),
+                snapshot_id: "s".into(),
+            },
+            state::Playlist {
+                id: "p2".into(),
+                name: "Someone Else's".into(),
+                track_count: 1,
+                owner: "them".into(),
+                owner_id: "them".into(),
+                snapshot_id: "s".into(),
+            },
+        ];
+        start_playing(&mut st);
+        st.hit.add_btn = Rect::new(70, 0, 5, 1);
+        st
+    }
+
+    /// `adding`, with the box open and every visible row's mark answered for,
+    /// which is the state a pick can actually be made from.
+    fn adding_open(tx: &UnboundedSender<AppCommand>) -> AppState {
+        let mut st = adding();
+        cache_playlists(&mut st, &[]);
+        handle_click(&mut st, Position { x: 72, y: 0 }, tx);
+        st.hit.picker_list = Rect::new(10, 10, 40, 10);
+        st
+    }
+
+    fn push_playlists(st: &mut AppState, count: usize) {
+        for i in 0..count {
+            st.playlists.push(state::Playlist {
+                id: format!("x{i}"),
+                name: format!("Playlist {i}"),
+                track_count: 1,
+                owner: "me".into(),
+                owner_id: "me".into(),
+                snapshot_id: "s".into(),
+            });
+        }
+    }
+
+    /// Walk every playlist in `st`, with `holding` the ids of the ones the
+    /// playing record is on — the state the prefetch leaves behind.
+    fn cache_playlists(st: &mut AppState, holding: &[&str]) {
+        let uri = st
+            .deck_track()
+            .map(|t| t.uri.clone())
+            .unwrap_or_else(|| "spotify:track:Uprising".into());
+        let track = state::track_id(&uri).to_string();
+        let ids: Vec<String> = st.playlists.iter().map(|p| p.id.clone()).collect();
+        for id in ids {
+            let on = holding.contains(&id.as_str());
+            st.playlist_tracks.insert(
+                id,
+                state::PlaylistContents {
+                    snapshot_id: "s".into(),
+                    track_ids: on.then(|| track.clone()).into_iter().collect(),
+                },
+            );
+        }
+    }
+
+    /// The control opens the box for whatever the deck is about, and the box
+    /// holds on to that record: the deck can move on while it is open.
+    #[test]
+    fn the_add_control_opens_the_box_for_the_playing_record() {
+        let (tx, _rx) = channel();
+        let mut st = adding();
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        let picker = st.picker.as_ref().expect("no box opened");
+        assert_eq!(picker.uri, "spotify:track:Uprising");
+        assert!(picker.query.is_empty());
+    }
+
+    /// Opening the box asks for the contents of the rows it is showing, and
+    /// of those only — a walk costs a request per hundred tracks.
+    #[test]
+    fn opening_the_box_asks_for_the_rows_it_shows() {
+        let (tx, mut rx) = channel();
+        let mut st = adding();
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::CachePlaylistTracks { playlist_ids }) => {
+                assert_eq!(playlist_ids, vec!["p1".to_string()], "a followed playlist");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The prefetch has normally answered for everything by the time the box
+    /// opens, and a box that already knows asks for nothing.
+    #[test]
+    fn a_box_over_cached_playlists_asks_for_nothing() {
+        let (tx, mut rx) = channel();
+        let st = adding_open(&tx);
+        assert!(st.picker.is_some());
+        assert!(
+            !matches!(rx.try_recv(), Ok(AppCommand::CachePlaylistTracks { .. })),
+            "it walked a playlist it already held"
+        );
+    }
+
+    /// The playlists the record is already on open at the top, and checking a
+    /// row leaves it where it is — a list that re-sorts under the pointer is
+    /// worse than one that waits until next time.
+    #[test]
+    fn the_box_opens_on_playlist_rows_first_and_holds_that_order() {
+        let (tx, _rx) = channel();
+        let mut st = adding();
+        st.playlists.push(state::Playlist {
+            id: "p3".into(),
+            name: "Morning".into(),
+            track_count: 1,
+            owner: "me".into(),
+            owner_id: "me".into(),
+            snapshot_id: "s".into(),
+        });
+        cache_playlists(&mut st, &["p3"]);
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        st.hit.picker_list = Rect::new(10, 10, 40, 10);
+        assert_eq!(st.picker_rows(), vec![2, 0], "the row it is on is not first");
+
+        handle_click(&mut st, Position { x: 20, y: 10 }, &tx);
+        assert_eq!(st.picker_rows(), vec![2, 0], "the row moved under the click");
+    }
+
+    /// One click on a row is the whole gesture: it flips that row, and the box
+    /// stays up so the next playlist is one more click and not another trip
+    /// through the control.
+    #[test]
+    fn a_click_on_a_row_flips_it_and_leaves_the_box_up() {
+        let (tx, mut rx) = channel();
+        let mut st = adding_open(&tx);
+        while rx.try_recv().is_ok() {}
+        handle_click(&mut st, Position { x: 20, y: 10 }, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::SetOnPlaylist {
+                playlist_id,
+                uri,
+                on,
+                ..
+            }) => {
+                assert_eq!(playlist_id, "p1");
+                assert_eq!(uri, "spotify:track:Uprising");
+                assert!(on, "an off row asked to be taken off");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(st.picker.is_some(), "the box closed on a pick");
+        assert!(st.picker.as_ref().unwrap().pending.contains("p1"));
+        // The mark answers the press rather than the round trip; the client
+        // puts it back if the change is refused.
+        assert_eq!(st.picker_has("p1"), Some(true));
+    }
+
+    /// And a row already on the playlist asks to come off it, which is the
+    /// half of the control that makes it a checkbox.
+    #[test]
+    fn a_click_on_a_checked_row_takes_the_record_off() {
+        let (tx, mut rx) = channel();
+        let mut st = adding();
+        cache_playlists(&mut st, &["p1"]);
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        st.hit.picker_list = Rect::new(10, 10, 40, 10);
+        while rx.try_recv().is_ok() {}
+        handle_click(&mut st, Position { x: 20, y: 10 }, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::SetOnPlaylist { on, .. }) => assert!(!on),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(st.picker_has("p1"), Some(false));
+    }
+
+    /// A second press on a row already mid-change would put the record on
+    /// twice.
+    #[test]
+    fn a_second_press_while_one_is_in_flight_does_nothing() {
+        let (tx, mut rx) = channel();
+        let mut st = adding_open(&tx);
+        while rx.try_recv().is_ok() {}
+        st.picker.as_mut().unwrap().pending.insert("p1".into());
+        toggle_picker_row(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The flip goes into the cached contents, which is where the mark is
+    /// read from — so one walk of a playlist answers for every record, and a
+    /// change made here is a change every record sees.
+    #[test]
+    fn a_toggle_flips_the_id_in_the_cached_contents() {
+        let (tx, _rx) = channel();
+        let mut st = adding_open(&tx);
+        let id = state::track_id("spotify:track:Uprising").to_string();
+        assert!(!st.playlist_tracks["p1"].track_ids.contains(&id));
+        toggle_picker_row(&mut st, &tx);
+        assert!(st.playlist_tracks["p1"].track_ids.contains(&id));
+        // The client rolls a refusal back the same way, over the same set.
+        st.picker.as_mut().unwrap().pending.clear();
+        toggle_picker_row(&mut st, &tx);
+        assert!(!st.playlist_tracks["p1"].track_ids.contains(&id));
+    }
+
+    /// A row whose mark is not known yet is inert: reading `·` as "not on it"
+    /// and adding would leave a duplicate on a real playlist.
+    #[test]
+    fn a_row_that_has_not_answered_yet_cannot_be_flipped() {
+        let (tx, mut rx) = channel();
+        let mut st = adding();
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        while rx.try_recv().is_ok() {}
+        assert_eq!(st.picker_has("p1"), None);
+        toggle_picker_row(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+        assert!(st.picker.as_ref().unwrap().pending.is_empty());
+    }
+
+    /// Clicking off closes the box — and does not go on to work whatever it
+    /// was covering, which the help box's own dismiss deliberately does.
+    #[test]
+    fn a_click_off_the_box_closes_it_and_nothing_else() {
+        let (tx, mut rx) = channel();
+        let mut st = adding_open(&tx);
+        while rx.try_recv().is_ok() {}
+        st.hit.play_btn = Rect::new(0, 20, 3, 1);
+        handle_click(&mut st, Position { x: 1, y: 20 }, &tx);
+        assert!(st.picker.is_none());
+        assert!(rx.try_recv().is_err(), "the click reached the transport");
+    }
+
+    /// The field keeps the box open: a click that missed the caret and closed
+    /// it would take the query with it.
+    #[test]
+    fn a_click_in_the_field_keeps_the_box_open() {
+        let (tx, _rx) = channel();
+        let mut st = adding();
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        st.hit.picker_field = Rect::new(10, 9, 40, 1);
+        handle_click(&mut st, Position { x: 20, y: 9 }, &tx);
+        assert!(st.picker.is_some());
+    }
+
+    /// While the box is up it owns the keyboard: a letter is a letter, and
+    /// the keys it would otherwise be do not reach the app behind it.
+    #[test]
+    fn the_box_swallows_the_keys_the_app_would_read() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(adding()));
+        {
+            let mut st = state.write();
+            handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        }
+        for c in ['q', '?', 'l'] {
+            handle_event(Event::Key(KeyEvent::from(KeyCode::Char(c))), &state, &tx);
+        }
+        let st = state.read();
+        assert!(!st.should_quit && !st.show_help);
+        assert_eq!(st.picker.as_ref().unwrap().query, "q?l");
+    }
+
+    /// Esc closes it, as it closes every other overlay.
+    #[test]
+    fn esc_closes_the_box() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(adding()));
+        {
+            let mut st = state.write();
+            handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        }
+        handle_event(Event::Key(KeyEvent::from(KeyCode::Esc)), &state, &tx);
+        assert!(state.read().picker.is_none());
+        assert!(state.read().show_player, "and it left the view alone");
+    }
+
+    /// The arrows walk the rows the box is showing, and stop at its ends.
+    #[test]
+    fn the_arrows_walk_the_rows() {
+        let (tx, _rx) = channel();
+        // One playlist of your own, so there is nowhere to walk to.
+        let state = Arc::new(RwLock::new(adding()));
+        {
+            let mut st = state.write();
+            handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        }
+        let down = |state: &Arc<RwLock<AppState>>| {
+            handle_event(Event::Key(KeyEvent::from(KeyCode::Down)), state, &tx)
+        };
+        down(&state);
+        assert_eq!(state.read().picker.as_ref().unwrap().selected, 0);
+
+        let mut two = adding();
+        two.playlists.push(state::Playlist {
+            id: "p3".into(),
+            name: "Lunch".into(),
+            track_count: 1,
+            owner: "me".into(),
+            owner_id: "me".into(),
+            snapshot_id: "s".into(),
+        });
+        let state = Arc::new(RwLock::new(two));
+        {
+            let mut st = state.write();
+            handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        }
+        down(&state);
+        assert_eq!(state.read().picker.as_ref().unwrap().selected, 1);
+        handle_event(Event::Key(KeyEvent::from(KeyCode::Up)), &state, &tx);
+        assert_eq!(state.read().picker.as_ref().unwrap().selected, 0);
+    }
+
+    /// The box covers the view, so the wheel is its own wherever it is turned
+    /// — and it stops at the ends of the list rather than running past them.
+    #[test]
+    fn the_wheel_walks_the_box_and_not_the_view_behind_it() {
+        let (tx, _rx) = channel();
+        let mut st = adding();
+        push_playlists(&mut st, PICKER_ROWS + 4);
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        let before = st.main_list.offset();
+        handle_scroll(&mut st, Position { x: 0, y: 0 }, 1, &tx);
+        assert_eq!(st.picker.as_ref().unwrap().offset, SCROLL_LINES as usize);
+        assert_eq!(st.main_list.offset(), before, "the view behind it moved");
+
+        // Rows own: the one from `adding` plus the ones just pushed.
+        let rows = st.picker_rows().len();
+        for _ in 0..10 {
+            handle_scroll(&mut st, Position { x: 0, y: 0 }, 1, &tx);
+        }
+        assert_eq!(st.picker.as_ref().unwrap().offset, rows - PICKER_ROWS);
+        for _ in 0..10 {
+            handle_scroll(&mut st, Position { x: 0, y: 0 }, -1, &tx);
+        }
+        assert_eq!(st.picker.as_ref().unwrap().offset, 0);
+    }
+
+    /// Scrolling brings rows into view whose marks nothing has answered for,
+    /// so the window that moved is the window that gets asked about.
+    #[test]
+    fn scrolling_asks_about_the_rows_it_brings_into_view() {
+        let (tx, mut rx) = channel();
+        let mut st = adding();
+        push_playlists(&mut st, PICKER_ROWS + 4);
+        handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+        while rx.try_recv().is_ok() {}
+        handle_scroll(&mut st, Position { x: 0, y: 0 }, 1, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::CachePlaylistTracks { playlist_ids }) => {
+                assert_eq!(playlist_ids.len(), PICKER_ROWS);
+                assert!(
+                    playlist_ids.contains(&"x11".to_string()),
+                    "{playlist_ids:?}"
+                );
+                assert!(!playlist_ids.contains(&"p1".to_string()), "it scrolled off");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Typing resets the selection: the rows under it have changed, and row 2
+    /// of the old set is not row 2 of the new one.
+    #[test]
+    fn typing_puts_the_selection_back_at_the_top() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(adding()));
+        {
+            let mut st = state.write();
+            handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
+            st.picker.as_mut().unwrap().selected = 1;
+            st.picker.as_mut().unwrap().offset = 1;
+        }
+        handle_event(Event::Key(KeyEvent::from(KeyCode::Char('l'))), &state, &tx);
+        let st = state.read();
+        let picker = st.picker.as_ref().unwrap();
+        assert_eq!((picker.selected, picker.offset), (0, 0));
     }
 
     /// The player draws no prompt (see [`crate::ui::top_row`]), so `/` is
@@ -3246,7 +4274,7 @@ mod tests {
     #[test]
     fn b_and_shift_b_on_a_radio_page_open_the_matched_tracks_pages() {
         let (tx, mut rx) = channel();
-        let mut st = AppState::new();
+        let mut st = connected();
         st.main = radio_page(RadioScope::Popular, Vec::new());
         st.radio = Some(matched_radio());
 
@@ -3261,6 +4289,23 @@ mod tests {
             rx.try_recv(),
             Ok(AppCommand::OpenArtist { ref id, .. }) if id == "r1"
         ));
+    }
+
+    /// The same two keys on an account that cannot stream: a station's record
+    /// is still named, but the pages behind it hold nothing that can be
+    /// played, so the deck says so rather than opening a dead end.
+    #[test]
+    fn b_and_shift_b_say_why_when_spotify_cannot_play() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.spotify = SpotifyState::Limited("no Premium".into());
+        st.main = radio_page(RadioScope::Popular, Vec::new());
+        st.radio = Some(matched_radio());
+
+        open_album_of_selection(&mut st, &tx);
+        open_artist_of_selection(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "no page is opened");
+        assert!(st.toast.is_some(), "and the deck says why");
     }
 
     /// Off radio the fallback must not fire: `b` on a page with no albums on
