@@ -483,6 +483,27 @@ pub struct RadioPlayback {
     /// apart is what lets `Client::resolve_radio_track` ask whether an answer
     /// is still about the announcement it was for.
     pub matched: RadioMatch,
+    /// Why this station is not playing, when it would not play at all.
+    ///
+    /// A station that fails keeps the deck rather than clearing it. The
+    /// controls that reach another station are *on* the deck, so dropping the
+    /// deck on a failure takes away the one thing that gets you out of it.
+    pub failure: Option<String>,
+    /// How many stations a seek has tried to reach this one, or 0 for a
+    /// station you chose yourself.
+    ///
+    /// A station you picked is the one you meant, and a failure is the end of
+    /// it. A station a seek landed on is one of a run, and a failure is a
+    /// reason to keep walking — bounded by this count, because each attempt
+    /// can cost the whole connect timeout.
+    pub seek_attempt: u8,
+    /// Which tune-in this deck is, counted by the client.
+    ///
+    /// A failure comes back over the command channel, so a slow one from a
+    /// tune-in already abandoned can arrive after the deck has moved on. The
+    /// uuid alone does not catch it: retrying a station that failed puts the
+    /// same uuid on the deck the old failure names.
+    pub tune_seq: u64,
 }
 
 impl Track {
@@ -560,7 +581,15 @@ impl RadioPlayback {
             title,
             volume_percent,
             matched: RadioMatch::None,
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
         }
+    }
+
+    /// Whether this station would not play at all.
+    pub fn failed(&self) -> bool {
+        self.failure.is_some()
     }
 
     /// The announced track, if there is one worth drawing.
@@ -971,6 +1000,48 @@ pub fn view_key(view: &MainView) -> Option<ViewKey> {
 
 const VIEW_STACK_MAX: usize = 20;
 
+/// One thing you were listening to, for the radio deck's back and forward
+/// controls.
+///
+/// `Spotify` carries nothing because it does not have to: a station leaves
+/// [`AppState::playback`] and [`AppState::queue`] where they were, so coming
+/// back to Spotify is stopping the stream and letting the player go on.
+#[derive(Debug, Clone)]
+pub enum Listened {
+    Station(Box<Station>),
+    Spotify,
+}
+
+/// How far back the listening history reaches. The view stack keeps its root
+/// frame when it overflows; this one has no root, so the oldest entry goes.
+const LISTEN_STACK_MAX: usize = 20;
+
+impl Listened {
+    /// Whether two entries name the same thing to go back to.
+    fn same(&self, other: &Listened) -> bool {
+        match (self, other) {
+            (Listened::Station(a), Listened::Station(b)) => a.uuid == b.uuid,
+            (Listened::Spotify, Listened::Spotify) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Add an entry to one end of the listening path, capped.
+///
+/// Never the same thing twice running, for the reason `AppState::push_view`
+/// refuses it: a station restarted, or a seek that lands back where it was,
+/// would otherwise put a step in the path that goes nowhere.
+fn push_listen(path: &mut Vec<Listened>, entry: Listened) {
+    if path.last().is_some_and(|last| last.same(&entry)) {
+        return;
+    }
+    if path.len() >= LISTEN_STACK_MAX {
+        path.remove(0);
+    }
+    path.push(entry);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -1168,6 +1239,14 @@ pub struct AppState {
     /// Stations you kept, loaded from disk at startup. The directory has no
     /// accounts, so this list is the whole of "saved".
     pub radio_favorites: Vec<Station>,
+    /// What you were listening to before the current station, oldest first.
+    ///
+    /// Read only while a station is live: the radio deck's `◂◂ previous` walks
+    /// it, and the Spotify deck's own previous still means the queue's last
+    /// track.
+    pub listen_back: Vec<Listened>,
+    /// What `◂◂ previous` stepped out of, nearest last.
+    pub listen_forward: Vec<Listened>,
 
     pub main: MainView,
     /// Back-navigation history (Backspace pops), bottoming out at Home.
@@ -1260,6 +1339,8 @@ impl AppState {
             playback: None,
             radio: None,
             radio_favorites: Vec::new(),
+            listen_back: Vec::new(),
+            listen_forward: Vec::new(),
             playlists: Vec::new(),
             liked: std::collections::HashMap::new(),
             me_id: None,
@@ -1437,6 +1518,48 @@ impl AppState {
             offset: self.main_list.offset(),
             search_tab: self.search_tab,
         });
+    }
+
+    /// What is playing now, as a history entry.
+    ///
+    /// A station wins over Spotify for the reason it wins everywhere else:
+    /// while a station is on, the Spotify snapshot is kept but silent.
+    fn now_listening(&self) -> Option<Listened> {
+        match (&self.radio, &self.playback) {
+            (Some(r), _) => Some(Listened::Station(Box::new(r.station.clone()))),
+            (None, Some(_)) => Some(Listened::Spotify),
+            (None, None) => None,
+        }
+    }
+
+    /// Remember what is playing, because something else is about to.
+    ///
+    /// Closes the path forward, the way opening a page does on the view
+    /// stack: a new destination is not the one `next ▸▸` was holding.
+    pub fn record_listen(&mut self) {
+        let Some(now) = self.now_listening() else {
+            return;
+        };
+        push_listen(&mut self.listen_back, now);
+        self.listen_forward.clear();
+    }
+
+    /// Step back one entry, handing what is playing to the forward path.
+    pub fn step_back_listen(&mut self) -> Option<Listened> {
+        let previous = self.listen_back.pop()?;
+        if let Some(now) = self.now_listening() {
+            push_listen(&mut self.listen_forward, now);
+        }
+        Some(previous)
+    }
+
+    /// Step forward one entry, handing what is playing back to the back path.
+    pub fn step_forward_listen(&mut self) -> Option<Listened> {
+        let next = self.listen_forward.pop()?;
+        if let Some(now) = self.now_listening() {
+            push_listen(&mut self.listen_back, now);
+        }
+        Some(next)
     }
 
     /// Where the current page's back control leads, or `None` when it should
@@ -1905,5 +2028,148 @@ mod tests {
         let got = pb.interpolated_progress_ms(60_000);
         assert!((14_900..=15_500).contains(&got), "{got}");
         assert_eq!(pb.interpolated_progress_ms(7_000), 7_000, "clamped");
+    }
+
+    fn test_station(uuid: &str) -> Station {
+        Station {
+            uuid: uuid.into(),
+            name: uuid.into(),
+            url: format!("http://stream/{uuid}"),
+            homepage: String::new(),
+            tags: String::new(),
+            country: String::new(),
+            countrycode: "US".into(),
+            language: String::new(),
+            codec: "MP3".into(),
+            bitrate: 128,
+            votes: 1,
+            hls: false,
+        }
+    }
+
+    /// Tune a station the way the client does: record what is playing, then
+    /// install the new one.
+    fn tune(st: &mut AppState, uuid: &str) {
+        st.record_listen();
+        st.radio = Some(RadioPlayback::new(
+            test_station(uuid),
+            50,
+            Arc::new(parking_lot::Mutex::new(None)),
+        ));
+    }
+
+    fn name_of(entry: &Listened) -> String {
+        match entry {
+            Listened::Station(s) => s.uuid.clone(),
+            Listened::Spotify => "spotify".into(),
+        }
+    }
+
+    /// Back and forward are one path walked in two directions: a step out and
+    /// back in must land where it started, and the Spotify queue a station
+    /// interrupted is the bottom of it.
+    #[test]
+    fn stepping_back_and_forward_walks_the_same_path() {
+        let mut st = AppState::new();
+        st.playback = Some(Playback::started(50, false));
+        for uuid in ["a", "b", "c"] {
+            tune(&mut st, uuid);
+        }
+
+        for expected in ["b", "a", "spotify"] {
+            let entry = st.step_back_listen().expect("a path back");
+            assert_eq!(name_of(&entry), expected);
+            if let Listened::Station(s) = &entry {
+                st.radio = Some(RadioPlayback::new(
+                    (**s).clone(),
+                    50,
+                    Arc::new(parking_lot::Mutex::new(None)),
+                ));
+            } else {
+                st.radio = None;
+            }
+        }
+        assert!(st.step_back_listen().is_none(), "nothing before the queue");
+
+        for expected in ["a", "b", "c"] {
+            let entry = st.step_forward_listen().expect("a path forward");
+            assert_eq!(name_of(&entry), expected);
+            let Listened::Station(s) = &entry else {
+                unreachable!()
+            };
+            st.radio = Some(RadioPlayback::new(
+                (**s).clone(),
+                50,
+                Arc::new(parking_lot::Mutex::new(None)),
+            ));
+        }
+        assert!(st.step_forward_listen().is_none());
+    }
+
+    /// A new destination is not the one `next ▸▸` was holding, so choosing one
+    /// closes the path forward — the same rule `push_view` follows.
+    #[test]
+    fn a_new_station_closes_the_path_forward() {
+        let mut st = AppState::new();
+        st.playback = Some(Playback::started(50, false));
+        tune(&mut st, "a");
+        tune(&mut st, "b");
+        st.step_back_listen();
+        assert_eq!(st.listen_forward.len(), 1);
+
+        tune(&mut st, "c");
+        assert!(st.listen_forward.is_empty());
+    }
+
+    /// A station restarted, or a seek that lands back where it was, must not
+    /// put a step in the path that goes nowhere.
+    #[test]
+    fn the_path_never_records_the_same_thing_twice_running() {
+        let mut st = AppState::new();
+        tune(&mut st, "a");
+        tune(&mut st, "b");
+        st.record_listen();
+        st.record_listen();
+        assert_eq!(st.listen_back.len(), 2);
+    }
+
+    /// The view stack keeps its root frame when it overflows because `Esc`
+    /// needs somewhere to bottom out. This path has no root, so the oldest
+    /// entry is the one that goes.
+    #[test]
+    fn the_path_drops_its_oldest_step_rather_than_growing() {
+        let mut st = AppState::new();
+        for i in 0..LISTEN_STACK_MAX + 5 {
+            tune(&mut st, &format!("s{i}"));
+        }
+        assert_eq!(st.listen_back.len(), LISTEN_STACK_MAX);
+        assert_eq!(name_of(&st.listen_back[0]), "s4");
+    }
+
+    /// Walking back and forth must not grow the path past its cap either.
+    #[test]
+    fn walking_forward_cannot_outgrow_the_cap() {
+        let mut st = AppState::new();
+        for i in 0..LISTEN_STACK_MAX {
+            tune(&mut st, &format!("s{i}"));
+        }
+        for _ in 0..10 {
+            st.step_back_listen();
+        }
+        for _ in 0..10 {
+            st.step_forward_listen();
+        }
+        assert!(st.listen_back.len() <= LISTEN_STACK_MAX);
+    }
+
+    /// A tune-in that never came up clears the station but leaves the path
+    /// alone, so previous still reaches the one you were listening to.
+    #[test]
+    fn a_failed_tune_in_leaves_the_station_you_came_from_reachable() {
+        let mut st = AppState::new();
+        tune(&mut st, "a");
+        tune(&mut st, "b");
+        st.radio = None;
+        assert_eq!(name_of(&st.step_back_listen().expect("a path back")), "a");
     }
 }

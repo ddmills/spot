@@ -144,6 +144,20 @@ because the directory has no accounts to keep them in. Playing a station reports
 back to the directory — that is the only ranking signal the chart has, and spot reads that
 chart on every screen of this feature.
 
+The deck's `◂◂ previous` and `next ▸▸` walk what you have listened to. Previous steps back
+a station at a time, and past the first station it returns to the Spotify queue that
+station interrupted, where it was paused; next walks the same path forward again. Once
+there is nothing left to go forward to, the right-hand control reads `seek ▸▸` and moves
+down the playing station's own country instead, in the directory's chart order. `n` and
+`p` do the same from the keyboard. Either way the station you are leaving goes quiet on
+the press, not when the next one has finished connecting.
+
+Plenty of stations in a directory of ten thousand no longer answer. One that will not play
+stays named on the deck reading `OFF AIR` with the reason beside it, so the controls out of
+it are still there and `▶ play` tries it again; a station that connects and then stops
+sending is caught the same way. A seek that lands on a dead station walks on to the next
+one in the country rather than stopping there, giving up after three.
+
 Radio and Spotify never play at once: starting a station pauses Spotify, and starting a
 Spotify track stops the station. The bottom bar and the player view (`v`) both switch to
 the station, and the spectrum analyzer keeps working, because both engines feed the same
@@ -182,7 +196,7 @@ is a worse answer than a row that says why it won't play.
 | Key | Action |
 | --- | --- |
 | `Space` | play / pause |
-| `n / p` | next / previous track |
+| `n / p` | next / previous track or station |
 | `h / l` | seek -5s / +5s |
 | `- / =` | volume down / up |
 | `s` | toggle shuffle |

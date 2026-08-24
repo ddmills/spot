@@ -136,9 +136,29 @@ pub enum AppCommand {
     },
     /// Start a station. Stops Spotify first: the two engines share one output
     /// device and only one of them may own it.
-    PlayStation(Box<Station>),
+    ///
+    /// `attempt` counts the stations a seek has walked to reach this one, and
+    /// is 0 for a station chosen directly. A station you picked is the one you
+    /// meant and a failure is the end of it; a station a seek landed on is one
+    /// of a run, and a failure is a reason to keep walking.
+    PlayStation {
+        station: Box<Station>,
+        attempt: u8,
+    },
     /// Stop the stream and release the device.
     StopRadio,
+    /// A station that would not play, or one that stopped sending.
+    ///
+    /// Reported rather than acted on: the tune-in runs on a task of its own,
+    /// off the command loop, and whether a dead station is the end of the road
+    /// or one step of a seek is the loop's question. `tune_seq` says which
+    /// tune-in this is about — a failure can arrive after the deck has moved
+    /// on, and a retry puts the same station's uuid back on the deck.
+    RadioFailed {
+        station: Box<Station>,
+        reason: String,
+        tune_seq: u64,
+    },
     /// `L` on a station row: keep it, or stop keeping it.
     ToggleSavedStation(Box<Station>),
 

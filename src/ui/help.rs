@@ -13,7 +13,7 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
         "Playback",
         &[
             ("Space", "play / pause"),
-            ("n / p", "next / previous track"),
+            ("n / p", "next / previous track or station"),
             ("h / l", "seek -5s / +5s"),
             ("- / =", "volume down / up"),
             ("s", "toggle shuffle"),
@@ -59,6 +59,7 @@ const MOUSE_HINTS: &[&str] = &[
     "on a radio or artist page, click a tab to change what it lists",
     "click an artist or album name to open its page",
     "on a station, spot looks the announced track up on Spotify",
+    "on a station, ◂◂ and ▸▸ walk what you have listened to",
     "on an album card: the name opens it, ▶ play starts it, shuffle mixes it",
     "click a step of the path, beside the mark in either view, to go there",
     "opening a page already on the path walks back to it",

@@ -672,6 +672,9 @@ mod tests {
             ))),
             volume_percent: 40,
             matched: Default::default(),
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
         });
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
@@ -725,7 +728,19 @@ mod tests {
             ))),
             volume_percent: 40,
             matched: Default::default(),
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
         });
+        st.listen_back.push(crate::app::state::Listened::Spotify);
+        for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+
+        println!("\n--- and the same station, off air ---\n");
+        let r = st.radio.as_mut().unwrap();
+        r.is_playing = false;
+        r.failure = Some("could not reach the station: operation timed out".into());
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
         }

@@ -459,17 +459,16 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
             }
         }
 
-        // Transport. Play/pause and volume mean the same thing to either
-        // engine and are routed by the client; the four below have no meaning
-        // for a live broadcast, so they say so rather than reaching Spirc and
-        // quietly starting Spotify underneath the stream.
+        // Transport. Play/pause, volume and skip mean something to either
+        // engine and are routed by the client — on a station the last of those
+        // is the station either side of this one. Shuffle and seek have no
+        // meaning for a live broadcast, so they say so rather than reaching
+        // Spirc and quietly starting Spotify underneath the stream.
         KeyCode::Char(' ') => drop(tx.send(AppCommand::PlayPause)),
-        KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('s')
-            if state.read().radio.is_some() =>
-        {
+        KeyCode::Char('s') if state.read().radio.is_some() => {
             state
                 .write()
-                .toast("radio is live — there is no track to skip");
+                .toast("radio is live — there is no queue to shuffle");
         }
         KeyCode::Char('h') | KeyCode::Char('l') if state.read().radio.is_some() => {
             state
@@ -1169,10 +1168,14 @@ fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCom
     // stop radio without starting something else. It needs no key of its own:
     // pressing play on the thing that is playing is the same gesture as
     // pressing pause, and this is the row that says which station that is.
+    //
+    // Unless it is not playing at all. A station that would not come up stays
+    // on the deck saying so, and Enter on its row is the same ask as `▶ play`
+    // over it: try again. Stopping what never started says nothing.
     if st
         .radio
         .as_ref()
-        .is_some_and(|r| r.station.uuid == station.uuid)
+        .is_some_and(|r| r.station.uuid == station.uuid && !r.failed())
     {
         st.toast(format!("stopped {}", station.name));
         let _ = tx.send(AppCommand::StopRadio);
@@ -1183,7 +1186,10 @@ fn play_station(st: &mut AppState, station: Station, tx: &UnboundedSender<AppCom
         return;
     }
     st.toast(format!("tuning in to {}…", station.name));
-    let _ = tx.send(AppCommand::PlayStation(Box::new(station)));
+    let _ = tx.send(AppCommand::PlayStation {
+        station: Box::new(station),
+        attempt: 0,
+    });
 }
 
 fn play_current_view(st: &mut AppState, tx: &UnboundedSender<AppCommand>, shuffle: bool) {
@@ -2559,6 +2565,9 @@ mod tests {
             title: Arc::new(parking_lot::Mutex::new(None)),
             volume_percent: 50,
             matched: Default::default(),
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
         }
     }
 
@@ -2613,7 +2622,7 @@ mod tests {
         activate_selection(&mut st, &tx);
         assert!(matches!(
             rx.try_recv(),
-            Ok(AppCommand::PlayStation(s)) if s.uuid == "a"
+            Ok(AppCommand::PlayStation { station: s, .. }) if s.uuid == "a"
         ));
     }
 
@@ -2719,7 +2728,9 @@ mod tests {
         st.main = station_search(test_station("a", "Radio Paradise"));
         st.search_tab = SearchTab::Stations;
         activate_selection(&mut st, &tx);
-        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayStation(s)) if s.uuid == "a"));
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::PlayStation { station: s, .. }) if s.uuid == "a")
+        );
     }
 
     /// …and Enter on the station already playing stops it, as on a radio page.
@@ -2743,7 +2754,9 @@ mod tests {
         st.main = station_search(test_station("a", "Radio Paradise"));
         st.search_tab = SearchTab::Stations;
         play_without_opening(&mut st, &tx);
-        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayStation(s)) if s.uuid == "a"));
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::PlayStation { station: s, .. }) if s.uuid == "a")
+        );
     }
 
     /// The guard that matters: `L` on a station result keeps the *station*.
@@ -2959,12 +2972,12 @@ mod tests {
     /// While a station is live the Spotify-only transport keys must not reach
     /// Spirc: doing so would start Spotify playing underneath the stream.
     #[test]
-    fn skip_and_seek_are_refused_while_radio_is_live() {
+    fn shuffle_and_seek_are_refused_while_radio_is_live() {
         let (tx, mut rx) = channel();
         let state = Arc::new(RwLock::new(AppState::new()));
         state.write().radio = Some(live_radio(test_station("a", "Radio Paradise")));
 
-        for key in ['n', 'p', 's', 'h', 'l'] {
+        for key in ['s', 'h', 'l'] {
             handle_normal(KeyEvent::from(KeyCode::Char(key)), &state, &tx);
             assert!(
                 rx.try_recv().is_err(),
@@ -2980,6 +2993,37 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayPause)));
         handle_normal(KeyEvent::from(KeyCode::Char('=')), &state, &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::VolumeRel(5))));
+    }
+
+    /// Whichever engine owns the device owns the transport. While a station is
+    /// on, previous and next mean the station either side of it, and the
+    /// client is where that is decided — so the keys go through untouched.
+    #[test]
+    fn next_and_previous_reach_the_client_while_radio_is_live() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(AppState::new()));
+        state.write().radio = Some(live_radio(test_station("a", "Radio Paradise")));
+
+        handle_normal(KeyEvent::from(KeyCode::Char('n')), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Next)));
+        handle_normal(KeyEvent::from(KeyCode::Char('p')), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Prev)));
+        assert!(state.read().toast.is_none(), "neither key should say no");
+    }
+
+    /// The deck's two step controls are the same rects the Spotify deck's are,
+    /// so the mouse sends the same two commands from either row.
+    #[test]
+    fn the_radio_step_controls_send_prev_and_next() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.radio = Some(live_radio(test_station("a", "Radio Paradise")));
+        st.hit.prev_btn = Rect::new(0, 20, 11, 1);
+        st.hit.next_btn = Rect::new(53, 20, 7, 1);
+        handle_click(&mut st, Position { x: 2, y: 20 }, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Prev)));
+        handle_click(&mut st, Position { x: 55, y: 20 }, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Next)));
     }
 
     /// The one search box asks both catalogues, from wherever it is pressed. A

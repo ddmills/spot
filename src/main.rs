@@ -134,6 +134,7 @@ async fn run() -> Result<()> {
         mixer,
         Arc::clone(&state),
         rx,
+        tx.clone(),
         audio_tap,
     );
     tokio::spawn(client.run());

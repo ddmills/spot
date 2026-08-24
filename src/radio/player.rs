@@ -123,6 +123,12 @@ enum AudioCmd {
     Pause,
     Resume,
     Stop,
+    /// Silence the stream but keep the device.
+    ///
+    /// What a station change wants. [`AudioCmd::Stop`] closes the output, so
+    /// the station replacing this one pays a device open before its first
+    /// sample, and on a stalled backend the close itself waits.
+    Hush,
     SetVolume(f32),
     /// Close the device and end the thread. The ack is what makes this
     /// synchronous: the sender knows the output is silent when it arrives.
@@ -145,15 +151,18 @@ pub struct RadioPlayer {
     /// Bumped on every play and stop. A connection that completes after its
     /// generation has passed is discarded.
     generation: Arc<AtomicU64>,
-    /// Whether a stream has been handed to the audio thread and not stopped.
+    /// The generation of the stream handed to the audio thread; 0 for none.
     ///
-    /// The engine's own liveness, deliberately not read off
-    /// `AppState.radio`. That field is a UI fact — the event layer clears it on
-    /// the click that starts a track, so the deck stops drawing a station that
-    /// is going away — and for one turn of the command channel it says "no
-    /// station" while this thread is still streaming one. Asking the UI whether
-    /// to stop the audio is what let both engines play at once.
-    live: Arc<AtomicBool>,
+    /// The engine's own liveness, deliberately not read off `AppState.radio`.
+    /// That field is a UI fact and this is an audio one, and asking the UI
+    /// whether to stop the audio is what let both engines play at once.
+    ///
+    /// A generation rather than a flag so the mark cannot outlive its own
+    /// station: a stop landing between the hand-off's last check and this
+    /// store used to leave a `true` behind with nothing playing, and every
+    /// transport key then routed to a station that was not there. Written
+    /// stale, it now simply reads as stale. See [`Self::is_live`].
+    live: Arc<AtomicU64>,
     /// Whether the user has asked for silence, shared with the audio thread.
     ///
     /// A station takes seconds to connect, and the pause key works throughout
@@ -163,6 +172,17 @@ pub struct RadioPlayer {
     /// Without it, pausing a station that is still connecting was ignored and
     /// the station started playing under a deck that said it was paused.
     paused: Arc<AtomicBool>,
+    /// The generation of the last stream whose decoder ran dry.
+    ///
+    /// A broadcast has no length to reach, so nothing else in the app sees one
+    /// end: the server closes, the decoder returns `None`, the sink drains to
+    /// silence, and the deck goes on saying the station is on. This is the one
+    /// place that notices — written by the source itself, on the audio
+    /// callback thread, which is why it is an atomic and not a message.
+    ///
+    /// A generation rather than a flag so an old stream running out cannot
+    /// condemn the station that replaced it. See [`Self::stream_ended`].
+    ended: Arc<AtomicU64>,
 }
 
 impl RadioPlayer {
@@ -188,18 +208,21 @@ impl RadioPlayer {
             title: Arc::new(Mutex::new(None)),
             tap,
             generation,
-            live: Arc::new(AtomicBool::new(false)),
+            live: Arc::new(AtomicU64::new(0)),
             paused,
+            ended: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Whether this thread is streaming a station.
     ///
     /// True from the moment a connected stream is handed to the audio thread
-    /// until [`Self::stop`]. See [`Self::live`] for why the caller must ask
-    /// here rather than looking at `AppState.radio`.
+    /// until [`Self::stop`] or [`Self::hush`]. See [`Self::live`] for why the
+    /// caller must ask here rather than looking at `AppState.radio`, and why
+    /// the answer is a generation comparison rather than a flag.
     pub fn is_live(&self) -> bool {
-        self.live.load(Ordering::SeqCst)
+        let live = self.live.load(Ordering::SeqCst);
+        live != 0 && live == self.generation.load(Ordering::SeqCst)
     }
 
     /// The shared now-playing slot. Cloned into `AppState` so the deck can read
@@ -242,7 +265,9 @@ impl RadioPlayer {
         // station it stops only when [`READ_TIMEOUT`] fires; a blocking-pool
         // thread can wait that out, the audio thread cannot.
         let tap = Arc::clone(&self.tap);
-        let source = tokio::task::spawn_blocking(move || decode(reader, tap))
+        let ended = Arc::clone(&self.ended);
+        let stamp = Arc::clone(&self.generation);
+        let source = tokio::task::spawn_blocking(move || decode(reader, tap, ended, stamp))
             .await
             .context("the radio decoder thread panicked")??;
         if self.generation.load(Ordering::SeqCst) != generation {
@@ -250,8 +275,11 @@ impl RadioPlayer {
         }
 
         // Marked live with the hand-off, not with the request: until the
-        // source reaches the thread there is nothing playing to stop.
-        self.live.store(true, Ordering::SeqCst);
+        // source reaches the thread there is nothing playing to stop. Marked
+        // with this station's own generation, so a stop landing between the
+        // check above and this store writes a mark that is already stale —
+        // which is what `is_live` reads it as.
+        self.live.store(generation, Ordering::SeqCst);
         self.send(AudioCmd::Play {
             source: Box::new(source),
             generation,
@@ -332,9 +360,46 @@ impl RadioPlayer {
     /// never reaches the sink.
     pub fn stop(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.live.store(false, Ordering::SeqCst);
+        self.live.store(0, Ordering::SeqCst);
         *self.title.lock() = None;
         self.send(AudioCmd::Stop);
+    }
+
+    /// Silence the stream at once, keeping the device open.
+    ///
+    /// What a station change asks for. Connecting the next station takes
+    /// seconds — a directory address, a stream to reach, five seconds of
+    /// prefetch — and without this the station being left goes on playing
+    /// through all of them, under a deck that has already moved on.
+    ///
+    /// [`Self::stop`] would do it, but it also closes the output: the station
+    /// arriving would pay a device open before its first sample, and closing
+    /// waits on the audio backend, which a station whose reads have stalled
+    /// can hold. Bumps the generation like `stop`, so a connect still in
+    /// flight never reaches the sink either.
+    pub fn hush(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.live.store(0, Ordering::SeqCst);
+        *self.title.lock() = None;
+        self.paused.store(false, Ordering::SeqCst);
+        // Here as well as on the audio thread: the tap is what the header
+        // reads to tell a station that is playing from one that is still
+        // arriving, and clearing it on the caller's thread is what flips the
+        // corner to `LOADING` on the keypress rather than a second later.
+        self.tap.clear();
+        self.send(AudioCmd::Hush);
+    }
+
+    /// Whether the stream that is playing has run out.
+    ///
+    /// The station is still live as far as the engine is concerned — the
+    /// device is open and the sink is connected — but the source behind it has
+    /// nothing left to give, so what is coming out is silence. Only true for
+    /// the stream now playing: an older one running out is stamped with its own
+    /// generation and read as the history it is.
+    pub fn stream_ended(&self) -> bool {
+        let generation = self.generation.load(Ordering::SeqCst);
+        generation != 0 && self.ended.load(Ordering::SeqCst) == generation
     }
 
     pub fn set_volume(&self, percent: u8) {
@@ -351,7 +416,7 @@ impl RadioPlayer {
     /// goes away.
     pub fn shutdown(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.live.store(false, Ordering::SeqCst);
+        self.live.store(0, Ordering::SeqCst);
         *self.title.lock() = None;
         let (ack_tx, ack_rx) = channel();
         self.send(AudioCmd::Shutdown(ack_tx));
@@ -451,6 +516,15 @@ fn audio_thread(
                 silence(&mut out);
                 tap.clear();
             }
+            // Replaced rather than cleared, for the reason `start` replaces it:
+            // `Sink::clear` waits for the source it discards to end, and a
+            // station whose reads have stalled is never polled again.
+            AudioCmd::Hush => {
+                if let Some((stream, sink)) = out.as_mut() {
+                    *sink = Sink::connect_new(stream.mixer());
+                }
+                tap.clear();
+            }
             AudioCmd::SetVolume(v) => {
                 if let Some((_, sink)) = &out {
                     sink.set_volume(v);
@@ -473,7 +547,12 @@ fn audio_thread(
 /// Blocking, and unbounded but for [`READ_TIMEOUT`]: identifying the codec
 /// means reading the first frames, and how long that takes is the station's
 /// business. Runs on a blocking-pool thread — never on the audio thread.
-fn decode(reader: RadioReader, tap: Arc<AudioTap>) -> Result<RadioSource> {
+fn decode(
+    reader: RadioReader,
+    tap: Arc<AudioTap>,
+    ended: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+) -> Result<RadioSource> {
     let decoder = rodio::Decoder::builder()
         .with_data(reader)
         // A broadcast has no beginning to seek back to. Saying so stops
@@ -481,7 +560,7 @@ fn decode(reader: RadioReader, tap: Arc<AudioTap>) -> Result<RadioSource> {
         .with_seekable(false)
         .build()
         .context("could not decode the station's audio")?;
-    Ok(TapSource::new(decoder, tap))
+    Ok(TapSource::new(decoder, tap, ended, generation))
 }
 
 /// Silence the output and release the device.
@@ -553,16 +632,36 @@ struct TapSource<S> {
     /// Cached from `inner`: a mono station has to have each sample written
     /// twice, because the tap reads its input in stereo pairs.
     mono: bool,
+    /// Where the end of the broadcast is recorded. See [`RadioPlayer::ended`].
+    ended: Arc<AtomicU64>,
+    /// The engine's current generation, and the one this source was built for.
+    ///
+    /// Read on the audio callback thread so a source the user has moved on
+    /// from ends itself at the next poll. The sink is replaced on a hush,
+    /// which is what silences it, but the source is only *collected* when the
+    /// mixer next asks it for a sample — and asking means another read on a
+    /// station that may have stalled. Ending first is how it never asks.
+    generation: Arc<AtomicU64>,
+    stamp: u64,
 }
 
 impl<S: Source> TapSource<S> {
-    fn new(inner: S, tap: Arc<AudioTap>) -> Self {
+    fn new(
+        inner: S,
+        tap: Arc<AudioTap>,
+        ended: Arc<AtomicU64>,
+        generation: Arc<AtomicU64>,
+    ) -> Self {
         let mono = inner.channels() == 1;
+        let stamp = generation.load(Ordering::SeqCst);
         Self {
             inner,
             tap,
             buf: Vec::with_capacity(TAP_FLUSH),
             mono,
+            ended,
+            generation,
+            stamp,
         }
     }
 
@@ -577,7 +676,21 @@ impl<S: Source> Iterator for TapSource<S> {
     type Item = rodio::Sample;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let sample = self.inner.next()?;
+        // The user has moved on. Ending here rather than being asked for one
+        // more sample is what keeps a stalled station from taking another
+        // fifteen-second read with the mixer waiting on it.
+        if self.stamp != self.generation.load(Ordering::SeqCst) {
+            return None;
+        }
+        let Some(sample) = self.inner.next() else {
+            // The server closed, or a read timed out and ended the download.
+            // A broadcast has no length to reach, so nothing else in the app
+            // sees one end — the sink simply drains to silence under a deck
+            // that goes on saying the station is on. This is where it is
+            // recorded, stamped with the stream it belongs to.
+            self.ended.store(self.stamp, Ordering::SeqCst);
+            return None;
+        };
         self.buf.push(f64::from(sample));
         if self.mono {
             self.buf.push(f64::from(sample));
@@ -629,11 +742,62 @@ mod tests {
 
         // Stand in for a connected stream reaching the audio thread; `play`
         // itself needs a network and a device.
-        player.live.store(true, Ordering::SeqCst);
+        hand_off(&player);
         assert!(player.is_live());
 
         player.stop();
         assert!(!player.is_live(), "stop is what ends it");
+    }
+
+    /// The mark is the generation it was made for, so a stop that lands after
+    /// the hand-off's last check cannot leave the engine claiming a station
+    /// the audio thread has already dropped — every transport key routed to
+    /// that station, and nothing could stop it.
+    #[test]
+    fn a_stop_racing_the_handoff_leaves_no_station_behind() {
+        let player = RadioPlayer::new(Arc::new(AudioTap::new()));
+        let generation = player.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        player.stop();
+        player.live.store(generation, Ordering::SeqCst);
+        assert!(!player.is_live());
+    }
+
+    /// A station change silences the stream and keeps the device: the next
+    /// station pays no reopen, and nothing waits on a backend a stalled
+    /// station can hold.
+    #[test]
+    fn a_hush_ends_the_stream_without_ending_the_session() {
+        let player = RadioPlayer::new(Arc::new(AudioTap::new()));
+        hand_off(&player);
+        *player.title.lock() = Some("Aspen — Seasick".into());
+        player.pause();
+
+        player.hush();
+        assert!(!player.is_live());
+        assert!(
+            player.title.lock().is_none(),
+            "the last title is not this one"
+        );
+        assert!(
+            !player.paused.load(Ordering::SeqCst),
+            "a pause is about a station, and this one is gone"
+        );
+    }
+
+    /// A broadcast has no length to reach, so a decoder running dry is the only
+    /// end there is. It is read against the generation it belongs to: a station
+    /// the user has already left must not condemn the one that replaced it.
+    #[test]
+    fn a_stream_that_runs_dry_is_read_against_its_own_generation() {
+        let player = RadioPlayer::new(Arc::new(AudioTap::new()));
+        let generation = hand_off(&player);
+        assert!(!player.stream_ended(), "nothing has run out");
+
+        player.ended.store(generation, Ordering::SeqCst);
+        assert!(player.stream_ended());
+
+        player.hush();
+        assert!(!player.stream_ended(), "that was the station before this");
     }
 
     /// A station takes seconds to connect, and the pause key works throughout
@@ -699,10 +863,76 @@ mod tests {
         }
     }
 
+    /// A source under test, on a generation nothing moves off.
+    fn tapped(inner: Tone, tap: &Arc<AudioTap>) -> TapSource<Tone> {
+        TapSource::new(
+            inner,
+            Arc::clone(tap),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(1)),
+        )
+    }
+
+    /// Stand in for a connected stream reaching the audio thread, which `play`
+    /// needs a network and a device to do. Returns the generation it took.
+    fn hand_off(player: &RadioPlayer) -> u64 {
+        let generation = player.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        player.live.store(generation, Ordering::SeqCst);
+        generation
+    }
+
+    /// A broadcast has no length to reach, so a server that closes is the only
+    /// end there is — and the source is the one thing that sees it. The stamp
+    /// is what keeps an old stream running dry from condemning the station
+    /// that replaced it.
+    #[test]
+    fn a_stream_that_runs_dry_is_recorded_against_its_own_generation() {
+        let tap = Arc::new(AudioTap::new());
+        let ended = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(7));
+        let mut src = TapSource::new(
+            tone(vec![0.5], 2),
+            Arc::clone(&tap),
+            Arc::clone(&ended),
+            Arc::clone(&generation),
+        );
+
+        assert_eq!(src.next(), Some(0.5));
+        assert_eq!(ended.load(Ordering::SeqCst), 0, "not ended while sending");
+        assert_eq!(src.next(), None);
+        assert_eq!(ended.load(Ordering::SeqCst), 7);
+    }
+
+    /// A source the user has moved off ends at its next poll rather than being
+    /// asked for one more sample. Asking means another read, and a station
+    /// whose reads have stalled would hold the mixer on it for the length of
+    /// the read timeout — with the station that replaced it waiting behind.
+    #[test]
+    fn a_source_the_user_has_left_ends_rather_than_reading_again() {
+        let tap = Arc::new(AudioTap::new());
+        let ended = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(AtomicU64::new(3));
+        let mut src = TapSource::new(
+            tone(vec![0.5; 8], 2),
+            Arc::clone(&tap),
+            Arc::clone(&ended),
+            Arc::clone(&generation),
+        );
+
+        assert_eq!(src.next(), Some(0.5));
+        generation.store(4, Ordering::SeqCst);
+        assert_eq!(src.next(), None);
+        assert_eq!(
+            ended.load(Ordering::SeqCst),
+            0,
+            "a station left behind has not run out; it has been left behind"
+        );
+    }
+
     #[test]
     fn tap_source_passes_samples_through_unchanged() {
         let tap = Arc::new(AudioTap::new());
-        let src = TapSource::new(tone(vec![0.25, -0.25, 1.0, -1.0], 2), Arc::clone(&tap));
+        let src = tapped(tone(vec![0.25, -0.25, 1.0, -1.0], 2), &tap);
         assert_eq!(src.collect::<Vec<_>>(), vec![0.25, -0.25, 1.0, -1.0]);
     }
 
@@ -712,7 +942,7 @@ mod tests {
         // Enough samples to cross the flush threshold; the tap only sees
         // whole flushes.
         let samples: Vec<f32> = (0..TAP_FLUSH).map(|_| 0.5).collect();
-        let mut src = TapSource::new(tone(samples, 2), Arc::clone(&tap));
+        let mut src = tapped(tone(samples, 2), &tap);
         for _ in 0..TAP_FLUSH {
             src.next();
         }
@@ -772,7 +1002,7 @@ mod tests {
     fn tap_source_duplicates_mono_samples() {
         let tap = Arc::new(AudioTap::new());
         let samples: Vec<f32> = (0..TAP_FLUSH / 2).map(|i| i as f32).collect();
-        let mut src = TapSource::new(tone(samples, 1), Arc::clone(&tap));
+        let mut src = tapped(tone(samples, 1), &tap);
         for _ in 0..TAP_FLUSH / 2 {
             src.next();
         }

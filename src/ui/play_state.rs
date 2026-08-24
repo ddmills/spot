@@ -86,6 +86,53 @@ pub fn or_paused(status: Option<Status>) -> PlayState {
     status.map_or(PlayState::Paused, |s| s.state)
 }
 
+/// Where the radio deck's outer transport controls lead.
+///
+/// Computed here for the reason [`status`] is: the bottom bar and the player
+/// view both draw the row, and a control that is offered on one and not the
+/// other is a control that moves when you press `v`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RadioSteps {
+    /// Something was playing before this station.
+    pub back: bool,
+    pub forward: RadioForward,
+}
+
+/// What the right-hand control of the radio transport offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RadioForward {
+    /// Nothing ahead and no country to walk: the control is not drawn.
+    #[default]
+    None,
+    /// A station `◂◂ previous` stepped out of.
+    Next,
+    /// No station stepped out of, so the control moves down the playing
+    /// station's own country instead.
+    Seek,
+}
+
+/// What the radio transport row can offer this frame.
+///
+/// `Seek` needs a country because the directory is asked by ISO code — a
+/// station that names none has nothing to walk through.
+pub fn radio_steps(state: &AppState) -> RadioSteps {
+    let has_country = state
+        .radio
+        .as_ref()
+        .is_some_and(|r| !r.station.countrycode.is_empty());
+    let forward = if !state.listen_forward.is_empty() {
+        RadioForward::Next
+    } else if has_country {
+        RadioForward::Seek
+    } else {
+        RadioForward::None
+    };
+    RadioSteps {
+        back: !state.listen_back.is_empty(),
+        forward,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +154,9 @@ mod tests {
             title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             volume_percent: 50,
             matched: Default::default(),
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
         });
         st.audio_tap.push(&[0.0; 2048], 1.0);
         st
@@ -159,5 +209,48 @@ mod tests {
     #[test]
     fn an_idle_app_reports_nothing() {
         assert!(status(&AppState::new()).is_none());
+    }
+
+    /// `next ▸▸` and `seek ▸▸` are one control with two meanings, and the
+    /// forward path is what decides which: a station stepped out of is a
+    /// station to go back to, and with none the control walks the country.
+    #[test]
+    fn the_right_hand_control_seeks_with_nothing_to_step_forward_to() {
+        let mut st = radio();
+        assert_eq!(radio_steps(&st).forward, RadioForward::Seek);
+        st.listen_forward.push(crate::app::state::Listened::Spotify);
+        assert_eq!(radio_steps(&st).forward, RadioForward::Next);
+    }
+
+    /// The directory is asked by ISO code, so a station that names no country
+    /// has nothing to walk through — the same rule the deck's country link is
+    /// drawn by.
+    #[test]
+    fn a_station_from_nowhere_offers_no_seek() {
+        let mut st = radio();
+        st.radio.as_mut().unwrap().station.countrycode.clear();
+        assert_eq!(radio_steps(&st).forward, RadioForward::None);
+    }
+
+    /// A station that would not play reads as paused, not as loading, so the
+    /// pill offers `▶ play` — which over a failed station means try again. A
+    /// deck with no pill is a deck you cannot retry from.
+    #[test]
+    fn a_failed_station_reads_as_paused_not_loading() {
+        let mut st = radio();
+        st.audio_tap.clear();
+        let r = st.radio.as_mut().unwrap();
+        r.is_playing = false;
+        r.failure = Some("could not reach the station".into());
+        assert_eq!(state_of(&st), PlayState::Paused);
+    }
+
+    /// Back appears only with somewhere to go.
+    #[test]
+    fn the_back_control_waits_for_something_behind_it() {
+        let mut st = radio();
+        assert!(!radio_steps(&st).back);
+        st.listen_back.push(crate::app::state::Listened::Spotify);
+        assert!(radio_steps(&st).back);
     }
 }

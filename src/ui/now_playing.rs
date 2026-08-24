@@ -35,6 +35,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // What the corner of the header is saying, read before the split borrow
     // below so the pill under the progress track can only agree with it.
     let play = play_state::or_paused(play_state::status(state));
+    // Read for the same reason and in the same place: what the radio row can
+    // offer is state the split borrow below gives up.
+    let steps = play_state::radio_steps(state);
 
     // Split borrows: playback/queue/toast/cover are read while hit areas are
     // written.
@@ -88,6 +91,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             like,
             saved,
             play,
+            steps,
             mouse,
             hit,
         );
@@ -220,6 +224,7 @@ fn draw_radio(
     liked: Option<bool>,
     saved: bool,
     play: PlayState,
+    steps: play_state::RadioSteps,
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
 ) {
@@ -238,7 +243,7 @@ fn draw_radio(
     if body.height < 5 {
         return;
     }
-    deck::radio_transport(frame, row_at(body, 4), play, mouse, hit);
+    deck::radio_transport(frame, row_at(body, 4), play, steps, mouse, hit);
 
     if body.height < deck::DECK_H {
         return;

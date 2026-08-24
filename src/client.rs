@@ -8,7 +8,7 @@ use librespot_core::spotify_uri::SpotifyUri;
 use librespot_playback::mixer::Mixer;
 use librespot_playback::player::Player;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::api::{Api, PAGE_LIMIT};
@@ -58,6 +58,22 @@ type TrackCache = HashMap<String, CachedTracks>;
 /// How often the client wakes without a command, for the one job that needs
 /// a clock: matching what a station announces against Spotify.
 const RADIO_TICK: Duration = Duration::from_secs(3);
+
+/// How many stations a seek tries before it gives up.
+///
+/// Kept small because the cost is time, not requests: a station that will not
+/// answer holds the walk for the whole connect timeout, and a run of five
+/// would be over a minute of silence with nothing to look at.
+const SEEK_ATTEMPTS: u8 = 3;
+
+/// How long after a seek landed on a station its dying still counts as part of
+/// that seek.
+///
+/// A station that drops in its first moments is one the walk should carry on
+/// past. One that has been on for half an hour is the thing you chose to
+/// listen to, and jumping you to a stranger is not what the control you last
+/// pressed meant.
+const SEEK_CHAIN_WITHIN: Duration = Duration::from_secs(120);
 const COVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COVER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -78,6 +94,11 @@ pub struct Client {
     mixer: Arc<dyn Mixer>,
     state: Arc<RwLock<AppState>>,
     rx: UnboundedReceiver<AppCommand>,
+    /// The other end of [`Self::rx`], for work that has to leave the command
+    /// loop and come back. The radio seek is the only user: it reads the
+    /// directory, which is a request the loop must not wait on, and what it
+    /// finds is a `PlayStation` like any other.
+    tx: UnboundedSender<AppCommand>,
     /// Completed track fetches by cache key; shared with fetch tasks.
     cache: Arc<Mutex<TrackCache>>,
     /// Shared with cover-fetch tasks, so the connection to Spotify's image
@@ -96,6 +117,13 @@ pub struct Client {
     /// is on. Cleared when the station changes or stops, so the same string
     /// announced by a different station is asked about again.
     radio_probe: Option<String>,
+    /// Which tune-in the deck is on, counted up on every station started.
+    ///
+    /// A tune-in reports its failure over the command channel, so a slow one
+    /// from a station already abandoned can arrive after the deck has moved
+    /// on. The station's uuid does not tell the two apart — a retry puts the
+    /// same uuid back on the deck — so the deck carries this instead.
+    tune_seq: u64,
     /// The radio directory. Shares [`Self::http`], which already carries the
     /// user agent Radio Browser asks for.
     radio_api: RadioApi,
@@ -116,6 +144,7 @@ impl Client {
         mixer: Arc<dyn Mixer>,
         state: Arc<RwLock<AppState>>,
         rx: UnboundedReceiver<AppCommand>,
+        tx: UnboundedSender<AppCommand>,
         audio_tap: Arc<crate::audio_tap::AudioTap>,
     ) -> (Self, oneshot::Receiver<()>) {
         // Returned rather than taken as an argument: the receiver has exactly
@@ -137,6 +166,7 @@ impl Client {
             mixer,
             state,
             rx,
+            tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
             radio_api: RadioApi::new(http.clone()),
             radio_player: RadioPlayer::new(audio_tap),
@@ -144,6 +174,7 @@ impl Client {
             covers: Arc::new(Mutex::new(CoverCache::default())),
             liked_probe: None,
             radio_probe: None,
+            tune_seq: 0,
             shutdown_ack: Some(shutdown_ack),
         };
         (client, shutdown_done)
@@ -173,7 +204,10 @@ impl Client {
                     }
                     None => break,
                 },
-                _ = tick.tick() => self.resolve_radio_track(),
+                _ = tick.tick() => {
+                    self.check_radio_stream();
+                    self.resolve_radio_track();
+                }
             }
         }
     }
@@ -185,6 +219,17 @@ impl Client {
             // checked first everywhere below for that reason: while a station
             // is on, the Spotify player is paused and driving it would start
             // Spotify playing underneath the stream.
+            // A station that would not play has nothing to resume, and
+            // pressing play on something that is not playing plainly means
+            // "try again". Checked before the toggle, or the deck would flip
+            // to claiming it was on.
+            PlayPause if self.state.read().radio.as_ref().is_some_and(|r| r.failed()) => {
+                let Some(station) = self.state.read().radio.as_ref().map(|r| r.station.clone())
+                else {
+                    return Ok(());
+                };
+                self.play_station(station, 0);
+            }
             PlayPause if self.radio_live() => {
                 let toggled = {
                     let mut st = self.state.write();
@@ -232,13 +277,17 @@ impl Client {
                 self.set_radio_volume((i16::from(current) + i16::from(delta)).clamp(0, 100) as u8);
             }
             SetVolume(pct) if self.radio_live() => self.set_radio_volume(pct.min(100)),
-            // A broadcast has no track either side of it and no position to
-            // seek to, so these have nothing to do while a station is on. The
-            // key handler already turns them into a toast, but it is not the
-            // only way in: a mouse click, a media key, or a hit rect left over
-            // from the Spotify deck all arrive here directly.
-            Next | Prev | SeekRel(_) | SeekTo(_) | ToggleShuffle | JumpTo(_) | TrackEnded
+            // A broadcast has no position to seek to and no queue to shuffle,
+            // so these have nothing to do while a station is on. The key
+            // handler already turns them into a toast, but it is not the only
+            // way in: a mouse click, a media key, or a hit rect left over from
+            // the Spotify deck all arrive here directly.
+            SeekRel(_) | SeekTo(_) | ToggleShuffle | JumpTo(_) | TrackEnded
                 if self.radio_live() => {}
+            // Previous and next mean the station either side of this one, not
+            // the track: see [`Self::radio_back`].
+            Prev if self.radio_live() => self.radio_back(),
+            Next if self.radio_live() => self.radio_forward(),
             Next => {
                 if self.advance_queue() {
                     self.load_current();
@@ -411,8 +460,27 @@ impl Client {
                 }
             }
             LoadRadio { scope } => self.load_radio(scope),
-            PlayStation(station) => self.play_station(*station),
+            PlayStation { station, attempt } => {
+                // Before the new station is installed, so what is recorded is
+                // what was actually playing. A tune-in that fails leaves the
+                // entry standing, which is right: it is still the last thing
+                // you heard.
+                //
+                // Only the first station of a seek: the walk past a station
+                // that would not play is not a step you took, and putting the
+                // dead ones in the path would have previous walk back through
+                // silence.
+                if attempt <= 1 {
+                    self.state.write().record_listen();
+                }
+                self.play_station(*station, attempt);
+            }
             StopRadio => self.stop_radio(),
+            RadioFailed {
+                station,
+                reason,
+                tune_seq,
+            } => self.radio_failed(*station, reason, tune_seq),
             ToggleSavedStation(station) => self.toggle_saved_station(*station),
             YieldToRadio => self.yield_to_radio(),
             // Intercepted by `run`, which is the only place that can end the
@@ -890,17 +958,26 @@ impl Client {
     /// and the next station all arrive on that loop, so a slow station makes a
     /// player that answers nothing, and a station that never connects makes a
     /// player that never answers again.
-    fn play_station(&mut self, station: state::Station) {
+    fn play_station(&mut self, station: state::Station, attempt: u8) {
         self.player.pause();
+        // The station being left goes silent on the press, not when the one
+        // replacing it is ready. Connecting takes seconds — a directory
+        // address, a stream to reach, five seconds of prefetch — and hearing
+        // the station you asked to leave through all of them is the deck
+        // reporting one thing and the speakers another. `hush` rather than
+        // `stop`: the device stays open for the station arriving.
+        self.radio_player.hush();
         let volume = self.playback_volume();
+        self.tune_seq += 1;
+        let tune_seq = self.tune_seq;
 
         {
             let mut st = self.state.write();
-            st.radio = Some(state::RadioPlayback::new(
-                station.clone(),
-                volume,
-                self.radio_player.title(),
-            ));
+            let mut playback =
+                state::RadioPlayback::new(station.clone(), volume, self.radio_player.title());
+            playback.seek_attempt = attempt;
+            playback.tune_seq = tune_seq;
+            st.radio = Some(playback);
             // Whatever the last station was announcing is not this station's
             // business. Without this, moving to a station that happens to be
             // playing the same record would find the probe already set and
@@ -918,7 +995,26 @@ impl Client {
         let radio = self.radio_player.clone();
         let api = self.radio_api.clone();
         let state = Arc::clone(&self.state);
+        let tx = self.tx.clone();
         tokio::spawn(async move {
+            // Whether this task still speaks for the deck. Asked afresh at
+            // every step rather than once at the end: the two awaits below are
+            // a network round trip and a whole connect, the deck's previous
+            // and next controls make overlapping tasks ordinary rather than
+            // rare, and a task that no longer speaks for the deck must touch
+            // neither engine — not the radio it would strand, and not the
+            // Spotify a later step may have handed the device back to.
+            let ours = {
+                let state = Arc::clone(&state);
+                move || {
+                    state
+                        .read()
+                        .radio
+                        .as_ref()
+                        .is_some_and(|r| r.tune_seq == tune_seq)
+                }
+            };
+
             // The directory's ranking runs on these, and it also hands back
             // the stream URL it believes in, which is fresher than the one in
             // the row.
@@ -926,6 +1022,9 @@ impl Client {
                 .click(&station.uuid)
                 .await
                 .unwrap_or_else(|| station.url.clone());
+            if !ours() {
+                return;
+            }
 
             // Again, right before the stream starts: a load the player was
             // still working through can start making sound after the pause
@@ -933,25 +1032,20 @@ impl Client {
             // catch it.
             player.pause();
             let outcome = radio.play(&url, volume).await;
-            // Whether this task still speaks for the deck. Clicks overlap
-            // because this runs off the command loop, and an older one must
-            // not clear a newer one's station or stop its stream.
-            let ours = state
-                .read()
-                .radio
-                .as_ref()
-                .is_some_and(|r| r.station.uuid == station.uuid);
+            let ours = ours();
             if let Err(e) = outcome {
                 log::error!("could not play {}: {e:#}", station.name);
+                // Reported rather than acted on. Whether this is the end of
+                // the road or one step of a seek is the command loop's to
+                // decide, and it is also the only place that may write the
+                // deck. The engine is left alone: `hush` above already
+                // silenced it, and this station never reached the thread.
                 if ours {
-                    // An earlier station may still be streaming: this one
-                    // never reached the audio thread, so nothing has replaced
-                    // it. Left alone it plays on under a deck that does not
-                    // draw it, which is a stream with no control over it.
-                    radio.stop();
-                    let mut st = state.write();
-                    st.radio = None;
-                    st.toast(format!("could not play {}: {e}", station.name));
+                    let _ = tx.send(AppCommand::RadioFailed {
+                        station: Box::new(station.clone()),
+                        reason: e.to_string(),
+                        tune_seq,
+                    });
                 }
                 return;
             }
@@ -959,10 +1053,19 @@ impl Client {
             // several seconds connecting and prefetching; anything that
             // started during that window is caught on the far side of it —
             // with `YieldToRadio` behind it as the backstop for anything later
-            // still.
-            player.pause();
+            // still. Only while this task still speaks for the deck: previous
+            // can have handed the device back to Spotify meanwhile, and this
+            // pause would silence it under a bar that says it is playing.
             if ours {
-                state.write().toast(format!("playing {}", station.name));
+                player.pause();
+                let mut st = state.write();
+                if let Some(r) = st.radio.as_mut() {
+                    // The walk that reached this station is over, and nothing
+                    // is failing any more.
+                    r.failure = None;
+                    r.seek_attempt = 0;
+                }
+                st.toast(format!("playing {}", station.name));
             }
         });
     }
@@ -970,6 +1073,256 @@ impl Client {
     fn stop_radio(&self) {
         self.radio_player.stop();
         self.state.write().radio = None;
+    }
+
+    /// The radio deck's `◂◂ previous`: back to the last thing you were
+    /// listening to.
+    ///
+    /// A station has no track before it, but it does have something before
+    /// it — an earlier station, or the Spotify queue it interrupted. The
+    /// history is walked here rather than recorded here: `step_back_listen`
+    /// has already handed what is playing to the forward path, so the tune-in
+    /// below must not record it a second time.
+    fn radio_back(&mut self) {
+        let stepped = self.state.write().step_back_listen();
+        match stepped {
+            Some(state::Listened::Station(s)) => self.play_station(*s, 0),
+            Some(state::Listened::Spotify) => self.resume_spotify(),
+            None => self
+                .state
+                .write()
+                .toast("nothing was playing before this station"),
+        }
+    }
+
+    /// The radio deck's `next ▸▸` / `seek ▸▸`.
+    ///
+    /// Forward through what [`Self::radio_back`] stepped out of while there is
+    /// any; once that path is spent the control is offering the rest of the
+    /// station's own country instead, which is what the row says it is.
+    fn radio_forward(&mut self) {
+        let stepped = self.state.write().step_forward_listen();
+        match stepped {
+            Some(state::Listened::Station(s)) => self.play_station(*s, 0),
+            Some(state::Listened::Spotify) => self.resume_spotify(),
+            None => self.seek_station(1),
+        }
+    }
+
+    /// Hand the output device back to Spotify, where the station left it.
+    ///
+    /// Starting a station pauses librespot rather than stopping it and keeps
+    /// the queue, so there is nothing to reload: stopping the stream and
+    /// letting the player go on puts the track back where it was. The anchor
+    /// is reset because the paused snapshot is now the position again — a
+    /// station may have been on for an hour.
+    fn resume_spotify(&mut self) {
+        self.stop_radio();
+        let resumed = {
+            let mut st = self.state.write();
+            match st.playback.as_mut() {
+                Some(pb) => {
+                    pb.anchor(pb.progress_ms);
+                    pb.is_playing = true;
+                    st.queue
+                        .as_ref()
+                        .and_then(|q| q.current())
+                        .map(|t| t.name.clone())
+                }
+                None => None,
+            }
+        };
+        match resumed {
+            Some(name) => {
+                self.player.play();
+                self.state.write().toast(format!("back to {name}"));
+            }
+            None => self
+                .state
+                .write()
+                .toast("nothing was playing before this station"),
+        }
+    }
+
+    /// Move down the playing station's country, in the directory's own order.
+    ///
+    /// The country page is asked for rather than read from anywhere: nothing
+    /// caches stations, and the station may have been reached from the chart,
+    /// a genre, the saved list or a search, none of which is its country. The
+    /// request is made off the command loop for the reason
+    /// [`Self::play_station`] connects off it — the loop has to stay free to
+    /// pause and stop — and what it finds comes back as an ordinary
+    /// `PlayStation`, so a seek records history like any other new
+    /// destination.
+    fn seek_station(&mut self, attempt: u8) {
+        let Some((station, code)) = self
+            .state
+            .read()
+            .radio
+            .as_ref()
+            .map(|r| (r.station.clone(), r.station.countrycode.clone()))
+        else {
+            return;
+        };
+        // Nothing to walk through, and nothing wrong with what is playing:
+        // this is a control that leads nowhere, not a station that failed. The
+        // row does not draw it in this case, but the `n` key reaches here
+        // whether it is drawn or not.
+        if code.is_empty() {
+            self.state
+                .write()
+                .toast(format!("{} names no country to seek through", station.name));
+            return;
+        }
+        // Silent from the press, not from the answer. The directory takes as
+        // long as it takes, and going on hearing the station being seeked away
+        // from is what makes the control feel like it did nothing.
+        self.radio_player.hush();
+        self.tune_seq += 1;
+        let tune_seq = self.tune_seq;
+        if let Some(r) = self.state.write().radio.as_mut() {
+            r.tune_seq = tune_seq;
+        }
+
+        let api = self.radio_api.clone();
+        let state = Arc::clone(&self.state);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            // Every exit below reports rather than returning quietly: the
+            // stream is already silent, so a seek that gives up without saying
+            // so leaves the deck claiming a station nobody can hear.
+            let failed = |reason: String| {
+                let _ = tx.send(AppCommand::RadioFailed {
+                    station: Box::new(station.clone()),
+                    reason,
+                    tune_seq,
+                });
+            };
+            let stations = match api.by_country(&code).await {
+                Ok(stations) => stations,
+                Err(e) => {
+                    log::error!("could not seek through {code}: {e:#}");
+                    failed(format!("could not reach the radio directory: {e}"));
+                    return;
+                }
+            };
+            // Whether this answer still speaks for the deck. The request takes
+            // as long as the directory makes it take, and a station chosen
+            // meanwhile is the one the user means.
+            if !state
+                .read()
+                .radio
+                .as_ref()
+                .is_some_and(|r| r.tune_seq == tune_seq)
+            {
+                return;
+            }
+            match next_in_country(&stations, &station.uuid) {
+                Some(next) => {
+                    let _ = tx.send(AppCommand::PlayStation {
+                        station: Box::new(next),
+                        attempt,
+                    });
+                }
+                None => failed(format!("there is nothing else to hear in {code}")),
+            }
+        });
+    }
+
+    /// Deal with a station that would not play.
+    ///
+    /// A seek walking a country is the only thing that carries on: it is a run
+    /// of stations rather than a choice of one, and stopping on the first dead
+    /// entry is what makes seeking through a directory of ten thousand
+    /// stations useless. Every other route in — a row, a previous, a station
+    /// the user has had on for an hour — takes the failure as the answer, and
+    /// keeps the deck so the controls out of it are still there.
+    fn radio_failed(&mut self, station: state::Station, reason: String, tune_seq: u64) {
+        let ours = self
+            .state
+            .read()
+            .radio
+            .as_ref()
+            .is_some_and(|r| r.tune_seq == tune_seq);
+        if !ours {
+            return;
+        }
+        let attempt = self
+            .state
+            .read()
+            .radio
+            .as_ref()
+            .map_or(0, |r| r.seek_attempt);
+        if seek_walks_on(attempt) {
+            self.state
+                .write()
+                .toast(format!("{} would not play — seeking on", station.name));
+            self.seek_station(attempt + 1);
+            return;
+        }
+        // One message, not two: a walk that gave up has already said what it
+        // was doing at every hop, and the last station's own error is the
+        // least interesting part of it.
+        let told = if attempt >= SEEK_ATTEMPTS {
+            format!("gave up after {attempt} stations that would not play")
+        } else {
+            format!("could not play {}: {reason}", station.name)
+        };
+        self.fail_station(&reason, told);
+    }
+
+    /// Leave the station on the deck, marked as not playing and saying why.
+    ///
+    /// The controls that reach another station are on the deck, so clearing it
+    /// on a failure takes away the one thing that gets you out of the station
+    /// that failed.
+    fn fail_station(&self, reason: &str, told: String) {
+        self.radio_player.hush();
+        let mut st = self.state.write();
+        let Some(r) = st.radio.as_mut() else { return };
+        r.is_playing = false;
+        r.seek_attempt = 0;
+        r.failure = Some(reason.to_string());
+        st.toast(told);
+    }
+
+    /// Notice a station that connected and then stopped sending.
+    ///
+    /// A broadcast has no length to reach, so nothing else in the app sees one
+    /// end: the sink drains to silence under a deck that goes on saying the
+    /// station is on. Read off the engine on the same tick that resolves
+    /// announcements, because that is the only clock the client has left.
+    ///
+    /// A station a seek landed on moments ago walks on; one that has been
+    /// playing long enough to be the thing you chose to listen to does not.
+    /// Jumping someone to a stranger after an hour is not what the control
+    /// they last pressed meant.
+    fn check_radio_stream(&mut self) {
+        if !self.radio_player.stream_ended() {
+            return;
+        }
+        let Some((station, tune_seq, of_a_walk)) = self
+            .state
+            .read()
+            .radio
+            .as_ref()
+            .filter(|r| !r.failed())
+            .map(|r| {
+                (
+                    r.station.clone(),
+                    r.tune_seq,
+                    r.seek_attempt > 0 && r.elapsed() < SEEK_CHAIN_WITHIN,
+                )
+            })
+        else {
+            return;
+        };
+        // A station that dropped long after the walk that found it is the one
+        // you settled on, so the walk is over whatever brought you here.
+        if !of_a_walk && let Some(r) = self.state.write().radio.as_mut() {
+            r.seek_attempt = 0;
+        }
+        self.radio_failed(station, "it stopped sending".to_string(), tune_seq);
     }
 
     /// Silence both engines on the way out, then let the quit path know.
@@ -1181,7 +1534,11 @@ impl Client {
     /// started, whatever asked — so the question is settled by what is
     /// actually making sound rather than by what we last asked for.
     fn yield_to_radio(&self) {
-        if !self.radio_player.is_live() {
+        // The permissive question, not the engine's own: a station change
+        // silences the engine for the seconds the next one takes to connect,
+        // and that is exactly the window in which a librespot load landing
+        // late would start playing under a deck that says a station is on.
+        if !self.radio_live() {
             return;
         }
         log::warn!("Spotify started under a live station; pausing it");
@@ -1812,6 +2169,39 @@ fn spawn_liked_check(api: Api, state: Arc<RwLock<AppState>>, uris: Vec<String>) 
     });
 }
 
+/// The station after `current` in a country's chart, wrapping at the end.
+///
+/// A chart the playing station is not on still seeks: it can have come from a
+/// search, a genre page or the saved list, be ranked past the directory's
+/// limit, or have been dropped as broken since. Starting at the top is the
+/// nearest honest reading of "the next one in this country".
+///
+/// HLS entries are stepped over rather than offered — spot cannot play them,
+/// and a control that lands on one is a control that stops the music.
+/// Whether a station that would not play is one step of a seek or the end of
+/// the road.
+///
+/// A station you chose is the one you meant. A station a seek landed on is one
+/// of a run, and a directory of ten thousand stations has plenty that no
+/// longer answer — stopping on the first is what makes seeking useless.
+fn seek_walks_on(attempt: u8) -> bool {
+    attempt > 0 && attempt < SEEK_ATTEMPTS
+}
+
+fn next_in_country(stations: &[state::Station], current: &str) -> Option<state::Station> {
+    let start = stations
+        .iter()
+        .position(|s| s.uuid == current)
+        .map_or(0, |i| i + 1);
+    stations
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(stations.len())
+        .find(|s| !s.hls && s.uuid != current)
+        .cloned()
+}
+
 fn into_station_rows(stations: Vec<state::Station>) -> Vec<state::RadioRow> {
     stations.into_iter().map(state::RadioRow::Station).collect()
 }
@@ -1888,5 +2278,91 @@ mod tests {
         // An empty announcement is not a question.
         assert!(!needs_lookup("", None));
         assert!(!needs_lookup("   ", None));
+    }
+
+    fn chart(entries: &[(&str, bool)]) -> Vec<state::Station> {
+        entries
+            .iter()
+            .map(|(uuid, hls)| state::Station {
+                uuid: (*uuid).into(),
+                name: (*uuid).into(),
+                url: format!("http://stream/{uuid}"),
+                homepage: String::new(),
+                tags: String::new(),
+                country: String::new(),
+                countrycode: "DE".into(),
+                language: String::new(),
+                codec: "MP3".into(),
+                bitrate: 128,
+                votes: 1,
+                hls: *hls,
+            })
+            .collect()
+    }
+
+    /// `seek ▸▸` walks down the chart and comes back to the top, so a country
+    /// is a ring rather than a dead end.
+    #[test]
+    fn the_seek_walks_the_chart_and_wraps() {
+        let list = chart(&[("a", false), ("b", false), ("c", false)]);
+        assert_eq!(next_in_country(&list, "a").unwrap().uuid, "b");
+        assert_eq!(next_in_country(&list, "c").unwrap().uuid, "a");
+    }
+
+    /// HLS entries are listed but unplayable, so the walk steps over them
+    /// rather than landing on one and stopping the music.
+    #[test]
+    fn the_seek_steps_over_stations_spot_cannot_play() {
+        let list = chart(&[("a", false), ("b", true), ("c", false)]);
+        assert_eq!(next_in_country(&list, "a").unwrap().uuid, "c");
+    }
+
+    /// A station the chart does not list — reached from a search or a genre,
+    /// ranked past the directory's limit, or dropped as broken — still seeks,
+    /// from the top.
+    #[test]
+    fn a_station_the_chart_does_not_list_seeks_from_the_top() {
+        let list = chart(&[("a", false), ("b", false)]);
+        assert_eq!(next_in_country(&list, "elsewhere").unwrap().uuid, "a");
+    }
+
+    /// A seek that keeps hitting stations which will not play walks past them
+    /// rather than stopping on the first one — a directory of ten thousand
+    /// stations has plenty that answer and plenty that do not, and stopping on
+    /// a dead one is what makes seeking useless.
+    #[test]
+    fn a_seek_walks_past_the_stations_that_would_not_play() {
+        let list = chart(&[
+            ("a", false),
+            ("dead1", false),
+            ("dead2", false),
+            ("b", false),
+        ]);
+        let mut at = "a".to_string();
+        for expected in ["dead1", "dead2", "b"] {
+            at = next_in_country(&list, &at).unwrap().uuid;
+            assert_eq!(at, expected);
+        }
+    }
+
+    /// A station you chose is the one you meant, and a failure is the answer.
+    /// A station a seek landed on is one of a run, and a failure is a reason to
+    /// keep walking — up to a bound, because the cost is time rather than
+    /// requests: each dead station holds the walk for the whole connect
+    /// timeout.
+    #[test]
+    fn only_a_seek_walks_on_from_a_station_that_would_not_play() {
+        assert!(!seek_walks_on(0), "a station you chose yourself");
+        assert!(seek_walks_on(1), "the first station a seek landed on");
+        assert!(!seek_walks_on(SEEK_ATTEMPTS), "the walk is bounded");
+        assert!(!seek_walks_on(SEEK_ATTEMPTS + 1));
+    }
+
+    /// Nothing playable in the country: the caller says so rather than looping.
+    #[test]
+    fn a_country_of_nothing_playable_seeks_nowhere() {
+        assert!(next_in_country(&chart(&[("a", true)]), "a").is_none());
+        assert!(next_in_country(&chart(&[("a", false)]), "a").is_none());
+        assert!(next_in_country(&[], "a").is_none());
     }
 }

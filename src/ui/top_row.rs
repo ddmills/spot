@@ -675,6 +675,9 @@ mod tests {
             title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             volume_percent: 50,
             matched: Default::default(),
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
         });
         audible(&st);
         st

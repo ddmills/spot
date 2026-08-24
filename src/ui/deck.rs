@@ -22,7 +22,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::play_state::PlayState;
+use super::play_state::{PlayState, RadioForward, RadioSteps};
 use super::table::{
     art_w, draw_art, draw_volume, fit, link, meter, right_row, segment, state_spans, width,
 };
@@ -50,6 +50,10 @@ pub(super) const TIME_W: u16 = 5 + 6;
 /// The transport's two buttons, in the order they are laid out.
 const PREV_LABEL: &str = "◂◂ previous";
 const NEXT_LABEL: &str = "next ▸▸";
+/// What the radio transport's right-hand button says when there is no station
+/// to step forward to. The same seven cells as [`NEXT_LABEL`], so the two
+/// never move the row between them.
+const SEEK_LABEL: &str = "seek ▸▸";
 
 /// The liked control at the right end of the title row, in both states.
 /// Unpadded, like every other control on the deck — the hover pill covers the
@@ -410,6 +414,21 @@ fn station_subtitle(radio: &RadioPlayback) -> String {
 /// control should not be reachable in the first place.
 pub fn radio_status(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hit: &mut HitAreas) {
     hit.gauge = Rect::default();
+    if row.width == 0 {
+        return;
+    }
+    // A station that would not come up gets the reason where the bar goes.
+    // Neither a meter nor an elapsed count is true of a station that is not
+    // sending, and drawing them anyway is the deck reporting a stream that is
+    // not there.
+    if let Some(reason) = &radio.failure {
+        let mark = "OFF AIR ";
+        let mut line = vec![Span::styled(mark, theme::warn())];
+        let left = row.width as usize - width(mark).min(row.width as usize);
+        line.push(Span::styled(fit(reason, left), theme::dim()));
+        frame.render_widget(Paragraph::new(Line::from(line)), row);
+        return;
+    }
     if row.width <= TIME_W {
         return;
     }
@@ -426,19 +445,26 @@ pub fn radio_status(frame: &mut Frame, row: Rect, radio: &RadioPlayback, hit: &m
     frame.render_widget(Paragraph::new(Line::from(line)), row);
 }
 
-/// The radio deck's transport: the play/pause pill, and nothing either side.
+/// The radio deck's transport, laid out like [`transport`]: previous flush
+/// left, the play state centred, and the forward control flush right.
 ///
-/// Previous and next are not drawn rather than drawn dead. A station has no
-/// track before or after it, and a greyed control that never lights is a
-/// question the UI keeps asking and answering. Records `hit.play_btn`, and
-/// clears the other two so a click cannot land on last frame's rects.
+/// A broadcast has no track either side of it, but a station does have
+/// something either side: what you were listening to before it, and — with
+/// nothing stepped out of — the rest of its own country. `steps` says which of
+/// those exist, and a control that leads nowhere is not drawn rather than
+/// drawn dead: a greyed control that never lights is a question the UI keeps
+/// asking and answering. Records `hit.prev_btn`, `hit.play_btn` and
+/// `hit.next_btn`, clearing each first so a click cannot land on last frame's
+/// rects.
 ///
 /// `play` is what the corner is saying — see [`transport`] for why a station
-/// still connecting gets no pill at all.
+/// still connecting gets no pill at all. The two buttons stay where they are
+/// through that window, so the row does not move around what is missing.
 pub fn radio_transport(
     frame: &mut Frame,
     row: Rect,
     play: PlayState,
+    steps: RadioSteps,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -446,22 +472,49 @@ pub fn radio_transport(
     hit.next_btn = Rect::default();
     hit.play_btn = Rect::default();
 
-    let Some(pill) = state_spans(play) else {
-        return;
+    let button = theme::text();
+    let forward = match steps.forward {
+        RadioForward::None => None,
+        RadioForward::Next => Some(NEXT_LABEL),
+        RadioForward::Seek => Some(SEEK_LABEL),
     };
-    let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
-    if row.width < pill_w {
-        return;
+    // Only the controls actually offered, unlike the Spotify row's fixed pair:
+    // a station with nothing behind it gives the pill the left edge's cells.
+    let edges = (if steps.back { width(PREV_LABEL) } else { 0 } + forward.map_or(0, width)) as u16;
+
+    if steps.back {
+        let mut spans = Vec::new();
+        let mut x = row.x;
+        hit.prev_btn = segment(
+            &mut spans,
+            &mut x,
+            row,
+            mouse,
+            vec![Span::styled(PREV_LABEL, button)],
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
     }
-    let seg = Rect {
-        x: row.x + (row.width - pill_w) / 2,
-        width: pill_w,
-        ..row
-    };
-    let mut spans = Vec::new();
-    let mut x = seg.x;
-    hit.play_btn = segment(&mut spans, &mut x, row, mouse, pill);
-    frame.render_widget(Paragraph::new(Line::from(spans)), seg);
+
+    if let Some(pill) = state_spans(play) {
+        let pill_w: u16 = pill.iter().map(|s| s.width() as u16).sum();
+        if row.width >= edges + pill_w + 2 {
+            let seg = Rect {
+                x: row.x + (row.width - pill_w) / 2,
+                width: pill_w,
+                ..row
+            };
+            let mut spans = Vec::new();
+            let mut x = seg.x;
+            hit.play_btn = segment(&mut spans, &mut x, row, mouse, pill);
+            frame.render_widget(Paragraph::new(Line::from(spans)), seg);
+        }
+    }
+
+    if let Some(label) = forward
+        && row.width > edges
+    {
+        hit.next_btn = right_row(frame, row, mouse, vec![vec![Span::styled(label, button)]])[0];
+    }
 }
 
 /// The station control at the right end of [`radio_station_row`], in both
@@ -1028,16 +1081,77 @@ mod tests {
         assert_eq!(hit.next_btn.right(), 60);
     }
 
-    /// The radio deck's transport is the pill and nothing else, so a station
-    /// still connecting leaves the row empty rather than offering `■ pause`
-    /// over silence, under a corner already saying `LOADING`.
+    /// A station still connecting is offered no pill, for the reason a track
+    /// still loading is not: neither word on it would be true, under a corner
+    /// already saying `LOADING`. With nothing behind the station and no
+    /// country to walk, that leaves the row empty.
     #[test]
     fn the_radio_pill_goes_away_while_a_station_connects() {
         let (lines, hit, _) = render(60, 1, |f, a, h| {
-            radio_transport(f, a, PlayState::Loading, None, h)
+            radio_transport(f, a, PlayState::Loading, RadioSteps::default(), None, h)
         });
         assert!(lines[0].trim().is_empty(), "{:?}", lines[0]);
         assert!(hit.play_btn.is_empty());
+    }
+
+    /// Connecting is exactly when you want out of a station that will not come
+    /// up, so the two step controls stay while the pill is away.
+    #[test]
+    fn the_step_controls_stay_while_a_station_connects() {
+        let steps = RadioSteps {
+            back: true,
+            forward: RadioForward::Seek,
+        };
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            radio_transport(f, a, PlayState::Loading, steps, None, h)
+        });
+        assert!(hit.play_btn.is_empty());
+        assert_eq!(hit.prev_btn.x, 0);
+        assert_eq!(hit.next_btn.right(), 60);
+        assert!(lines[0].contains(PREV_LABEL) && lines[0].contains(SEEK_LABEL));
+    }
+
+    /// The radio twin of [`the_transport_pushes_its_buttons_to_the_edges`]: the
+    /// same three controls in the same places, so the row does not move under
+    /// the eye when the source changes.
+    #[test]
+    fn the_radio_transport_pushes_its_steps_to_the_edges() {
+        let steps = RadioSteps {
+            back: true,
+            forward: RadioForward::Next,
+        };
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            radio_transport(f, a, PlayState::Playing, steps, None, h)
+        });
+        assert!(lines[0].contains(PREV_LABEL) && lines[0].contains(NEXT_LABEL));
+        assert_eq!(hit.prev_btn.x, 0);
+        assert_eq!(hit.next_btn.right(), 60);
+        assert_eq!(hit.prev_btn.y, hit.next_btn.y);
+        assert!(lines[0].contains("■ pause"));
+        let (left, right) = (hit.play_btn.x, 60 - hit.play_btn.right());
+        assert!(
+            left.abs_diff(right) <= 1,
+            "pill off centre: {left} vs {right}"
+        );
+    }
+
+    /// A station reached with nothing behind it and no country to walk offers
+    /// neither control, and records neither rect — so a click cannot land on
+    /// what the Spotify deck left in the same place.
+    #[test]
+    fn a_station_with_no_path_either_side_draws_no_step_controls() {
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            radio_transport(f, a, PlayState::Playing, RadioSteps::default(), None, h)
+        });
+        assert!(!lines[0].contains('◂') && !lines[0].contains('▸'));
+        assert!(hit.prev_btn.is_empty() && hit.next_btn.is_empty());
+    }
+
+    /// The two readings of the right-hand control are one width, so the row
+    /// does not jump under the cursor that just pressed it.
+    #[test]
+    fn seek_and_next_are_the_same_width() {
+        assert_eq!(width(SEEK_LABEL), width(NEXT_LABEL));
     }
 
     /// The `LIVE` bar is a readout, and the row it sits on is where the Spotify
@@ -1062,6 +1176,23 @@ mod tests {
             .draw(|f| radio_status(f, f.area(), &r, &mut hit))
             .unwrap();
         assert!(hit.gauge.is_empty(), "{:?}", hit.gauge);
+    }
+
+    /// A station that would not come up says so where the bar goes. Neither a
+    /// full meter nor an elapsed count is true of a station that is not
+    /// sending, and drawing them anyway has the deck report a stream that is
+    /// not there.
+    #[test]
+    fn a_station_that_would_not_play_says_why_instead_of_live() {
+        let mut r = radio("Adroit Jazz");
+        r.failure = Some("could not reach the station".into());
+        r.is_playing = false;
+        let (lines, hit, _) = render(60, 1, |f, a, h| radio_status(f, a, &r, h));
+
+        assert!(lines[0].contains("OFF AIR"), "{:?}", lines[0]);
+        assert!(lines[0].contains("could not reach the station"));
+        assert!(!lines[0].contains("LIVE"));
+        assert!(hit.gauge.is_empty(), "there is no stream to seek through");
     }
 
     /// Too narrow for both, previous keeps the row — `right_row` would
@@ -1351,15 +1482,42 @@ mod tests {
     fn every_radio_row_degrades_without_panicking() {
         let mut r = radio("Adroit Jazz");
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
+        let paths = [
+            RadioSteps::default(),
+            RadioSteps {
+                back: true,
+                forward: RadioForward::Next,
+            },
+            RadioSteps {
+                back: false,
+                forward: RadioForward::Seek,
+            },
+            RadioSteps {
+                back: true,
+                forward: RadioForward::Seek,
+            },
+        ];
+        let mut dead = r.clone();
+        dead.failure = Some("the station stopped sending, which is a long way to say so".into());
         for width in 0..40u16 {
             for saved in [false, true] {
-                render(width.max(1), 2, |f, a, h| {
-                    let a = Rect { width, ..a };
-                    radio_masthead(f, a, &r, Some(true), None, h);
-                    radio_status(f, Rect { height: 1, ..a }, &r, h);
-                    radio_transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
-                    radio_station_row(f, Rect { height: 1, ..a }, &r, saved, None, h);
-                });
+                for steps in paths {
+                    let r = if saved { &r } else { &dead };
+                    render(width.max(1), 2, |f, a, h| {
+                        let a = Rect { width, ..a };
+                        radio_masthead(f, a, r, Some(true), None, h);
+                        radio_status(f, Rect { height: 1, ..a }, r, h);
+                        radio_transport(
+                            f,
+                            Rect { height: 1, ..a },
+                            PlayState::Playing,
+                            steps,
+                            None,
+                            h,
+                        );
+                        radio_station_row(f, Rect { height: 1, ..a }, r, saved, None, h);
+                    });
+                }
             }
         }
     }

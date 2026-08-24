@@ -255,6 +255,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // What the corner of the header is saying, read before the split borrow
     // below so the pill under the progress track can only agree with it.
     let play = play_state::or_paused(play_state::status(state));
+    // Read for the same reason and in the same place: what the radio row can
+    // offer is state the split borrow below gives up.
+    let steps = play_state::radio_steps(state);
 
     // Split borrows: queue/playback are read while list state, hit areas
     // and the visualizer's smoothing state are written.
@@ -349,6 +352,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     ..transport_area
                 },
                 play,
+                steps,
                 mouse,
                 hit,
             );
