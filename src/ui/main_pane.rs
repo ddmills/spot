@@ -5,10 +5,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
+use super::columns::{Cell, ColKey, GUTTER, Layout, right, row_spans, scroll_col};
 use super::theme;
 use crate::app::state::{
-    AppState, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError, MainView, SearchTab, SortKey,
-    Track, TrackSort, format_duration,
+    AppState, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError, MainView, SearchTab, Sort, Track,
+    format_duration,
 };
 
 /// Playback context needed to mark the playing row, copied out of the queue
@@ -58,6 +59,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         main,
         playlists,
         playlists_error,
+        playlists_sort,
+        playlists_display,
         radio_favorites,
         main_list,
         hit,
@@ -71,6 +74,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let page_art = &*page_art;
     let playlists = &*playlists;
     let playlists_error = &*playlists_error;
+    let playlists_display = &*playlists_display;
+    let playlists_sort = *playlists_sort;
     // The *browsed* album's sleeve, not the playing one — see
     // `AppState::view_cover`.
     //
@@ -93,6 +98,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             frame,
             list_area,
             playlists,
+            playlists_display,
+            playlists_sort,
             playlists_error.as_ref(),
             loading,
             me_id.as_deref(),
@@ -166,7 +173,6 @@ const HOME_INDENT: usize = 2;
 /// alone would mean a six-cell target on a full-width row.
 ///
 /// [`HomeItem`]: crate::app::state::HomeItem
-#[allow(clippy::too_many_arguments)]
 fn draw_home(
     frame: &mut Frame,
     area: Rect,
@@ -264,6 +270,8 @@ fn draw_playlists(
     frame: &mut Frame,
     area: Rect,
     playlists: &[crate::app::state::Playlist],
+    display: &[usize],
+    sort: Sort,
     error: Option<&LoadError>,
     loading: bool,
     me_id: Option<&str>,
@@ -291,31 +299,20 @@ fn draw_playlists(
         return;
     }
 
-    let cols = PlaylistCols::new(inner.width as usize);
-    let mut rows_area = inner;
-    if inner.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(playlist_header(&cols)),
-            Rect { height: 1, ..inner },
-        );
-        let skip = if inner.height >= 3 { 2 } else { 1 };
-        rows_area = Rect {
-            y: inner.y + skip,
-            height: inner.height - skip,
-            ..inner
-        };
-    }
+    let layout = Layout::resolve(&super::columns::playlists(), inner.width as usize, 0);
+    let rows_area = layout.draw_header(frame, inner, Some(sort), mouse, hit);
     hit.main_list = rows_area;
 
     // Playlists only. Liked Songs is a Home row of its own: it is not a
     // playlist, so it does not belong under a heading that says it is.
-    let items: Vec<ListItem> = playlists
+    let items: Vec<ListItem> = display
         .iter()
+        .filter_map(|&i| playlists.get(i))
         .enumerate()
         .map(|(i, p)| {
             let playing =
                 marks.context.as_deref() == Some(crate::app::state::playlist_key(&p.id).as_str());
-            playlist_row(p, &cols, me_id, playing, i == main_index)
+            playlist_row(p, &layout, me_id, playing, i == main_index)
         })
         .collect();
     let count = items.len();
@@ -324,107 +321,47 @@ fn draw_playlists(
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
 
-/// Width of the station table's saved column: the mark, then a space.
-const STATION_SAVE_W: usize = 2;
-/// Width of the right-aligned quality cell ("AAC+ 128k", "HLS").
-const STATION_QUALITY_W: usize = 10;
-/// Width of the facet list's right-aligned station count.
-const FACET_COUNT_W: usize = 7;
-
-/// Column widths for the station table, from the pane's inner width. Tags are
-/// the first thing dropped: they are the only column a station reads fine
-/// without.
-struct StationCols {
-    name: usize,
-    tags: usize,
-    country: usize,
-}
-
-impl StationCols {
-    fn new(width: usize) -> Self {
-        let fixed = STATION_SAVE_W + STATION_QUALITY_W + 3 * COL_GAP.len();
-        let flex = width.saturating_sub(fixed);
-        // Below this the tag list is a few clipped letters saying nothing, so
-        // the name takes the space instead.
-        if flex < 44 {
-            return Self {
-                name: flex.saturating_sub(6),
-                tags: 0,
-                country: 6.min(flex),
-            };
-        }
-        let name = flex * 5 / 10;
-        let country = 6;
-        Self {
-            name,
-            tags: flex.saturating_sub(name + country),
-            country,
-        }
-    }
-}
-
-fn station_header(cols: &StationCols) -> Line<'static> {
-    let mut text = format!(
-        "{}{}{COL_GAP}",
-        " ".repeat(STATION_SAVE_W),
-        fit("Station", cols.name)
-    );
-    if cols.tags > 0 {
-        text.push_str(&fit("Tags", cols.tags));
-        text.push_str(COL_GAP);
-    }
-    text.push_str(&fit("Where", cols.country));
-    text.push_str(COL_GAP);
-    text.push_str(&format!("{:>STATION_QUALITY_W$}", "Stream"));
-    Line::styled(text, theme::dim())
-}
-
 /// One station row.
-///
-/// The saved mark reuses the track table's `★`, and for the same reason: this
-/// is the same gesture on the same key, and a second glyph for it would say
-/// there were two kinds of keeping.
 fn station_row(
     s: &crate::app::state::Station,
-    cols: &StationCols,
+    layout: &Layout,
     saved: bool,
     playing: bool,
     selected: bool,
 ) -> ListItem<'static> {
-    let mark = if playing {
-        Span::styled("♫ ", theme::accent())
-    } else if saved {
-        Span::styled(format!("{} ", super::table::LIKED_MARK), theme::accent())
-    } else {
-        Span::raw("  ")
-    };
+    let dim = theme::dim();
     // An HLS station is listed but cannot be played, so it is drawn as
     // something that is there rather than something that is offered. Hiding
     // them would quietly remove the BBC and most national broadcasters from
     // the directory, which is a worse lie than a dim row.
-    let name_style = if s.hls { theme::dim() } else { theme::text() };
-
-    let mut spans = vec![mark, Span::styled(fit(&s.name, cols.name), name_style)];
-    spans.push(Span::raw(COL_GAP));
-    if cols.tags > 0 {
-        spans.push(Span::styled(fit(&s.tags, cols.tags), theme::dim()));
-        spans.push(Span::raw(COL_GAP));
-    }
-    let where_ = if s.countrycode.is_empty() {
-        s.country.as_str()
-    } else {
-        s.countrycode.as_str()
-    };
-    spans.push(Span::styled(fit(where_, cols.country), theme::dim()));
-    spans.push(Span::raw(COL_GAP));
-    // Right-aligned against the header, which is too — `fit` pads on the
-    // right, so it would left-align the cell under a right-aligned label.
-    let quality = fit(&s.quality(), STATION_QUALITY_W).trim_end().to_string();
-    spans.push(Span::styled(
-        format!("{quality:>STATION_QUALITY_W$}"),
-        theme::dim(),
-    ));
-
+    let name_style = if s.hls { dim } else { theme::text() };
+    let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Mark => spans.push(match playing {
+            true => Span::styled("♫ ", theme::accent()),
+            false => Span::raw(" ".repeat(cell.width)),
+        }),
+        // The saved mark reuses the track table's `★`, and for the same
+        // reason: this is the same gesture on the same key, and a second
+        // glyph for it would say there were two kinds of keeping.
+        ColKey::Saved => {
+            let mark = match saved {
+                true => super::table::LIKED_MARK,
+                false => "",
+            };
+            spans.push(Span::styled(fit(mark, cell.width), theme::accent()));
+        }
+        ColKey::Station => spans.push(Span::styled(fit(&s.name, cell.width), name_style)),
+        ColKey::Tags => spans.push(Span::styled(fit(&s.tags, cell.width), dim)),
+        ColKey::Where => {
+            let where_ = match s.countrycode.is_empty() {
+                true => s.country.as_str(),
+                false => s.countrycode.as_str(),
+            };
+            spans.push(Span::styled(fit(where_, cell.width), dim));
+        }
+        ColKey::Stream => spans.push(Span::styled(right(&s.quality(), cell.width), dim)),
+        _ => spans.push(Span::raw(" ".repeat(cell.width))),
+    });
     let mut line = Line::from(spans);
     if selected {
         super::table::apply_selection(&mut line);
@@ -445,24 +382,14 @@ fn render_station_table(
     stations: &[&crate::app::state::Station],
     favorites: &[crate::app::state::Station],
     playing_url: Option<&str>,
+    sort: Sort,
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
+    mouse: Option<Position>,
 ) {
-    let cols = StationCols::new(body.width as usize);
-    let mut rows_area = body;
-    if body.height >= 2 {
-        frame.render_widget(
-            Paragraph::new(station_header(&cols)),
-            Rect { height: 1, ..body },
-        );
-        let skip = if body.height >= 3 { 2 } else { 1 };
-        rows_area = Rect {
-            y: body.y + skip,
-            height: body.height - skip,
-            ..body
-        };
-    }
+    let layout = Layout::resolve(&super::columns::stations(), body.width as usize, 0);
+    let rows_area = layout.draw_header(frame, body, Some(sort), mouse, hit);
     hit.main_list = rows_area;
 
     let items: Vec<ListItem> = stations
@@ -471,7 +398,7 @@ fn render_station_table(
         .map(|(i, s)| {
             station_row(
                 s,
-                &cols,
+                &layout,
                 favorites.iter().any(|f| f.uuid == s.uuid),
                 playing_url == Some(s.url.as_str()),
                 i == main_index,
@@ -485,14 +412,16 @@ fn render_station_table(
 }
 
 /// One country or genre row: a name and how many stations are behind it.
-fn facet_row(label: &str, count: u32, width: usize, selected: bool) -> ListItem<'static> {
-    let name_w = width.saturating_sub(STATION_SAVE_W + FACET_COUNT_W + COL_GAP.len());
-    let mut line = Line::from(vec![
-        Span::raw(" ".repeat(STATION_SAVE_W)),
-        Span::styled(fit(label, name_w), theme::text()),
-        Span::raw(COL_GAP),
-        Span::styled(format!("{count:>FACET_COUNT_W$}"), theme::dim()),
-    ]);
+fn facet_row(label: &str, count: u32, layout: &Layout, selected: bool) -> ListItem<'static> {
+    let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Name => spans.push(Span::styled(fit(label, cell.width), theme::text())),
+        ColKey::Stations => spans.push(Span::styled(
+            right(&count.to_string(), cell.width),
+            theme::dim(),
+        )),
+        _ => spans.push(Span::raw(" ".repeat(cell.width))),
+    });
+    let mut line = Line::from(spans);
     if selected {
         super::table::apply_selection(&mut line);
     }
@@ -562,13 +491,11 @@ fn draw_radio(
     }
 
     // A station list is the same table the Stations tab of a search draws, so
-    // it goes through the same builder. Facet lists get no header row:
-    // "Country / Stations" over a list of countries says only what the tab
-    // above it already said.
+    // it goes through the same builder.
     if !facets {
         let stations: Vec<&crate::app::state::Station> = view
             .rows
-            .iter()
+            .rows()
             .filter_map(|r| match r {
                 RadioRow::Station(s) => Some(s),
                 RadioRow::Facet { .. } => None,
@@ -580,31 +507,42 @@ fn draw_radio(
             &stations,
             favorites,
             playing_url,
+            view.rows.sort,
             main_index,
             list_state,
             hit,
+            mouse,
         );
         return;
     }
 
-    hit.main_list = body;
+    // Countries and genres are their own two-column table, headed by what its
+    // rows are — the tab above says which list you are on, not what the
+    // number beside each row counts.
+    let label = match view.scope.tab() {
+        RadioTab::Genres => "Genre",
+        _ => "Country",
+    };
+    let layout = Layout::resolve(&super::columns::facets(label), body.width as usize, 0);
+    let rows_area = layout.draw_header(frame, body, Some(view.rows.sort), mouse, hit);
+    hit.main_list = rows_area;
     let items: Vec<ListItem> = view
         .rows
-        .iter()
+        .rows()
         .enumerate()
         .map(|(i, row)| match row {
             RadioRow::Facet { label, count, .. } => {
-                facet_row(label, *count, body.width as usize, i == main_index)
+                facet_row(label, *count, &layout, i == main_index)
             }
             // Unreachable: `facets` is read off the first row, and the
             // directory never mixes the two kinds in one answer.
-            RadioRow::Station(s) => facet_row(&s.name, 0, body.width as usize, i == main_index),
+            RadioRow::Station(s) => facet_row(&s.name, 0, &layout, i == main_index),
         })
         .collect();
     let count = items.len();
-    super::clamp_offset(list_state, count, body.height as usize);
-    frame.render_stateful_widget(List::new(items), body, list_state);
-    super::table::draw_scrollbar(frame, scroll_col(body), count, list_state.offset());
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    frame.render_stateful_widget(List::new(items), rows_area, list_state);
+    super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
 
 /// What to say on a radio page with nothing on it.
@@ -903,8 +841,8 @@ fn artist_body(
     hit.main_list = body;
     let width = body.width as usize;
     let height = body.height as usize;
-    let split = v.top.display.len();
-    let cols = TrackCols::new(width, split as u32);
+    let split = v.top.len();
+    let layout = Layout::resolve(&super::columns::tracks(false), width, v.top.items.len());
 
     // Plan the lines first: their count is the scroll length, and their order
     // is what the mouse and the keyboard both resolve through.
@@ -934,7 +872,7 @@ fn artist_body(
             plan.push(ArtistLine::Tabs);
             plan.push(ArtistLine::Blank);
         }
-        for album in 0..v.display.len() {
+        for album in 0..v.albums.len() {
             plan.extend((0..CARD_ART_H).map(|row| ArtistLine::Card { album, row }));
             plan.push(ArtistLine::Blank);
         }
@@ -989,7 +927,7 @@ fn artist_body(
     hit.card_play.clear();
     hit.card_shuffle.clear();
     hit.album_names.clear();
-    for (album, a) in v.display.iter().map(|&i| &v.albums[i]).enumerate() {
+    for (album, a) in v.albums.rows().enumerate() {
         let first = cards_from + album * CARD_H;
         let push = |hits: &mut Vec<(Rect, usize)>, row: u16, dx: u16, w: u16| {
             let Some(y) = screen_y(first + row as usize) else {
@@ -1041,51 +979,36 @@ fn artist_body(
     if let Some(first) = tracks_at {
         let visible = (first.max(offset), (first + split).min(offset + height));
         if visible.1 > visible.0 {
-            let rect = |off: usize, w: usize| {
-                Rect {
-                    x: body.x.saturating_add(off as u16),
-                    y: body.y + (visible.0 - offset) as u16,
-                    width: w as u16,
-                    height: (visible.1 - visible.0) as u16,
-                }
-                .intersection(body)
-            };
-            if cols.actions {
-                hit.main_like_col = rect(cols.like_offset(), LIKE_W);
-                hit.main_add_col = rect(cols.add_offset(), ADD_W);
-            }
-            hit.main_artist_col = rect(cols.artist_offset(), cols.artist);
-            if let Some(off) = cols.album_offset() {
-                hit.main_album_col = rect(off, cols.album);
-            }
+            track_cells(
+                &layout,
+                body,
+                body.y + (visible.0 - offset) as u16,
+                (visible.1 - visible.0) as u16,
+                hit,
+            );
             // The column, then the row: both rects sit inside the track
             // block, so the row arithmetic is only safe once one of them has
             // claimed the pointer.
             hover_cell = mouse
-                .and_then(|m| {
-                    if hit.main_like_col.contains(m) {
-                        Some((m, HoverCol::Like))
-                    } else if hit.main_add_col.contains(m) {
-                        Some((m, HoverCol::Add))
-                    } else if hit.main_artist_col.contains(m) {
-                        Some((m, HoverCol::Artist))
-                    } else if hit.main_album_col.contains(m) {
-                        Some((m, HoverCol::Album))
-                    } else {
-                        None
-                    }
-                })
+                .and_then(|m| hovered_cell(hit, m).map(|col| (m, col)))
                 .map(|(m, col)| (offset + (m.y - body.y) as usize - first, col));
         }
     }
 
     // Row positions are in display order; the playing marker resolves by URI.
-    let playing = marks.uri.as_deref().and_then(|uri| {
-        v.top
-            .display
-            .iter()
-            .position(|&ti| v.top.tracks[ti].uri == uri)
-    });
+    let playing = marks.uri.as_deref().and_then(|uri| v.top.position_of(uri));
+    // The column header is a planned line inside the scrolling body rather
+    // than a fixed paragraph above it, so it is drawn at whatever row the
+    // scroll has put it on — and its hit rects follow it off screen the way
+    // the album-group strip above does.
+    let header_at = tracks_at.map(|first| first - 1);
+    let header_row = Rect {
+        x: body.x,
+        y: header_at.and_then(screen_y).unwrap_or(body.y),
+        width: body.width,
+        height: u16::from(header_at.and_then(screen_y).is_some()),
+    };
+    let header_line = layout.header_line(Some(v.top.sort), header_row, mouse, hit);
     let items: Vec<ListItem> = plan
         .iter()
         .map(|line| match *line {
@@ -1093,26 +1016,27 @@ fn artist_body(
                 text.to_string(),
                 theme::text().add_modifier(Modifier::BOLD),
             )),
-            ArtistLine::TrackHeader => ListItem::new(track_header(&cols, None)),
+            ArtistLine::TrackHeader => ListItem::new(header_line.clone()),
             ArtistLine::Track(i) => {
                 let ti = v.top.display[i];
+                let t = &v.top.items[ti];
                 track_row(
-                    &v.top.tracks[ti],
-                    &cols,
-                    i as u32 + 1,
+                    t,
+                    &layout,
+                    track_no(t, ti, false),
                     if Some(i) == playing {
                         RowMark::Playing
                     } else {
                         RowMark::None
                     },
                     i == main_index,
-                    liked.get(&v.top.tracks[ti].uri).copied(),
+                    liked.get(&t.uri).copied(),
                     hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
                 )
             }
             ArtistLine::Tabs => ListItem::new(Line::from(tab_spans.clone())),
             ArtistLine::Card { album, row } => card_line(
-                &v.albums[v.display[album]],
+                &v.albums.items[v.albums.display[album]],
                 row,
                 indent as usize,
                 card_text_w,
@@ -1130,7 +1054,7 @@ fn artist_body(
     // are drawn over the block the rows left blank for them, clipped to the
     // body so a card scrolling off the top slides under it.
     if art_w > 0 {
-        for (album, a) in v.display.iter().map(|&i| &v.albums[i]).enumerate() {
+        for (album, a) in v.albums.rows().enumerate() {
             let first = cards_from + album * CARD_H;
             let top = body.y as i64 + first as i64 - offset as i64;
             if top + CARD_ART_H as i64 <= body.y as i64 || top >= body.bottom() as i64 {
@@ -1327,8 +1251,8 @@ fn header_band(
 
     // Row 1: name + subtitle on the left, totals right-aligned.
     let info_area = Rect { height: 1, ..text };
-    let total_ms: u64 = list.tracks.iter().map(|t| t.duration_ms).sum();
-    let count = list.tracks.len();
+    let total_ms: u64 = list.items.iter().map(|t| t.duration_ms).sum();
+    let count = list.items.len();
     let dur = format_total_duration(total_ms);
     let totals = Span::styled(
         match (loading, list.total) {
@@ -1406,23 +1330,6 @@ fn header_band(
     );
     hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
-    if list.sort.key != SortKey::Position {
-        let hint = Span::styled(
-            format!(
-                "sort: {} {}  (o/O)",
-                list.sort.key.label(),
-                if list.sort.ascending { "▲" } else { "▼" }
-            ),
-            dim,
-        );
-        let w = (hint.width() as u16).min(play_area.width);
-        let hint_area = Rect {
-            x: play_area.right().saturating_sub(w),
-            width: w,
-            ..play_area
-        };
-        frame.render_widget(Paragraph::new(Line::from(hint)), hint_area);
-    }
 
     let used = if stacked { ART_BAND_H } else { TEXT_BAND_H };
     Rect {
@@ -1465,24 +1372,6 @@ fn tab_segments<T: Copy + PartialEq>(
     }
 }
 
-/// Reserved at the right of the pane: a blank column, then the scrollbar. With
-/// no border to hang the bar on it needs columns of its own, kept outside the
-/// content rect so a click on it cannot resolve to a row.
-///
-/// Two rather than one because the last column of a track row is the
-/// right-aligned Time, and a duration flush against the scrollbar reads as one
-/// mark rather than two.
-const GUTTER: u16 = 2;
-
-/// The scrollbar's column for a content rect: the far side of the gutter.
-fn scroll_col(body: Rect) -> Rect {
-    Rect {
-        x: body.right() + GUTTER - 1,
-        y: body.y,
-        width: 1,
-        height: body.height,
-    }
-}
 /// Longest a single crumb is spelled before eliding.
 pub(super) const HEAD_W: usize = 24;
 /// Longest an *ancestor* crumb is spelled. Shorter than the head: the page you
@@ -1854,124 +1743,7 @@ fn centered_line(frame: &mut Frame, inner: Rect, offset: i16, line: Line<'static
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), row);
 }
 
-const DUR_W: usize = 5;
-const YEAR_W: usize = 4;
-const COL_GAP: &str = "   ";
-/// Leading marker column: "▶ " playing, "→ " next up.
-const PREFIX_W: usize = 2;
-use super::table::{ACTIONS_MIN, ACTIONS_W, ADD_W, LIKE_W, action_spans, actions_label};
-
-/// Minimum width of the track-number column, right-aligned.
-const NO_W: usize = 3;
-
-/// Column widths for the track table, derived from the pane's inner width.
-/// Narrow panes drop the year first, then the album, then the track number;
-/// the action pair outlives all three.
-struct TrackCols {
-    name: usize,
-    artist: usize,
-    /// 0 = hidden.
-    album: usize,
-    year: bool,
-    /// The `★ +` pair at the end of the row.
-    actions: bool,
-    track_no: bool,
-    /// Width of the number column, grown to fit the largest number.
-    no_w: usize,
-}
-
-impl TrackCols {
-    fn new(width: usize, max_no: u32) -> Self {
-        let year = width >= 70;
-        let show_album = width >= 50;
-        let actions = width >= ACTIONS_MIN;
-        let track_no = width >= 40;
-        let no_w = max_no.to_string().len().max(NO_W);
-        let mut flex = width.saturating_sub(PREFIX_W + DUR_W + COL_GAP.len());
-        if actions {
-            flex = flex.saturating_sub(ACTIONS_W + COL_GAP.len());
-        }
-        if track_no {
-            flex = flex.saturating_sub(no_w + COL_GAP.len());
-        }
-        if year {
-            flex = flex.saturating_sub(YEAR_W + COL_GAP.len());
-        }
-        if show_album {
-            let flex = flex.saturating_sub(2 * COL_GAP.len());
-            let name = flex * 4 / 10;
-            let artist = flex * 3 / 10;
-            Self {
-                name,
-                artist,
-                album: flex - name - artist,
-                year,
-                actions,
-                track_no,
-                no_w,
-            }
-        } else {
-            let flex = flex.saturating_sub(COL_GAP.len());
-            let name = flex * 6 / 10;
-            Self {
-                name,
-                artist: flex - name,
-                album: 0,
-                year,
-                actions,
-                track_no,
-                no_w,
-            }
-        }
-    }
-
-    /// Column offset (from the row start) of the title cell, and the head of
-    /// the offset chain below.
-    ///
-    /// Each offset is built on the one before it rather than repeating its
-    /// arithmetic: a click rect that disagrees with the glyph it covers is the
-    /// bug this chain exists to prevent.
-    fn title_offset(&self) -> usize {
-        let mut x = PREFIX_W;
-        if self.track_no {
-            x += self.no_w + COL_GAP.len();
-        }
-        x
-    }
-
-    /// Column offset (from the row start) of the artist cell.
-    fn artist_offset(&self) -> usize {
-        self.title_offset() + self.name + COL_GAP.len()
-    }
-
-    /// Column offset of the album cell, when the column is shown.
-    fn album_offset(&self) -> Option<usize> {
-        (self.album > 0).then(|| self.artist_offset() + self.artist + COL_GAP.len())
-    }
-
-    /// Column offset of the `★ +` pair, shown or not: past whichever of album
-    /// and artist ends the data columns, then past the year.
-    fn actions_offset(&self) -> usize {
-        let mut x = self
-            .album_offset()
-            .map_or(self.artist_offset() + self.artist, |off| off + self.album);
-        if self.year {
-            x += COL_GAP.len() + YEAR_W;
-        }
-        x + COL_GAP.len()
-    }
-
-    /// Column offset of the liked cell, the first of the pair.
-    fn like_offset(&self) -> usize {
-        self.actions_offset()
-    }
-
-    /// Column offset of the add cell, flush against the liked one: each cell
-    /// carries its own padding, so the two targets meet.
-    fn add_offset(&self) -> usize {
-        self.actions_offset() + LIKE_W
-    }
-}
+use super::table::{ADD_W, LIKE_W, action_spans};
 
 /// Which clickable cell of a track row the mouse is over.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2004,54 +1776,29 @@ fn cell_spans(text: &str, width: usize, style: Style, hovered: bool) -> Vec<Span
     ]
 }
 
-/// Column label with a ▲/▼ marker when it is the active sort column.
-fn sort_label(base: &str, key: SortKey, sort: Option<TrackSort>) -> String {
-    match sort {
-        Some(s) if s.key == key => {
-            format!("{base}{}", if s.ascending { "▲" } else { "▼" })
-        }
-        _ => base.to_string(),
-    }
-}
-
-fn track_header(cols: &TrackCols, sort: Option<TrackSort>) -> Line<'static> {
-    let mut text = " ".repeat(PREFIX_W);
-    if cols.track_no {
-        text = format!("{text}{:>w$}{COL_GAP}", "#", w = cols.no_w);
-    }
-    text = format!(
-        "{text}{}{COL_GAP}{}",
-        fit(&sort_label("Title", SortKey::Title, sort), cols.name),
-        fit(&sort_label("Artist", SortKey::Artist, sort), cols.artist)
-    );
-    if cols.album > 0 {
-        text = format!(
-            "{text}{COL_GAP}{}",
-            fit(&sort_label("Album", SortKey::Album, sort), cols.album)
-        );
-    }
-    if cols.year {
-        text = format!("{text}{COL_GAP}{}", fit("Year", YEAR_W));
-    }
-    if cols.actions {
-        text = format!("{text}{COL_GAP}{}", actions_label());
-    }
-    text = format!(
-        "{text}{COL_GAP}{:>DUR_W$}",
-        sort_label("Time", SortKey::Duration, sort)
-    );
-    Line::styled(text, theme::dim())
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowMark {
     None,
     Playing,
 }
 
+/// What a track row prints in the `#` column.
+///
+/// An album numbers by the track's own position on the record; every other
+/// list numbers by its position in the order it arrived, `index` into the
+/// list's `items`. Either way the number belongs to the *track*, not to the
+/// row it happens to be on — sorting by Title and reading 1, 2, 3 down the
+/// side would say the sort had renumbered the record.
+fn track_no(track: &Track, index: usize, album: bool) -> u32 {
+    match album {
+        true => track.track_number,
+        false => index as u32 + 1,
+    }
+}
+
 fn track_row(
     t: &Track,
-    cols: &TrackCols,
+    layout: &Layout,
     no: u32,
     mark: RowMark,
     selected: bool,
@@ -2060,10 +1807,6 @@ fn track_row(
 ) -> ListItem<'static> {
     let dim = theme::dim();
     let accent_bold = theme::accent().add_modifier(Modifier::BOLD);
-    let prefix = match mark {
-        RowMark::None => Span::raw(" ".repeat(PREFIX_W)),
-        RowMark::Playing => Span::styled("▶ ", accent_bold),
-    };
     // Three weights, the way the player queue does it: the title at TEXT,
     // everything supporting it at DIM, and the playing row in accent.
     // `Style::default()` here would leak the raw terminal foreground, the one
@@ -2073,57 +1816,50 @@ fn track_row(
     } else {
         theme::text()
     };
-    let mut spans = vec![prefix];
     // Where the star lands, so the selection restyle below can put its accent
     // back.
     let mut star_at = None;
-    if cols.track_no {
-        let no = if no > 0 {
-            no.to_string()
-        } else {
-            String::new()
-        };
-        spans.push(Span::styled(
-            format!("{no:>w$}{COL_GAP}", w = cols.no_w),
+    let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Mark => spans.push(match mark {
+            RowMark::None => Span::raw(" ".repeat(cell.width)),
+            RowMark::Playing => Span::styled("▶ ", accent_bold),
+        }),
+        ColKey::No => {
+            let no = match no > 0 {
+                true => no.to_string(),
+                false => String::new(),
+            };
+            spans.push(Span::styled(right(&no, cell.width), dim));
+        }
+        ColKey::Title => spans.push(Span::styled(fit(&t.name, cell.width), name_style)),
+        // Artist and album cells are clickable; hovering lights them.
+        ColKey::Artist => spans.extend(cell_spans(
+            &t.artists,
+            cell.width,
             dim,
-        ));
-    }
-    spans.push(Span::styled(fit(&t.name, cols.name), name_style));
-    spans.push(Span::raw(COL_GAP));
-    // Artist and album cells are clickable; hovering lights them.
-    spans.extend(cell_spans(
-        &t.artists,
-        cols.artist,
-        dim,
-        hover == Some(HoverCol::Artist),
-    ));
-    if cols.album > 0 {
-        spans.push(Span::raw(COL_GAP));
-        spans.extend(cell_spans(
+            hover == Some(HoverCol::Artist),
+        )),
+        ColKey::Album => spans.extend(cell_spans(
             &t.album,
-            cols.album,
+            cell.width,
             dim,
             hover == Some(HoverCol::Album),
-        ));
-    }
-    if cols.year {
-        spans.push(Span::raw(COL_GAP));
-        spans.push(Span::styled(fit(&t.release_year, YEAR_W), dim));
-    }
-    if cols.actions {
-        spans.push(Span::raw(COL_GAP));
-        star_at = Some(spans.len());
-        spans.extend(action_spans(
-            liked,
-            hover == Some(HoverCol::Like),
-            hover == Some(HoverCol::Add),
-        ));
-    }
-    spans.push(Span::raw(COL_GAP));
-    spans.push(Span::styled(
-        format!("{:>DUR_W$}", format_duration(t.duration_ms)),
-        dim,
-    ));
+        )),
+        ColKey::Year => spans.push(Span::styled(fit(&t.release_year, cell.width), dim)),
+        ColKey::Actions => {
+            star_at = Some(spans.len());
+            spans.extend(action_spans(
+                liked,
+                hover == Some(HoverCol::Like),
+                hover == Some(HoverCol::Add),
+            ));
+        }
+        ColKey::Time => spans.push(Span::styled(
+            right(&format_duration(t.duration_ms), cell.width),
+            dim,
+        )),
+        _ => spans.push(Span::raw(" ".repeat(cell.width))),
+    });
     let mut line = Line::from(spans);
     if selected {
         super::table::apply_selection(&mut line);
@@ -2140,67 +1876,36 @@ fn track_row(
     ListItem::new(line)
 }
 
-const TYPE_W: usize = 11;
-const COUNT_W: usize = 6;
-
-/// Column widths for the search Albums tab.
-struct AlbumCols {
-    name: usize,
-    artist: usize,
-    /// Show the year + type columns.
-    meta: bool,
-}
-
-impl AlbumCols {
-    fn new(width: usize) -> Self {
-        let meta = width >= 55;
-        let mut flex = width.saturating_sub(COL_GAP.len());
-        if meta {
-            flex = flex.saturating_sub(YEAR_W + TYPE_W + 2 * COL_GAP.len());
-        }
-        let name = flex / 2;
-        Self {
-            name,
-            artist: flex.saturating_sub(name),
-            meta,
-        }
-    }
-}
-
-fn album_header(cols: &AlbumCols) -> Line<'static> {
-    let mut text = format!(
-        "{}{COL_GAP}{}",
-        fit("Album", cols.name),
-        fit("Artist", cols.artist)
-    );
-    if cols.meta {
-        text = format!(
-            "{text}{COL_GAP}{}{COL_GAP}{}",
-            fit("Year", YEAR_W),
-            fit("Type", TYPE_W)
-        );
-    }
-    Line::styled(text, theme::dim())
-}
-
 fn album_row(
     a: &crate::app::state::AlbumItem,
-    cols: &AlbumCols,
+    layout: &Layout,
+    playing: bool,
     selected: bool,
     hovered: bool,
 ) -> ListItem<'static> {
     let dim = theme::dim();
-    // The name is the link, so it lights under the pointer — the same
-    // affordance `track_row` gives the album cell of a track table.
-    let mut spans = cell_spans(&a.name, cols.name, theme::text(), hovered);
-    spans.push(Span::raw(COL_GAP));
-    spans.push(Span::styled(fit(&a.artists, cols.artist), dim));
-    if cols.meta {
-        spans.push(Span::raw(COL_GAP));
-        spans.push(Span::styled(fit(&a.release_year, YEAR_W), dim));
-        spans.push(Span::raw(COL_GAP));
-        spans.push(Span::styled(fit(&a.album_type, TYPE_W), dim));
-    }
+    let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Mark => spans.push(match playing {
+            true => Span::styled("♫ ", theme::accent()),
+            false => Span::raw(" ".repeat(cell.width)),
+        }),
+        // The name is the link, so it lights under the pointer — the same
+        // affordance `track_row` gives the album cell of a track table.
+        ColKey::Album => spans.extend(cell_spans(&a.name, cell.width, theme::text(), hovered)),
+        ColKey::Artist => spans.push(Span::styled(fit(&a.artists, cell.width), dim)),
+        ColKey::Year => spans.push(Span::styled(fit(&a.release_year, cell.width), dim)),
+        ColKey::Type => spans.push(Span::styled(fit(&a.album_type, cell.width), dim)),
+        ColKey::Tracks => {
+            // 0 is what the source reports when it does not know, and a
+            // record with no tracks on it is not a thing.
+            let count = match a.track_count {
+                0 => String::new(),
+                n => n.to_string(),
+            };
+            spans.push(Span::styled(right(&count, cell.width), dim));
+        }
+        _ => spans.push(Span::raw(" ".repeat(cell.width))),
+    });
     let mut line = Line::from(spans);
     if selected {
         super::table::apply_selection(&mut line);
@@ -2208,36 +1913,22 @@ fn album_row(
     ListItem::new(line)
 }
 
-/// Column widths for a playlist table: the Playlists page, and the search
-/// view's Playlists tab.
-struct PlaylistCols {
-    name: usize,
-    owner: usize,
-}
-
-/// Leading marker column: `♫ ` on the playing context, blank otherwise.
-const PL_MARK_W: usize = 2;
-
-impl PlaylistCols {
-    fn new(width: usize) -> Self {
-        let flex = width.saturating_sub(PL_MARK_W + COUNT_W + 2 * COL_GAP.len());
-        let name = flex * 6 / 10;
-        Self {
-            name,
-            owner: flex.saturating_sub(name),
-        }
+/// One artist row: the Artists tab of a search, which has one column and the
+/// marker every other table carries.
+fn artist_row(
+    a: &crate::app::state::ArtistItem,
+    layout: &Layout,
+    selected: bool,
+) -> ListItem<'static> {
+    let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Artist => spans.push(Span::styled(fit(&a.name, cell.width), theme::text())),
+        _ => spans.push(Span::raw(" ".repeat(cell.width))),
+    });
+    let mut line = Line::from(spans);
+    if selected {
+        super::table::apply_selection(&mut line);
     }
-}
-
-fn playlist_header(cols: &PlaylistCols) -> Line<'static> {
-    let text = format!(
-        "{}{}{COL_GAP}{}{COL_GAP}{:>COUNT_W$}",
-        " ".repeat(PL_MARK_W),
-        fit("Title", cols.name),
-        fit("Owner", cols.owner),
-        "Tracks"
-    );
-    Line::styled(text, theme::dim())
+    ListItem::new(line)
 }
 
 /// One playlist row.
@@ -2249,23 +1940,33 @@ fn playlist_header(cols: &PlaylistCols) -> Line<'static> {
 /// somebody else's playlist far more often than not.
 fn playlist_row(
     p: &crate::app::state::Playlist,
-    cols: &PlaylistCols,
+    layout: &Layout,
     me_id: Option<&str>,
     playing: bool,
     selected: bool,
 ) -> ListItem<'static> {
+    let dim = theme::dim();
     let owner = match me_id {
         Some(me) if me == p.owner_id => "",
         _ => p.owner.as_str(),
     };
-    let mut line = Line::from(vec![
-        Span::styled(if playing { "♫ " } else { "  " }, theme::accent()),
-        Span::styled(fit(&p.name, cols.name), theme::text()),
-        Span::raw(COL_GAP),
-        Span::styled(fit(owner, cols.owner), theme::dim()),
-        Span::raw(COL_GAP),
-        Span::styled(format!("{:>COUNT_W$}", p.track_count), theme::dim()),
-    ]);
+    let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Mark => spans.push(Span::styled(
+            match playing {
+                true => "♫ ".to_string(),
+                false => " ".repeat(cell.width),
+            },
+            theme::accent(),
+        )),
+        ColKey::Title => spans.push(Span::styled(fit(&p.name, cell.width), theme::text())),
+        ColKey::Owner => spans.push(Span::styled(fit(owner, cell.width), dim)),
+        ColKey::Tracks => spans.push(Span::styled(
+            right(&p.track_count.to_string(), cell.width),
+            dim,
+        )),
+        _ => spans.push(Span::raw(" ".repeat(cell.width))),
+    });
+    let mut line = Line::from(spans);
     if selected {
         super::table::apply_selection(&mut line);
     }
@@ -2273,30 +1974,22 @@ fn playlist_row(
 }
 
 /// Render the album table (header + scrollable rows) inside `inner`.
+#[allow(clippy::too_many_arguments)]
 fn render_album_table(
     frame: &mut Frame,
     inner: Rect,
-    albums: &[crate::app::state::AlbumItem],
+    albums: &crate::app::state::SortedList<crate::app::state::AlbumItem>,
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
+    marks: &PlayMarks,
     mouse: Option<Position>,
 ) {
-    let cols = AlbumCols::new(inner.width as usize);
-    let mut rows_area = inner;
-    if inner.height >= 2 && !albums.is_empty() {
-        frame.render_widget(
-            Paragraph::new(album_header(&cols)),
-            Rect { height: 1, ..inner },
-        );
-        // Blank spacer row under the header when there is room for it.
-        let skip = if inner.height >= 3 { 2 } else { 1 };
-        rows_area = Rect {
-            y: inner.y + skip,
-            height: inner.height - skip,
-            ..inner
-        };
-    }
+    let layout = Layout::resolve(&crate::ui::columns::albums(), inner.width as usize, 0);
+    let rows_area = match albums.is_empty() {
+        true => inner,
+        false => layout.draw_header(frame, inner, Some(albums.sort), mouse, hit),
+    };
     hit.main_list = rows_area;
 
     // The album name is a link here the same way the Album *column* is one in
@@ -2304,10 +1997,11 @@ fn render_album_table(
     // column only, clipped to the rows actually filled.
     let filled_rows =
         (albums.len().saturating_sub(list_state.offset()) as u16).min(rows_area.height);
+    let name = layout.cell(ColKey::Album);
     hit.main_album_col = Rect {
-        x: rows_area.x,
+        x: rows_area.x + name.map_or(0, |c| c.x) as u16,
         y: rows_area.y,
-        width: cols.name as u16,
+        width: layout.width_of(ColKey::Album) as u16,
         height: filled_rows,
     }
     .intersection(rows_area);
@@ -2316,9 +2010,13 @@ fn render_album_table(
         .map(|m| list_state.offset() + (m.y - rows_area.y) as usize);
 
     let items: Vec<ListItem> = albums
-        .iter()
+        .rows()
         .enumerate()
-        .map(|(i, a)| album_row(a, &cols, i == main_index, hover_row == Some(i)))
+        .map(|(i, a)| {
+            let playing =
+                marks.context.as_deref() == Some(crate::app::state::album_key(&a.id).as_str());
+            album_row(a, &layout, playing, i == main_index, hover_row == Some(i))
+        })
         .collect();
     let count = items.len();
     super::clamp_offset(list_state, count, rows_area.height as usize);
@@ -2332,95 +2030,55 @@ fn render_album_table(
 fn render_track_table(
     frame: &mut Frame,
     inner: Rect,
-    tracks: &[Track],
-    display: &[usize],
+    tracks: &crate::app::state::SortedList<Track>,
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
     marks: &PlayMarks,
-    sort: Option<TrackSort>,
     liked: &std::collections::HashMap<String, bool>,
-    show_track_no: bool,
+    album: bool,
     mouse: Option<Position>,
 ) {
-    let cols = TrackCols::new(inner.width as usize, display.len() as u32);
-    let mut rows_area = inner;
-    if inner.height >= 2 && !display.is_empty() {
-        let header_area = Rect { height: 1, ..inner };
-        // Blank spacer row under the header when there is room for it.
-        let skip = if inner.height >= 3 { 2 } else { 1 };
-        rows_area = Rect {
-            y: inner.y + skip,
-            height: inner.height - skip,
-            ..inner
-        };
-        frame.render_widget(Paragraph::new(track_header(&cols, sort)), header_area);
-    }
+    let layout = Layout::resolve(
+        &super::columns::tracks(album),
+        inner.width as usize,
+        tracks.items.len(),
+    );
+    let rows_area = match tracks.is_empty() {
+        true => inner,
+        false => layout.draw_header(frame, inner, Some(tracks.sort), mouse, hit),
+    };
     hit.main_list = rows_area;
-    super::clamp_offset(list_state, display.len(), rows_area.height as usize);
+    super::clamp_offset(list_state, tracks.len(), rows_area.height as usize);
 
     // Clickable cells: the artist and album columns, clipped to actual rows.
     let filled_rows =
-        (display.len().saturating_sub(list_state.offset()) as u16).min(rows_area.height);
-    let cell_col = |off: usize, width: usize| {
-        Rect {
-            x: rows_area.x.saturating_add(off as u16),
-            y: rows_area.y,
-            width: width as u16,
-            height: filled_rows,
-        }
-        .intersection(rows_area)
-    };
-    if cols.actions {
-        hit.main_like_col = cell_col(cols.like_offset(), LIKE_W);
-        hit.main_add_col = cell_col(cols.add_offset(), ADD_W);
-    }
-    hit.main_artist_col = cell_col(cols.artist_offset(), cols.artist);
-    if let Some(off) = cols.album_offset() {
-        hit.main_album_col = cell_col(off, cols.album);
-    }
+        (tracks.len().saturating_sub(list_state.offset()) as u16).min(rows_area.height);
+    track_cells(&layout, rows_area, rows_area.y, filled_rows, hit);
     let hover_cell: Option<(usize, HoverCol)> = mouse.and_then(|m| {
         let row = |y: u16| list_state.offset() + (y - rows_area.y) as usize;
-        if hit.main_like_col.contains(m) {
-            Some((row(m.y), HoverCol::Like))
-        } else if hit.main_add_col.contains(m) {
-            Some((row(m.y), HoverCol::Add))
-        } else if hit.main_artist_col.contains(m) {
-            Some((row(m.y), HoverCol::Artist))
-        } else if hit.main_album_col.contains(m) {
-            Some((row(m.y), HoverCol::Album))
-        } else {
-            None
-        }
+        hovered_cell(hit, m).map(|col| (row(m.y), col))
     });
     // Row positions are in display order; the playing marker resolves by URI.
-    let playing = marks
-        .uri
-        .as_deref()
-        .and_then(|uri| display.iter().position(|&ti| tracks[ti].uri == uri));
-    let items: Vec<ListItem> = display
+    let playing = marks.uri.as_deref().and_then(|uri| tracks.position_of(uri));
+    let items: Vec<ListItem> = tracks
+        .display
         .iter()
         .enumerate()
         .map(|(i, &ti)| {
+            let t = &tracks.items[ti];
             let mark = if Some(i) == playing {
                 RowMark::Playing
             } else {
                 RowMark::None
             };
-            // Album views number by the track's own position on the album;
-            // everything else numbers by position in the current view.
-            let no = if show_track_no {
-                tracks[ti].track_number
-            } else {
-                i as u32 + 1
-            };
             track_row(
-                &tracks[ti],
-                &cols,
-                no,
+                t,
+                &layout,
+                track_no(t, ti, album),
                 mark,
                 i == main_index,
-                liked.get(&tracks[ti].uri).copied(),
+                liked.get(&t.uri).copied(),
                 hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
             )
         })
@@ -2429,6 +2087,51 @@ fn render_track_table(
     let list = List::new(items);
     frame.render_stateful_widget(list, rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
+}
+
+/// Record the clickable columns of a track table: the `★ +` pair, the artist
+/// and the album, each clipped to the rows actually on screen.
+///
+/// One definition for both places a track table is drawn — the browse pane and
+/// the artist page's top-tracks block — so the two cannot come to disagree
+/// about where a control is.
+fn track_cells(layout: &Layout, body: Rect, top: u16, rows: u16, hit: &mut HitAreas) {
+    let col = |cell: Option<&Cell>, dx: usize, width: usize| {
+        let Some(cell) = cell else {
+            return Rect::default();
+        };
+        Rect {
+            x: body.x.saturating_add((cell.x + dx) as u16),
+            y: top,
+            width: width as u16,
+            height: rows,
+        }
+        .intersection(body)
+    };
+    let actions = layout.cell(ColKey::Actions);
+    hit.main_like_col = col(actions, 0, LIKE_W);
+    // Flush against the liked cell: each carries its own padding, so the two
+    // targets meet.
+    hit.main_add_col = col(actions, LIKE_W, ADD_W);
+    let artist = layout.cell(ColKey::Artist);
+    hit.main_artist_col = col(artist, 0, artist.map_or(0, |c| c.width));
+    let album = layout.cell(ColKey::Album);
+    hit.main_album_col = col(album, 0, album.map_or(0, |c| c.width));
+}
+
+/// Which clickable cell of a track table the pointer is inside.
+fn hovered_cell(hit: &HitAreas, m: Position) -> Option<HoverCol> {
+    if hit.main_like_col.contains(m) {
+        Some(HoverCol::Like)
+    } else if hit.main_add_col.contains(m) {
+        Some(HoverCol::Add)
+    } else if hit.main_artist_col.contains(m) {
+        Some(HoverCol::Artist)
+    } else if hit.main_album_col.contains(m) {
+        Some(HoverCol::Album)
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2465,15 +2168,13 @@ fn draw_tracks(
     render_track_table(
         frame,
         body,
-        &list.tracks,
-        &list.display,
+        &list.rows,
         main_index,
         list_state,
         hit,
         marks,
-        Some(list.sort),
         liked,
-        list.show_track_no(),
+        list.is_album(),
         mouse,
     );
 }
@@ -2628,32 +2329,31 @@ fn draw_search(
     // playing. A station is the same object wherever you found it, and a
     // second layout for it would say it was not.
     if search_tab == SearchTab::Stations {
-        let stations: Vec<&crate::app::state::Station> = results.stations.iter().collect();
+        let stations: Vec<&crate::app::state::Station> = results.stations.rows().collect();
         render_station_table(
             frame,
             body,
             &stations,
             favorites,
             playing_url,
+            results.stations.sort,
             main_index,
             list_state,
             hit,
+            mouse,
         );
         return;
     }
 
     if search_tab == SearchTab::Tracks {
-        let display: Vec<usize> = (0..results.tracks.len()).collect();
         render_track_table(
             frame,
             body,
             &results.tracks,
-            &display,
             main_index,
             list_state,
             hit,
             marks,
-            None,
             liked,
             false,
             mouse,
@@ -2669,61 +2369,42 @@ fn draw_search(
             main_index,
             list_state,
             hit,
+            marks,
             mouse,
         );
         return;
     }
 
     let width = body.width as usize;
-    let header: Option<Line> = match search_tab {
-        SearchTab::Playlists => Some(playlist_header(&PlaylistCols::new(width))),
-        _ => None,
+    let (columns, sort) = match search_tab {
+        SearchTab::Playlists => (super::columns::playlists(), results.playlists.sort),
+        _ => (super::columns::artists(), results.artists.sort),
     };
-    let mut rows_area = body;
-    if let Some(h) = header
-        && body.height >= 2
-    {
-        frame.render_widget(Paragraph::new(h), Rect { height: 1, ..body });
-        // Blank spacer row under the header when there is room for it.
-        let skip = if body.height >= 3 { 2 } else { 1 };
-        rows_area = Rect {
-            y: body.y + skip,
-            height: body.height - skip,
-            ..body
-        };
-    }
+    let layout = Layout::resolve(&columns, width, 0);
+    let rows_area = layout.draw_header(frame, body, Some(sort), mouse, hit);
     hit.main_list = rows_area;
 
     let items: Vec<ListItem> = match search_tab {
         SearchTab::Tracks | SearchTab::Albums | SearchTab::Stations => unreachable!(),
         SearchTab::Artists => results
             .artists
-            .iter()
+            .rows()
             .enumerate()
-            .map(|(i, a)| {
-                let mut line = Line::styled(fit(&a.name, width), theme::text());
-                if i == main_index {
-                    super::table::apply_selection(&mut line);
-                }
-                ListItem::new(line)
+            .map(|(i, a)| artist_row(a, &layout, i == main_index))
+            .collect(),
+        SearchTab::Playlists => results
+            .playlists
+            .rows()
+            .enumerate()
+            // Search results name every owner: one of them being yours is
+            // the exception here, not the rule. The playing marker still
+            // applies — a result can be the queue you are listening to.
+            .map(|(i, p)| {
+                let playing = marks.context.as_deref()
+                    == Some(crate::app::state::playlist_key(&p.id).as_str());
+                playlist_row(p, &layout, None, playing, i == main_index)
             })
             .collect(),
-        SearchTab::Playlists => {
-            let cols = PlaylistCols::new(width);
-            results
-                .playlists
-                .iter()
-                .enumerate()
-                // Search results name every owner: one of them being yours is
-                // the exception here, not the rule. The playing marker still
-                // applies — a result can be the queue you are listening to.
-                .map(|(i, p)| {
-                    let playing = marks.context.as_deref()
-                        == Some(crate::app::state::playlist_key(&p.id).as_str());
-                    playlist_row(p, &cols, None, playing, i == main_index)
-                })
-                .collect()
-        }
     };
     let count = items.len();
     let list = List::new(items);
@@ -2968,8 +2649,7 @@ mod tests {
             image_url: None,
             genres: vec![],
             top: crate::app::state::TrackList::new("Donna The Buffalo", "", None),
-            albums: vec![],
-            display: Vec::new(),
+            albums: vec![].into(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
             error: None,
@@ -3041,7 +2721,7 @@ mod tests {
         let mut st = AppState::new();
         st.main = MainView::Playlists;
         st.me_id = Some("dm".into());
-        st.playlists = vec![
+        st.set_playlists(vec![
             Playlist {
                 id: "p1".into(),
                 name: "trendy".into(),
@@ -3058,7 +2738,7 @@ mod tests {
                 owner_id: "npr".into(),
                 snapshot_id: "s".into(),
             },
-        ];
+        ]);
         let lines = render(&mut st, 90, 22);
         assert!(lines[PATH].contains("PLAYLISTS"), "{:?}", lines[PATH]);
         assert!(lines[PATH].contains("2 playlists"), "{:?}", lines[PATH]);
@@ -3083,7 +2763,7 @@ mod tests {
     fn an_album_page_with_no_history_offers_its_artist() {
         let mut st = album_state();
         if let MainView::Tracks(list) = &mut st.main {
-            for t in &mut list.tracks {
+            for t in &mut list.items {
                 t.artist_id = Some("r1".into());
             }
         }
@@ -3291,7 +2971,8 @@ mod tests {
         assert!(lines[7].contains("Title"));
         assert!(lines[7].contains("Artist"));
         assert!(lines[7].contains("Album"));
-        assert!(lines[7].contains("Time"));
+        // Time and the `★ +` pair head themselves.
+        assert!(!lines[7].contains("Time"));
         assert!(lines[9].contains("Alpha"));
         // No frame, so rows start at column 0.
         assert!(lines[10].starts_with("▶ ") && lines[10].contains("Beta"));
@@ -3354,6 +3035,37 @@ mod tests {
         }));
     }
 
+    /// The number belongs to the track, not to the row it lands on: a sorted
+    /// list reads 3, 2, 1 down the side rather than renumbering itself.
+    #[test]
+    fn the_number_column_stays_with_its_track_across_a_sort() {
+        let mut st = tracks_state(vec![
+            track("Zebra", "A1"),
+            track("Mango", "A2"),
+            track("Apple", "A3"),
+        ]);
+        let lines = render(&mut st, 90, 14);
+        let no = |line: &str| line.trim_start().split(' ').next().unwrap().to_string();
+        assert_eq!(
+            [no(&lines[9]), no(&lines[10]), no(&lines[11])],
+            ["1", "2", "3"]
+        );
+
+        if let MainView::Tracks(list) = &mut st.main {
+            list.sort = Sort {
+                key: ColKey::Title,
+                ascending: true,
+            };
+            list.rebuild();
+        }
+        let lines = render(&mut st, 90, 14);
+        assert!(lines[9].contains("Apple") && lines[11].contains("Zebra"));
+        assert_eq!(
+            [no(&lines[9]), no(&lines[10]), no(&lines[11])],
+            ["3", "2", "1"]
+        );
+    }
+
     #[test]
     fn sorted_view_reorders_rows_and_suppresses_next_marker() {
         let mut st = tracks_state(vec![
@@ -3363,15 +3075,17 @@ mod tests {
         ]);
         play_uri(&mut st, "spotify:track:Zebra");
         if let MainView::Tracks(list) = &mut st.main {
-            list.sort = crate::app::state::TrackSort {
-                key: SortKey::Title,
+            list.sort = Sort {
+                key: ColKey::Title,
                 ascending: true,
             };
-            list.rebuild_display();
+            list.rebuild();
         }
         let lines = render(&mut st, 90, 14);
-        assert!(lines[5].contains("sort: title ▲"));
-        assert!(lines[7].contains("Title▲"));
+        // The header marks the column it is ordered by, and nothing else on
+        // the page repeats that.
+        assert!(lines[7].contains("Title ▲"));
+        assert!(!lines.iter().any(|l| l.contains("sort:")));
         assert!(lines[9].contains("Apple"));
         assert!(lines[10].contains("Mango"));
         assert!(lines[11].starts_with("▶ ") && lines[11].contains("Zebra"));
@@ -3519,10 +3233,7 @@ mod tests {
         let header = lines.iter().find(|l| l.contains("Title")).unwrap();
         assert!(!header.contains("Year"), "{header:?}");
         assert!(!header.contains("Album"), "{header:?}");
-        assert!(
-            header.contains(&super::super::table::actions_label()),
-            "{header:?}"
-        );
+        // The pair heads itself, so the rects are what say it is still there.
         assert!(!st.hit.main_like_col.is_empty());
         assert!(!st.hit.main_add_col.is_empty());
     }
@@ -3739,7 +3450,7 @@ mod tests {
         st.spotify = crate::app::state::SpotifyState::Ready;
         st.main = MainView::Search(SearchResults {
             query: "muse".into(),
-            tracks: vec![track("Starlight", "Muse")],
+            tracks: vec![track("Starlight", "Muse")].into(),
             albums: vec![crate::app::state::AlbumItem {
                 id: "a1".into(),
                 name: "Black Holes".into(),
@@ -3749,12 +3460,14 @@ mod tests {
                 album_group: "album".into(),
                 track_count: 12,
                 cover_url: None,
-            }],
+            }]
+            .into(),
             artists: vec![crate::app::state::ArtistItem {
                 id: "r1".into(),
                 uri: "spotify:artist:r1".into(),
                 name: "Muse".into(),
-            }],
+            }]
+            .into(),
             playlists: vec![Playlist {
                 id: "p1".into(),
                 name: "Muse Mix".into(),
@@ -3762,8 +3475,9 @@ mod tests {
                 owner: "someone".into(),
                 owner_id: "someone".into(),
                 snapshot_id: "s1".into(),
-            }],
-            stations: vec![test_station("st1", "Radio Paradise")],
+            }]
+            .into(),
+            stations: vec![test_station("st1", "Radio Paradise")].into(),
             ..Default::default()
         });
         st
@@ -3813,14 +3527,12 @@ mod tests {
         let mut st = search_state();
         st.search_tab = SearchTab::Stations;
         st.radio_favorites = vec![station.clone()];
-        let saved = render(&mut st, 90, 18).join("\n");
-        assert!(
-            saved.contains(&format!(
-                "{} Radio Paradise",
-                super::super::table::LIKED_MARK
-            )),
-            "{saved}"
-        );
+        let lines = render(&mut st, 90, 18);
+        assert!(lines[7].contains("Saved"), "{:?}", lines[7]);
+        let row = lines.iter().find(|l| l.contains("Radio Paradise")).unwrap();
+        // The star has a column of its own now, off to the right of the name.
+        let star = row.find(super::super::table::LIKED_MARK).unwrap();
+        assert!(star > row.find("Radio Paradise").unwrap(), "{row:?}");
 
         let mut st = search_state();
         st.search_tab = SearchTab::Stations;
@@ -3847,7 +3559,7 @@ mod tests {
         let mut st = search_state();
         st.search_tab = SearchTab::Stations;
         if let MainView::Search(r) = &mut st.main {
-            r.stations.clear();
+            r.stations = crate::app::state::SortedList::new();
             r.stations_loading = true;
         }
         let joined = render(&mut st, 90, 18).join("\n");
@@ -3863,7 +3575,7 @@ mod tests {
         let mut st = search_state();
         st.search_tab = SearchTab::Stations;
         if let MainView::Search(r) = &mut st.main {
-            r.stations.clear();
+            r.stations = crate::app::state::SortedList::new();
             r.stations_loading = false;
         }
         let joined = render(&mut st, 90, 18).join("\n");
@@ -3878,7 +3590,7 @@ mod tests {
         let mut st = search_state();
         st.search_tab = SearchTab::Tracks;
         if let MainView::Search(r) = &mut st.main {
-            r.stations.clear();
+            r.stations = crate::app::state::SortedList::new();
             r.stations_loading = true;
         }
         render(&mut st, 90, 18);
@@ -3921,6 +3633,84 @@ mod tests {
         assert!(lines[9].contains("2006"));
     }
 
+    /// Every table heads its columns, spaces the header off its rows, and
+    /// keeps the same marker gutter clear at the left — which is what makes
+    /// the pages line up with each other.
+    #[test]
+    fn every_browse_table_heads_its_columns_over_the_same_gutter() {
+        let cases: [(SearchTab, &str, &str); 4] = [
+            (SearchTab::Tracks, "Title", "Starlight"),
+            (SearchTab::Albums, "Album", "Black Holes"),
+            (SearchTab::Artists, "Artist", "Muse"),
+            (SearchTab::Playlists, "Title", "Muse Mix"),
+        ];
+        let gutter = crate::ui::columns::PREFIX_W;
+        for (tab, head, first) in cases {
+            let mut st = search_state();
+            st.search_tab = tab;
+            let lines = render(&mut st, 90, 16);
+            assert!(
+                lines[7][..gutter].trim().is_empty() && lines[7].contains(head),
+                "{tab:?} header: {:?}",
+                lines[7]
+            );
+            assert!(lines[8].trim().is_empty(), "{tab:?} lost its spacer");
+            assert!(
+                lines[9][..gutter].trim().is_empty() && lines[9].contains(first),
+                "{tab:?} first row: {:?}",
+                lines[9]
+            );
+        }
+    }
+
+    /// The bug the old per-table offset chains existed to prevent: a click
+    /// rect that disagrees with the glyphs it covers.
+    ///
+    /// Checked at several widths, because a rect and a label drift apart at
+    /// the width where a column drops out from under one of them.
+    #[test]
+    fn a_header_hit_rect_covers_exactly_its_own_label() {
+        for width in [34, 45, 60, 80, 120] {
+            let mut st = tracks_state(vec![track("Starlight", "Muse")]);
+            let lines = render(&mut st, width, 16);
+            assert!(
+                !st.hit.column_headers.is_empty(),
+                "no headers recorded at width {width}"
+            );
+            let layout = Layout::resolve(
+                &crate::ui::columns::tracks(false),
+                (width - GUTTER) as usize,
+                1,
+            );
+            for (rect, key) in &st.hit.column_headers {
+                let printed: String = lines[rect.y as usize]
+                    .chars()
+                    .skip(rect.x as usize)
+                    .take(rect.width as usize)
+                    .collect();
+                // The active column carries a ▲, which is part of the label
+                // and so part of the target. A narrow column clips its label,
+                // and the target clips with it.
+                let marker = match *key == ColKey::No {
+                    true => " ▲",
+                    false => "",
+                };
+                let cell = layout.cell(*key).expect("a rect for a dropped column");
+                if key.head().is_empty() {
+                    // A column that heads itself with nothing takes its whole
+                    // cell as the target — there is no label to aim at.
+                    assert_eq!(rect.width as usize, cell.width, "{key:?} at width {width}");
+                    continue;
+                }
+                let expected = fit(&format!("{}{marker}", key.head()), cell.width)
+                    .trim_end()
+                    .to_string();
+                assert_eq!(printed, expected, "{key:?} at width {width}");
+                assert!(!printed.is_empty() && !printed.starts_with(' '));
+            }
+        }
+    }
+
     /// An album row's *name* is a link, the way the Album column of a track
     /// table is: one click opens it. A double-click or Enter is a way in that
     /// nothing on screen says.
@@ -3931,14 +3721,19 @@ mod tests {
         let lines = render(&mut st, 90, 16);
         let col = st.hit.main_album_col;
         assert!(!col.is_empty());
-        // Starts at the left edge of the rows and covers the name column.
-        assert_eq!(col.x, st.hit.main_list.x);
+        // Covers the name column, past the marker gutter every table carries.
+        assert_eq!(
+            col.x,
+            st.hit.main_list.x + crate::ui::columns::PREFIX_W as u16
+        );
         assert_eq!(col.y, st.hit.main_list.y);
-        assert_eq!(col.width, AlbumCols::new(90 - GUTTER as usize).name as u16);
+        let layout = Layout::resolve(&crate::ui::columns::albums(), 90 - GUTTER as usize, 0);
+        assert_eq!(col.width, layout.width_of(ColKey::Album) as u16);
         // Clipped to the one row that actually has an album on it.
         assert_eq!(col.height, 1);
         let name: String = lines[col.y as usize]
             .chars()
+            .skip(col.x as usize)
             .take(col.width as usize)
             .collect();
         assert!(name.starts_with("Black Holes"), "{name:?}");
@@ -3948,7 +3743,7 @@ mod tests {
     fn empty_search_tab_shows_message() {
         let mut st = search_state();
         if let MainView::Search(r) = &mut st.main {
-            r.playlists.clear();
+            r.playlists = crate::app::state::SortedList::new();
         }
         st.search_tab = SearchTab::Playlists;
         let lines = render(&mut st, 60, 14);
@@ -3996,8 +3791,7 @@ mod tests {
             image_url: Some("https://i.scdn.co/image/artist".into()),
             genres: vec!["alt rock".into(), "space rock".into()],
             top,
-            albums,
-            display: Vec::new(),
+            albums: albums.into(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
             error: None,

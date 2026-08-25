@@ -230,11 +230,11 @@ mod tests {
     fn open(query: &str) -> AppState {
         let mut st = AppState::new();
         st.me_id = Some("me".into());
-        st.playlists = vec![
+        st.set_playlists(vec![
             playlist("a", "Late Night", "me"),
             playlist("b", "Someone Else's", "them"),
             playlist("c", "Lunch", "me"),
-        ];
+        ]);
         let uri = "spotify:track:x".to_string();
         st.picker = Some(PlaylistPicker {
             order: st.picker_order(&uri),
@@ -342,7 +342,7 @@ mod tests {
     fn no_playlists_of_your_own_reads_as_itself() {
         let mut st = AppState::new();
         st.me_id = Some("me".into());
-        st.playlists = vec![playlist("b", "Someone Else's", "them")];
+        st.set_playlists(vec![playlist("b", "Someone Else's", "them")]);
         let uri = "spotify:track:x".to_string();
         st.picker = Some(PlaylistPicker {
             order: st.picker_order(&uri),

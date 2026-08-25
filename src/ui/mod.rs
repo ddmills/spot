@@ -1,3 +1,4 @@
+pub mod columns;
 mod deck;
 mod help;
 mod main_pane;
@@ -153,18 +154,20 @@ mod tests {
         // A signed-in Premium account, which is what the library screens are
         // about; the app itself starts on radio alone.
         st.spotify = crate::app::state::SpotifyState::Ready;
-        st.playlists = (0..8)
-            .map(|i| Playlist {
-                id: format!("p{i}"),
-                name: format!("Playlist {i}"),
-                track_count: 10 + i,
-                owner: "me".into(),
-                owner_id: "me".into(),
-                snapshot_id: "s".into(),
-            })
-            .collect();
+        st.set_playlists(
+            (0..8)
+                .map(|i| Playlist {
+                    id: format!("p{i}"),
+                    name: format!("Playlist {i}"),
+                    track_count: 10 + i,
+                    owner: "me".into(),
+                    owner_id: "me".into(),
+                    snapshot_id: "s".into(),
+                })
+                .collect(),
+        );
         let mut list = TrackList::new("Hey Arnold!", "by me", None);
-        list.tracks = (0..12)
+        list.rows = ((0..12)
             .map(|i| crate::app::state::Track {
                 uri: format!("spotify:track:t{i}"),
                 name: format!("Track Number {i}"),
@@ -177,11 +180,11 @@ mod tests {
                 artist_id: Some("art".into()),
                 cover_url: None,
             })
-            .collect();
-        list.display = (0..list.tracks.len()).collect();
+            .collect::<Vec<_>>())
+        .into();
         // The same list is what is playing, so the bar's context row names it
         // — the queue is the list's rows, at the row that is on.
-        let mut q = crate::app::queue::Queue::new(list.tracks.clone(), 3, "My Mix");
+        let mut q = crate::app::queue::Queue::new(list.items.clone(), 3, "My Mix");
         q.source_key = Some(crate::app::state::playlist_key("p2"));
         st.queue = Some(q);
         st.main = crate::app::state::MainView::Tracks(list);
@@ -282,7 +285,7 @@ mod tests {
             .collect();
         assert!(row.contains("Title"), "not the column header: {row:?}");
         assert!(
-            row.trim_end().len() > 90,
+            row.find("Year").is_some_and(|at| at > 70),
             "the table stops short of the screen: {row:?}"
         );
     }
@@ -313,8 +316,7 @@ mod tests {
                 image_url: None,
                 genres: vec![],
                 top: TrackList::new("Muse", "", None),
-                albums: vec![],
-                display: Vec::new(),
+                albums: vec![].into(),
                 tab: crate::app::state::ArtistTab::Albums,
                 loading: false,
                 error: None,
@@ -529,11 +531,12 @@ mod tests {
         hls.hls = true;
         hls.codec = "UNKNOWN".into();
         hls.bitrate = 0;
-        view.rows = vec![
+        view.rows = (vec![
             RadioRow::Station(station("a", "Radio Paradise")),
             RadioRow::Station(station("b", "SomaFM")),
             RadioRow::Station(hls),
-        ];
+        ])
+        .into();
         view.loading = false;
         st.main = crate::app::state::MainView::Radio(view);
 
@@ -643,7 +646,7 @@ mod tests {
             unreachable!()
         };
         let mut top = TrackList::new("Roy Hargrove", "top tracks", None);
-        top.append(list.tracks);
+        top.append(list.rows.items);
         let mut view = crate::app::state::ArtistView {
             id: "r1".into(),
             uri: "spotify:artist:r1".into(),
@@ -665,8 +668,8 @@ mod tests {
                         cover_url: Some(format!("https://i.scdn.co/image/a{i}")),
                     }
                 })
-                .collect(),
-            display: Vec::new(),
+                .collect::<Vec<_>>()
+                .into(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
             error: None,
@@ -743,11 +746,12 @@ mod tests {
         let mut soma = station("b", "SomaFM Groove Salad");
         soma.tags = "ambient,downtempo,electronic".into();
         soma.codec = "MP3".into();
-        view.rows = vec![
+        view.rows = (vec![
             RadioRow::Station(station("a", "Radio Paradise (Main Mix)")),
             RadioRow::Station(soma.clone()),
             RadioRow::Station(bbc),
-        ];
+        ])
+        .into();
         view.loading = false;
         st.radio_favorites = vec![station("a", "Radio Paradise (Main Mix)")];
         st.main = crate::app::state::MainView::Radio(view);

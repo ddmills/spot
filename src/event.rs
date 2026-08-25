@@ -10,8 +10,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
-    self as state, AppState, ArtistRow, BackTarget, CrumbTarget, HomeItem, InputMode, MainView,
-    PICKER_ROWS, RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SortKey, SpotifyState,
+    self as state, AppState, ArtistRow, BackTarget, ColKey, CrumbTarget, HomeItem, InputMode,
+    MainView, PICKER_ROWS, RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SpotifyState,
     Station, Track, TrackList, UpdateState, ViewKey,
 };
 
@@ -215,6 +215,20 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
     // than falling through.
     if st.hit.retry_btn.contains(pos) {
         retry_current_view(st, tx);
+        return;
+    }
+
+    // The column header, which sits above the rows — so this branch and the
+    // one below it can never resolve to each other. Same column flips the
+    // arrow; a different one starts ascending.
+    if let Some(key) = st
+        .hit
+        .column_headers
+        .iter()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, key)| *key)
+    {
+        sort_by(st, key);
         return;
     }
 
@@ -1143,34 +1157,93 @@ fn snap_to_selection(st: &mut AppState) {
     }
 }
 
-/// `o`: cycle the track view's sort column (resets to ascending on change).
-fn cycle_sort(st: &mut AppState) {
-    let MainView::Tracks(list) = &mut st.main else {
-        return;
-    };
-    list.sort.key = match list.sort.key {
-        SortKey::Position => SortKey::Title,
-        SortKey::Title => SortKey::Artist,
-        SortKey::Artist => SortKey::Album,
-        SortKey::Album => SortKey::Duration,
-        SortKey::Duration => SortKey::Position,
-    };
-    list.sort.ascending = true;
-    st.resort_main();
-    snap_to_selection(st);
+/// The sort of the table on screen, when the page has one to read or write.
+///
+/// One resolution for every table, so `o`, `O` and a click on a header all
+/// reach the same field. The Playlists page's sort is the odd one out — it
+/// lives on the state rather than on its view, because [`MainView::Playlists`]
+/// carries no data at all.
+fn main_sort(st: &mut AppState) -> Option<&mut state::Sort> {
+    let tab = st.search_tab;
+    match &mut st.main {
+        MainView::Playlists => Some(&mut st.playlists_sort),
+        MainView::Tracks(list) => Some(&mut list.sort),
+        MainView::Radio(v) => Some(&mut v.rows.sort),
+        MainView::Search(r) => Some(match tab {
+            SearchTab::Tracks => &mut r.tracks.sort,
+            SearchTab::Albums => &mut r.albums.sort,
+            SearchTab::Artists => &mut r.artists.sort,
+            SearchTab::Playlists => &mut r.playlists.sort,
+            SearchTab::Stations => &mut r.stations.sort,
+        }),
+        // The page has two lists and one header; the header is the top
+        // tracks', so that is the one the keys and the click reach.
+        MainView::Artist(v) => Some(&mut v.top.sort),
+        MainView::Home => None,
+    }
 }
 
-/// `O`: flip the sort direction (meaningless for Position order).
-fn flip_sort(st: &mut AppState) {
-    let MainView::Tracks(list) = &mut st.main else {
-        return;
+/// Re-cut the view for a sort the user just asked for.
+///
+/// The list goes back to the top rather than following the row that was
+/// selected. A sort is asked for in order to read the list from its new
+/// start, and jumping to wherever the old selection landed hides exactly
+/// that — half the point of pressing the key.
+fn apply_sort(st: &mut AppState) {
+    st.resort_main();
+    st.main_to_top();
+}
+
+/// Order the table on screen by `key`.
+///
+/// One column clicked over and over runs ascending, descending, then off —
+/// back to the order the source sent. Without that last step the only way out
+/// of a sort is to remember which key clears it, and there is nothing on
+/// screen that says.
+fn sort_by(st: &mut AppState, key: ColKey) {
+    let Some(sort) = main_sort(st) else { return };
+    *sort = match (sort.key == key, sort.ascending) {
+        (true, true) => state::Sort {
+            key,
+            ascending: false,
+        },
+        (true, false) => state::Sort::default(),
+        (false, _) => state::Sort {
+            key,
+            ascending: true,
+        },
     };
-    if list.sort.key == SortKey::Position {
+    apply_sort(st);
+}
+
+/// `o`: step to the next sortable column of the table on screen.
+///
+/// Read off the header that was last drawn, so it covers every table and
+/// never names a column the pane is too narrow to show.
+fn cycle_sort(st: &mut AppState) {
+    let keys = st.hit.sort_keys.clone();
+    if keys.is_empty() {
         return;
     }
-    list.sort.ascending = !list.sort.ascending;
-    st.resort_main();
-    snap_to_selection(st);
+    let Some(sort) = main_sort(st) else { return };
+    let next = match keys.iter().position(|&k| k == sort.key) {
+        Some(i) => keys[(i + 1) % keys.len()],
+        None => keys[0],
+    };
+    sort.key = next;
+    sort.ascending = true;
+    apply_sort(st);
+}
+
+/// `O`: flip the sort direction.
+///
+/// Including in fetch order, where it reads the list from the bottom up —
+/// the `#` column has a direction like any other now that the number stays
+/// with its track.
+fn flip_sort(st: &mut AppState) {
+    let Some(sort) = main_sort(st) else { return };
+    sort.ascending = !sort.ascending;
+    apply_sort(st);
 }
 
 /// ←/→: switch tabs on the three tabbed views.
@@ -1293,7 +1366,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             return;
         }
         MainView::Playlists => {
-            let Some(id) = st.playlists.get(st.main_index).map(|p| p.id.clone()) else {
+            let Some(id) = st.playlist_row(st.main_index).map(|p| p.id.clone()) else {
                 return;
             };
             navigate(st, AppCommand::LoadPlaylistTracks { playlist_id: id }, tx);
@@ -1361,8 +1434,10 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             None => None,
         },
         MainView::Search(results) => match st.search_tab {
+            // Display order, not fetch order: once the tab sorts, what you see
+            // is the play order the queue is built from.
             SearchTab::Tracks => results.tracks.get(index).map(|_| AppCommand::Play {
-                tracks: results.tracks.clone(),
+                tracks: results.tracks.rows().cloned().collect(),
                 start: index,
                 name: "Search results".to_string(),
                 key: None,
@@ -1404,7 +1479,7 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// play order, with the source key attached only when the rows are in fetch
 /// order — the one order later pages can honestly extend.
 fn play_list(list: &TrackList, start: usize, shuffle: bool) -> AppCommand {
-    let natural = list.sort.key == SortKey::Position;
+    let natural = list.sort.is_natural();
     AppCommand::Play {
         tracks: display_tracks(list),
         start,
@@ -1417,10 +1492,7 @@ fn play_list(list: &TrackList, start: usize, shuffle: bool) -> AppCommand {
 
 /// The tracks of a list in display order, cloned.
 fn display_tracks(list: &TrackList) -> Vec<Track> {
-    list.display
-        .iter()
-        .map(|&i| list.tracks[i].clone())
-        .collect()
+    list.rows().cloned().collect()
 }
 
 /// Start playback of whatever the main pane is showing, from the top
@@ -1564,8 +1636,7 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     // trip — opening it is the way in, as it always has been.
     let playlist = match &st.main {
         MainView::Playlists => st
-            .playlists
-            .get(st.main_index)
+            .playlist_row(st.main_index)
             .map(|p| (p.id.clone(), p.name.clone())),
         MainView::Home => match st.home_items().get(st.main_index) {
             Some(HomeItem::LikedSongs) => {
@@ -1644,10 +1715,7 @@ fn open_album_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) 
         })
     };
     let cmd = match &st.main {
-        MainView::Tracks(list) => list
-            .display
-            .get(st.main_index)
-            .and_then(|&i| from_track(&list.tracks[i])),
+        MainView::Tracks(list) => list.get(st.main_index).and_then(from_track),
         // The artist page names albums in both of its sections: the Album
         // cell of a top track, and the cards under them.
         MainView::Artist(v) => match v.row(st.main_index) {
@@ -1813,10 +1881,7 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
         })
     };
     let cmd = match &st.main {
-        MainView::Tracks(list) => list
-            .display
-            .get(st.main_index)
-            .and_then(|&i| from_track(&list.tracks[i])),
+        MainView::Tracks(list) => list.get(st.main_index).and_then(from_track),
         MainView::Artist(v) => match v.row(st.main_index) {
             Some(ArtistRow::Track(t)) => from_track(t),
             _ => None,
@@ -1851,10 +1916,7 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
 /// `a`: put the selected track next in the queue (track lists only).
 fn queue_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let track = match &st.main {
-        MainView::Tracks(list) => list
-            .display
-            .get(st.main_index)
-            .map(|&i| list.tracks[i].clone()),
+        MainView::Tracks(list) => list.get(st.main_index).cloned(),
         MainView::Search(results) if st.search_tab == SearchTab::Tracks => {
             results.tracks.get(st.main_index).cloned()
         }
@@ -1908,10 +1970,7 @@ fn toggle_like_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// disagree about which record the row is.
 fn selected_track_uri(st: &AppState) -> Option<String> {
     match &st.main {
-        MainView::Tracks(list) => list
-            .display
-            .get(st.main_index)
-            .map(|&i| list.tracks[i].uri.clone()),
+        MainView::Tracks(list) => list.get(st.main_index).map(|t| t.uri.clone()),
         MainView::Search(results) if st.search_tab == SearchTab::Tracks => {
             results.tracks.get(st.main_index).map(|t| t.uri.clone())
         }
@@ -2021,8 +2080,8 @@ mod tests {
                 album_group: "album".into(),
                 track_count: 12,
                 cover_url: Some("https://i.scdn.co/image/abc".into()),
-            }],
-            display: vec![0],
+            }]
+            .into(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
             error: None,
@@ -2092,6 +2151,140 @@ mod tests {
         }
     }
 
+    /// Clicking a header sorts by that column; clicking the same one again
+    /// turns it round.
+    #[test]
+    fn clicking_a_header_sorts_by_its_column() {
+        let (tx, _rx) = channel();
+        let mut st = liked_state();
+        // The header sits above the rows, which is what keeps the two
+        // branches of the click apart.
+        st.hit.main_list = Rect::new(0, 4, 60, 10);
+        st.hit.column_headers = vec![(Rect::new(6, 2, 5, 1), state::ColKey::Title)];
+
+        handle_click(&mut st, Position { x: 7, y: 2 }, &tx);
+        let MainView::Tracks(list) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(list.sort.key, state::ColKey::Title);
+        assert!(list.sort.ascending);
+        assert_eq!(list.get(0).unwrap().name, "Hysteria");
+
+        handle_click(&mut st, Position { x: 7, y: 2 }, &tx);
+        let MainView::Tracks(list) = &st.main else {
+            unreachable!()
+        };
+        assert!(!list.sort.ascending, "the same column did not turn round");
+        assert_eq!(list.get(0).unwrap().name, "Starlight");
+
+        // A third click clears it: back to the order the source sent.
+        handle_click(&mut st, Position { x: 7, y: 2 }, &tx);
+        let MainView::Tracks(list) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(list.sort, state::Sort::default());
+        assert_eq!(list.get(0).unwrap().name, "Starlight");
+        assert_eq!(list.get(1).unwrap().name, "Hysteria");
+    }
+
+    /// `o` walks the header that was drawn, so it can never name a column the
+    /// pane was too narrow to show.
+    #[test]
+    fn o_cycles_only_the_columns_on_screen() {
+        let mut st = liked_state();
+        // A narrow pane: no year, no album, no track number.
+        st.hit.sort_keys = vec![
+            state::ColKey::Title,
+            state::ColKey::Artist,
+            state::ColKey::Time,
+        ];
+        for expected in [
+            state::ColKey::Title,
+            state::ColKey::Artist,
+            state::ColKey::Time,
+            state::ColKey::Title,
+        ] {
+            cycle_sort(&mut st);
+            let MainView::Tracks(list) = &st.main else {
+                unreachable!()
+            };
+            assert_eq!(list.sort.key, expected);
+            assert!(list.sort.ascending, "a new column did not start ascending");
+        }
+    }
+
+    /// Every table sorts, not only the track lists: `o` on the Playlists page
+    /// reaches the sort that lives beside it on the state.
+    #[test]
+    fn the_playlists_page_sorts_too() {
+        let mut st = connected();
+        st.main = MainView::Playlists;
+        st.set_playlists(vec![
+            playlist("p1", "trendy", "dm"),
+            playlist("p2", "Ambient", "dm"),
+        ]);
+        st.hit.sort_keys = vec![state::ColKey::Title, state::ColKey::Owner];
+
+        cycle_sort(&mut st);
+        assert_eq!(st.playlists_sort.key, state::ColKey::Title);
+        assert_eq!(st.playlist_row(0).unwrap().name, "Ambient");
+        // The library itself is untouched: the add-to-playlist box freezes
+        // indices into it.
+        assert_eq!(st.playlists[0].name, "trendy");
+    }
+
+    /// The Tracks tab of a search plays what is on screen, like every other
+    /// list — it sent raw fetch order before the tab could sort.
+    #[test]
+    fn a_sorted_search_tab_plays_its_display_order() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.search_tab = SearchTab::Tracks;
+        st.main = MainView::Search(state::SearchResults {
+            query: "muse".into(),
+            tracks: vec![
+                track("Starlight", Some("a1")),
+                track("Hysteria", Some("a1")),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        st.hit.sort_keys = vec![state::ColKey::Title];
+        cycle_sort(&mut st);
+
+        activate_selection(&mut st, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::Play { tracks, start, .. }) => {
+                assert_eq!(tracks[0].name, "Hysteria", "the queue is not display order");
+                // The sort put the cursor back on row 0, which is what Enter
+                // then plays.
+                assert_eq!(start, 0);
+            }
+            other => panic!("sent {other:?}"),
+        }
+    }
+
+    /// A sort is asked for in order to read the list from its new start, so it
+    /// takes the view there rather than chasing the row that was selected.
+    #[test]
+    fn sorting_returns_the_view_to_the_top() {
+        let mut st = liked_state();
+        st.hit.sort_keys = vec![state::ColKey::Title];
+        st.hit.main_list = Rect::new(0, 4, 60, 10);
+        // Down the list, and scrolled away from the top.
+        st.main_index = 1;
+        *st.main_list.offset_mut() = 1;
+
+        cycle_sort(&mut st);
+        assert_eq!(st.main_index, 0);
+        assert_eq!(st.main_list.offset(), 0);
+
+        // And the same the other way round: `O` does not chase it either.
+        st.main_index = 1;
+        flip_sort(&mut st);
+        assert_eq!(st.main_index, 0);
+    }
+
     /// A sorted view plays as the snapshot it is: the rows go out in display
     /// order, and the cache key stays behind — later pages arrive in fetch
     /// order and must not be appended to a queue that is not in it.
@@ -2102,11 +2295,11 @@ mod tests {
         if let MainView::Tracks(list) = &mut st.main {
             list.cache_key = Some(state::album_key("a1"));
             list.loading = true;
-            list.sort = crate::app::state::TrackSort {
-                key: SortKey::Title,
+            list.sort = state::Sort {
+                key: state::ColKey::Title,
                 ascending: true,
             };
-            list.rebuild_display();
+            list.rebuild();
         }
         st.resort_main();
 
@@ -2344,8 +2537,7 @@ mod tests {
             unreachable!()
         };
         v.top = TrackList::new("Muse", "top tracks", None);
-        v.albums.clear();
-        v.display.clear();
+        v.albums = state::SortedList::new();
         v.error = Some(state::LoadError::new(
             "no route to host",
             AppCommand::OpenArtist {
@@ -2699,7 +2891,7 @@ mod tests {
     fn mashing_a_row_leaves_one_frame() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
-        st.playlists = vec![playlist("p1", "trendy", "dm")];
+        st.set_playlists(vec![playlist("p1", "trendy", "dm")]);
 
         for _ in 0..4 {
             activate_selection(&mut st, &tx);
@@ -2801,7 +2993,7 @@ mod tests {
 
         // A different album from the same page still opens.
         if let MainView::Tracks(list) = &mut st.main {
-            list.tracks[0].album_id = Some("a2".into());
+            list.items[0].album_id = Some("a2".into());
         }
         open_album_of_selection(&mut st, &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::OpenAlbum { id, .. }) if id == "a2"));
@@ -2867,7 +3059,7 @@ mod tests {
     fn drilling_down_from_home_leaves_a_trail() {
         let (tx, mut rx) = channel();
         let mut st = connected();
-        st.playlists = vec![playlist("p1", "trendy", "dm")];
+        st.set_playlists(vec![playlist("p1", "trendy", "dm")]);
 
         assert!(matches!(st.main, MainView::Home));
         assert_eq!(st.back_target(), None, "Home has nowhere to go back to");
@@ -2907,7 +3099,7 @@ mod tests {
         );
 
         // Someone else's playlist of the same name is not Spotify's.
-        st.playlists = vec![playlist("p1", "Discover Weekly", "dm")];
+        st.set_playlists(vec![playlist("p1", "Discover Weekly", "dm")]);
         assert_eq!(
             st.home_items(),
             vec![HomeItem::LikedSongs, HomeItem::Playlists, HomeItem::Radio]
@@ -2944,7 +3136,7 @@ mod tests {
     fn a_single_click_anywhere_on_a_home_row_opens_it() {
         let (tx, mut rx) = channel();
         let mut st = connected();
-        st.playlists = vec![playlist("p1", "trendy", "dm")];
+        st.set_playlists(vec![playlist("p1", "trendy", "dm")]);
         // What the draw records for two entries at rows 4..6 and 7..9.
         st.hit.home_rows = vec![(Rect::new(1, 4, 90, 2), 0), (Rect::new(1, 7, 90, 2), 1)];
 
@@ -3129,7 +3321,7 @@ mod tests {
 
     fn radio_page(scope: RadioScope, rows: Vec<RadioRow>) -> MainView {
         let mut view = crate::app::state::RadioView::new(scope, 0);
-        view.rows = rows;
+        view.rows = rows.into();
         view.loading = false;
         MainView::Radio(view)
     }
@@ -3291,7 +3483,7 @@ mod tests {
     fn station_search(station: Station) -> MainView {
         MainView::Search(crate::app::state::SearchResults {
             query: "jazz".into(),
-            stations: vec![station],
+            stations: vec![station].into(),
             ..Default::default()
         })
     }
@@ -3437,7 +3629,7 @@ mod tests {
         let MainView::Artist(v) = &mut st.main else {
             unreachable!()
         };
-        v.albums.push(AlbumItem {
+        v.albums.items.push(AlbumItem {
             id: "a2".into(),
             name: "Hysteria".into(),
             artists: "Muse".into(),
@@ -3467,7 +3659,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(v.tab, ArtistTab::Singles);
-        assert_eq!(v.display, vec![1]);
+        assert_eq!(v.albums.display, vec![1]);
 
         // Two groups, so one more step wraps back to the first.
         cycle_view_tab(&mut st, 1, &tx);
@@ -3492,7 +3684,7 @@ mod tests {
         let MainView::Artist(v) = &mut st.main else {
             unreachable!()
         };
-        v.albums.push(AlbumItem {
+        v.albums.items.push(AlbumItem {
             id: "a2".into(),
             name: "Hysteria".into(),
             artists: "Muse".into(),
@@ -3528,7 +3720,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(v.tab, ArtistTab::Singles);
-        assert_eq!(v.display, vec![1]);
+        assert_eq!(v.albums.display, vec![1]);
     }
 
     /// One group is no choice: the strip is not drawn, and ←/→ has nothing to
@@ -3543,7 +3735,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(v.tab, ArtistTab::Albums);
-        assert_eq!(v.display, vec![0]);
+        assert_eq!(v.albums.display, vec![0]);
     }
 
     /// While a station is live the Spotify-only transport keys must not reach
@@ -3709,7 +3901,7 @@ mod tests {
         let mut st = connected();
         st.show_player = true;
         st.me_id = Some("me".into());
-        st.playlists = vec![
+        st.set_playlists(vec![
             state::Playlist {
                 id: "p1".into(),
                 name: "Late Night".into(),
@@ -3726,7 +3918,7 @@ mod tests {
                 owner_id: "them".into(),
                 snapshot_id: "s".into(),
             },
-        ];
+        ]);
         start_playing(&mut st);
         st.hit.add_btn = Rect::new(70, 0, 5, 1);
         st

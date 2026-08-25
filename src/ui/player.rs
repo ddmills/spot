@@ -22,13 +22,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
 
+use super::columns::{ColKey, GUTTER, Layout, right, row_spans, scroll_col};
 use super::deck;
 use super::main_pane;
 use super::play_state;
-use super::table::{
-    ACTIONS_MIN, ACTIONS_W, ADD_W, LIKE_W, action_spans, apply_selection, art_w, draw_scrollbar,
-    fit,
-};
+use super::table::{ADD_W, LIKE_W, action_spans, apply_selection, art_w, draw_scrollbar, fit};
 use super::theme;
 use crate::app::queue::Queue;
 use crate::app::state::{AppState, HitAreas, Track, format_duration};
@@ -47,11 +45,6 @@ const MAX_BANDS: u16 = 80;
 /// gap separates the bars horizontally the way the dark half of every `▄`
 /// separates the LEDs vertically (see [`viz_cell`]).
 const BAND_STRIDE: u16 = 2;
-
-const DUR_W: usize = 5;
-const COL_GAP: &str = "   ";
-/// Leading marker column: "▶ " on the playing row, blank elsewhere.
-const PREFIX_W: usize = 2;
 
 /// Row heights for the sections above the queue, each including the blank
 /// spacer rows around it. The progress band leads with two of them: the bar
@@ -302,6 +295,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let progress_area = band(rows.progress);
     let transport_area = band(rows.transport);
     let list_head_area = band(rows.list_head);
+    // The blank under the name-and-count row, which the queue heads its
+    // columns on. Empty on a pane too short for that band to have one.
+    let queue_head = match rows.list_head >= 2 {
+        true => Rect {
+            y: list_head_area.y + 1,
+            height: 1,
+            ..list_head_area
+        },
+        false => Rect::default(),
+    };
     let queue_area = band(rows.queue);
 
     // A station uses the same bands in the same order, minus the two things a
@@ -389,6 +392,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         draw_queue(
             frame,
             queue_area,
+            queue_head,
             queue.as_ref(),
             0,
             queue_list,
@@ -482,6 +486,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     draw_queue(
         frame,
         queue_area,
+        queue_head,
         queue.as_ref(),
         *queue_index,
         queue_list,
@@ -803,69 +808,6 @@ fn draw_scope(
     }
 }
 
-/// Column widths for the queue table: marker + number + title + artist +
-/// the `★ +` pair + time.
-struct QueueCols {
-    /// Right-aligned row number, wide enough for the longest one.
-    num: usize,
-    name: usize,
-    /// 0 = hidden (narrow panes).
-    artist: usize,
-    /// The `★ +` pair before the time. Dropped last, as in the browse table.
-    actions: bool,
-}
-
-impl QueueCols {
-    fn new(width: usize, len: usize) -> Self {
-        let num = len.to_string().len().max(2);
-        let actions = width >= ACTIONS_MIN;
-        let mut fixed = PREFIX_W + num + COL_GAP.len() + DUR_W + COL_GAP.len();
-        if actions {
-            fixed += ACTIONS_W + COL_GAP.len();
-        }
-        let flex = width.saturating_sub(fixed);
-        if width >= 40 + num {
-            let flex = flex.saturating_sub(COL_GAP.len());
-            // Titles are what a reader scans for, and they run longer than
-            // artist names — especially the CJK ones, which cost two cells a
-            // character. Give them the larger share.
-            let name = flex * 60 / 100;
-            Self {
-                num,
-                name,
-                artist: flex - name,
-                actions,
-            }
-        } else {
-            Self {
-                num,
-                name: flex,
-                artist: 0,
-                actions,
-            }
-        }
-    }
-
-    /// Column offset (from the row start) of the liked cell of the pair.
-    ///
-    /// Chained from the columns before it for the reason the browse table's
-    /// offsets are: a click rect that disagrees with the glyph it covers is
-    /// the bug this arithmetic exists to prevent.
-    fn like_offset(&self) -> usize {
-        let mut x = PREFIX_W + self.num + COL_GAP.len() + self.name;
-        if self.artist > 0 {
-            x += COL_GAP.len() + self.artist;
-        }
-        x + COL_GAP.len()
-    }
-
-    /// Column offset of the add cell, flush against the liked one: each cell
-    /// carries its own padding, so the two targets meet.
-    fn add_offset(&self) -> usize {
-        self.like_offset() + LIKE_W
-    }
-}
-
 /// Which control of a queue row the mouse is over.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QueueHover {
@@ -873,15 +815,12 @@ enum QueueHover {
     Add,
 }
 
-/// Columns the queue list keeps clear on its right: a blank one, then the
-/// scrollbar. The same two the browse pane reserves, for the same reason — a
-/// duration flush against the bar reads as one mark rather than two.
-const QUEUE_GUTTER: u16 = 2;
-
 #[allow(clippy::too_many_arguments)]
 fn draw_queue(
     frame: &mut Frame,
     area: Rect,
+    // The blank row of the band above, which the column header takes.
+    header: Rect,
     queue: Option<&Queue>,
     queue_index: usize,
     queue_list: &mut ratatui::widgets::ListState,
@@ -907,13 +846,30 @@ fn draw_queue(
         return;
     };
 
-    // The name and count now head the list from `draw_list_header`, so the
-    // rows start at the top of this band. Its right edge is the scrollbar's
-    // gutter — see [`QUEUE_GUTTER`].
+    // The name and count head the list from the band above, so the rows start
+    // at the top of this one. Its right edge is the scrollbar's gutter.
     let rows_area = Rect {
-        width: area.width.saturating_sub(QUEUE_GUTTER),
+        width: area.width.saturating_sub(GUTTER),
         ..area
     };
+    let layout = Layout::resolve(
+        &super::columns::queue(q.len()),
+        rows_area.width as usize,
+        q.len(),
+    );
+    // The column header costs the queue no rows: `LIST_HEAD_H` is the
+    // name-and-count row plus a blank, and the header takes the blank that is
+    // already there. Growing that band instead would shrink the queue against
+    // `MIN_QUEUE`, and a short pane would end up with a header over one
+    // visible track.
+    if header.height > 0 {
+        let row = Rect {
+            width: rows_area.width,
+            ..header
+        };
+        let line = layout.header_line(None, row, mouse, hit);
+        frame.render_widget(Paragraph::new(line), row);
+    }
     hit.player_queue = rows_area;
     super::clamp_offset(queue_list, q.len(), rows_area.height as usize);
 
@@ -921,8 +877,6 @@ fn draw_queue(
     // order, so no URI has to be matched, and a track that appears twice
     // marks only the row that is actually on.
     let playing = Some(q.index());
-
-    let cols = QueueCols::new(rows_area.width as usize, q.len());
 
     // The pair's click targets, clipped to the rows actually filled. The same
     // shape the browse table builds, for the same reason: the row comes from
@@ -937,9 +891,9 @@ fn draw_queue(
         }
         .intersection(rows_area)
     };
-    if cols.actions {
-        hit.queue_like_col = cell_col(cols.like_offset(), LIKE_W);
-        hit.queue_add_col = cell_col(cols.add_offset(), ADD_W);
+    if let Some(actions) = layout.cell(ColKey::Actions) {
+        hit.queue_like_col = cell_col(actions.x, LIKE_W);
+        hit.queue_add_col = cell_col(actions.x + LIKE_W, ADD_W);
     }
     let hover_cell: Option<(usize, QueueHover)> = mouse.and_then(|m| {
         let row = |y: u16| queue_list.offset() + (y - rows_area.y) as usize;
@@ -958,11 +912,6 @@ fn draw_queue(
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let prefix = if Some(i) == playing {
-                Span::styled("▶ ", accent_bold)
-            } else {
-                Span::raw(" ".repeat(PREFIX_W))
-            };
             // Three weights, so the playing row stands out: the title at TEXT,
             // everything supporting it at DIM, and the playing row in accent.
             // `Style::default()` here would leak the raw terminal foreground,
@@ -972,44 +921,43 @@ fn draw_queue(
             } else {
                 theme::text()
             };
-            // Display position, not `Track::track_number`: the queue is a
-            // permutation, so the number has to follow the rows on screen.
-            let mut spans = vec![
-                prefix,
-                Span::styled(
-                    format!("{:>w$}", i + 1, w = cols.num),
-                    if Some(i) == playing {
-                        accent_bold
-                    } else {
-                        theme::dim()
-                    },
-                ),
-                Span::raw(COL_GAP),
-                Span::styled(fit(&t.name, cols.name), name_style),
-            ];
-            if cols.artist > 0 {
-                spans.push(Span::raw(COL_GAP));
-                spans.push(Span::styled(fit(&t.artists, cols.artist), theme::dim()));
-            }
+            let hover = hover_cell.and_then(|(row, col)| (row == i).then_some(col));
+            let saved = liked.get(&t.uri).copied();
             // Where the star lands, so the selection restyle below can put its
             // accent back.
             let mut star_at = None;
-            let saved = liked.get(&t.uri).copied();
-            if cols.actions {
-                let hover = hover_cell.and_then(|(row, col)| (row == i).then_some(col));
-                spans.push(Span::raw(COL_GAP));
-                star_at = Some(spans.len());
-                spans.extend(action_spans(
-                    saved,
-                    hover == Some(QueueHover::Like),
-                    hover == Some(QueueHover::Add),
-                ));
-            }
-            spans.push(Span::raw(COL_GAP));
-            spans.push(Span::styled(
-                format!("{:>DUR_W$}", format_duration(t.duration_ms)),
-                theme::dim(),
-            ));
+            let spans = row_spans(&layout, |cell, spans| match cell.key {
+                ColKey::Mark => spans.push(match Some(i) == playing {
+                    true => Span::styled("▶ ", accent_bold),
+                    false => Span::raw(" ".repeat(cell.width)),
+                }),
+                // Display position, not `Track::track_number`: the queue is a
+                // permutation, so the number follows the rows on screen.
+                ColKey::No => spans.push(Span::styled(
+                    right(&(i + 1).to_string(), cell.width),
+                    match Some(i) == playing {
+                        true => accent_bold,
+                        false => theme::dim(),
+                    },
+                )),
+                ColKey::Title => spans.push(Span::styled(fit(&t.name, cell.width), name_style)),
+                ColKey::Artist => {
+                    spans.push(Span::styled(fit(&t.artists, cell.width), theme::dim()))
+                }
+                ColKey::Actions => {
+                    star_at = Some(spans.len());
+                    spans.extend(action_spans(
+                        saved,
+                        hover == Some(QueueHover::Like),
+                        hover == Some(QueueHover::Add),
+                    ));
+                }
+                ColKey::Time => spans.push(Span::styled(
+                    right(&format_duration(t.duration_ms), cell.width),
+                    theme::dim(),
+                )),
+                _ => spans.push(Span::raw(" ".repeat(cell.width))),
+            });
             let mut line = Line::from(spans);
             if i == queue_index {
                 apply_selection(&mut line);
@@ -1034,17 +982,7 @@ fn draw_queue(
         .collect();
     let count = items.len();
     frame.render_stateful_widget(List::new(items), rows_area, queue_list);
-    draw_scrollbar(
-        frame,
-        Rect {
-            x: rows_area.right() + QUEUE_GUTTER - 1,
-            y: rows_area.y,
-            width: 1,
-            height: rows_area.height,
-        },
-        count,
-        queue_list.offset(),
-    );
+    draw_scrollbar(frame, scroll_col(rows_area), count, queue_list.offset());
 }
 
 #[cfg(test)]
@@ -1131,8 +1069,7 @@ mod tests {
             image_url: None,
             genres: vec![],
             top: TrackList::new(name, "", None),
-            albums: vec![],
-            display: Vec::new(),
+            albums: vec![].into(),
             tab: crate::app::state::ArtistTab::Albums,
             loading: false,
             error: None,
@@ -1299,10 +1236,14 @@ mod tests {
         );
         assert!(lines[17].contains("■ pause"), "{:?}", lines[17]);
         assert!(lines[17].trim_end().ends_with("next ▸▸"), "{:?}", lines[17]);
-        assert!(lines[18].trim().is_empty() && lines[20].trim().is_empty());
-        // Then one row heads the list: name on the left, shuffle opposite.
+        assert!(lines[18].trim().is_empty());
+        // Then two rows head the list: name on the left with shuffle opposite,
+        // then the columns — which take the blank that was there rather than a
+        // row of the queue.
         assert!(lines[19].contains("My Mix · 3 tracks"), "{:?}", lines[19]);
         assert!(lines[19].contains("shuffle off"), "{:?}", lines[19]);
+        assert!(lines[20].contains("#   Title"), "{:?}", lines[20]);
+        assert!(lines[20].trim_end().ends_with("Artist"), "{:?}", lines[20]);
         assert!(!lines.iter().any(|l| l.contains("repeat")));
         // Queue rows: numbered, and only the playing one is marked.
         assert!(lines[21].contains(" 1   Alpha"), "{:?}", lines[21]);
@@ -1678,7 +1619,7 @@ mod tests {
         );
         assert_eq!(
             st.hit.player_queue.width,
-            inner_w - QUEUE_GUTTER,
+            inner_w - GUTTER,
             "the queue did not take the width"
         );
     }

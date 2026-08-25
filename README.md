@@ -270,11 +270,18 @@ is a worse answer than a row that says why it won't play.
 | `a` | play the selected track next |
 | `L` | like / unlike the track — the selected row, or the playing one in the player view; on a station row, save it |
 | `b / B` | open the selected track's album / artist |
-| `o / O` | cycle sort column / flip sort direction |
+| `o / O` | cycle sort column / flip sort direction (every list, or click a column header) |
 | `/` | search Spotify and the radio directory at once |
 | `R` | refresh the current view and your playlists |
 | `?` | help overlay, which also names the running version |
 | `q`, `Ctrl-c` | quit |
+
+Every browse list sorts: tracks, albums, playlists, artists, stations and the
+radio directory's countries and genres. Click a column header to sort by it —
+again to turn it round, a third time to clear it — or press `o` to step through
+the columns the pane is showing and `O` to flip the arrow. The
+player view's queue is the one list that does not sort — row 1 plays first, and
+a sorted queue would lie about that.
 
 Sorting reorders the visible list only. Playing a sorted list plays it in the
 order you see — the queue is what is on screen, and the player view (`v`)

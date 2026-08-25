@@ -7,6 +7,7 @@ use ratatui::widgets::ListState;
 
 use crate::app::queue::Queue;
 use crate::audio_tap::AudioTap;
+pub use crate::ui::columns::ColKey;
 
 /// Transport state of spot's own player. Everything about *what* is playing
 /// lives on the queue's current [`Track`]; this is only whether it is
@@ -150,14 +151,14 @@ impl LoadError {
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
     pub query: String,
-    pub tracks: Vec<Track>,
-    pub albums: Vec<AlbumItem>,
-    pub artists: Vec<ArtistItem>,
-    pub playlists: Vec<Playlist>,
+    pub tracks: SortedList<Track>,
+    pub albums: SortedList<AlbumItem>,
+    pub artists: SortedList<ArtistItem>,
+    pub playlists: SortedList<Playlist>,
     /// The station half of the answer. The two catalogues are two hosts and
     /// answer at their own pace, so this fills in after the four above rather
     /// than with them.
-    pub stations: Vec<Station>,
+    pub stations: SortedList<Station>,
     /// True from the moment the query goes out until the directory answers or
     /// fails. Its own flag and not [`AppState::loading`], which the Spotify
     /// half owns: an empty Stations tab means "still asking" or "nothing
@@ -216,39 +217,333 @@ impl SearchTab {
     }
 }
 
+/// How a list is ordered: which column, and which way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortKey {
-    /// Context/fetch order (the only order playback follows).
-    Position,
-    Title,
-    Artist,
-    Album,
-    Duration,
+pub struct Sort {
+    pub key: ColKey,
+    pub ascending: bool,
 }
 
-impl SortKey {
-    pub fn label(self) -> &'static str {
-        match self {
-            SortKey::Position => "position",
-            SortKey::Title => "title",
-            SortKey::Artist => "artist",
-            SortKey::Album => "album",
-            SortKey::Duration => "duration",
+impl Default for Sort {
+    /// Fetch order, which is what every list arrives in.
+    fn default() -> Self {
+        Self {
+            key: ColKey::No,
+            ascending: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrackSort {
-    pub key: SortKey,
-    pub ascending: bool,
+impl Sort {
+    /// Whether the rows are still in the order the source sent.
+    ///
+    /// What playback and the track cache test: a list read from the bottom up
+    /// is as much a snapshot as one ordered by title, and later pages can only
+    /// honestly extend the order they arrived in.
+    pub fn is_natural(self) -> bool {
+        self == Self::default()
+    }
 }
 
-impl Default for TrackSort {
+/// One row's value in one column, as something orderable.
+///
+/// `None` is what a source left empty, and it sorts last whichever way the
+/// arrow points: a record with no release date belongs at neither end of a
+/// list ordered by year, and floating it to the top buries the answer the
+/// sort was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SortCell {
+    Text(String),
+    Num(u64),
+    None,
+}
+
+impl SortCell {
+    /// A text cell, folded for comparison. Empty text is [`SortCell::None`]:
+    /// a blank name is a missing name.
+    pub fn text(s: &str) -> Self {
+        match s.trim() {
+            "" => SortCell::None,
+            t => SortCell::Text(t.to_lowercase()),
+        }
+    }
+}
+
+/// What a row is worth in each column, and what it is across a re-sort.
+pub trait Sortable {
+    fn cell(&self, key: ColKey) -> SortCell;
+    /// What a row is, across a re-sort — a uri, an id, a uuid, a facet key.
+    /// This is what re-anchors the selection to the row it was on.
+    fn identity(&self) -> &str;
+}
+
+/// Re-sort a list and answer where the row that was on `index` went.
+///
+/// A re-sort moves every row, so an index carried across one points at
+/// whatever happened to land there. The identity of the selected row is what
+/// survives instead.
+fn anchored<T: Sortable>(list: &mut SortedList<T>, index: usize) -> usize {
+    anchored_keeping(list, index, |_| true)
+}
+
+/// [`anchored`], with the filter a filtered list is re-cut through.
+fn anchored_keeping<T: Sortable>(
+    list: &mut SortedList<T>,
+    index: usize,
+    keep: impl Fn(&T) -> bool,
+) -> usize {
+    let was = list.get(index).map(|t| t.identity().to_string());
+    list.rebuild_keeping(keep);
+    was.and_then(|id| list.position_of(&id))
+        .unwrap_or_else(|| index.min(list.len().saturating_sub(1)))
+}
+
+/// The display permutation of `items` under `sort`, keeping the rows `keep`
+/// holds.
+///
+/// The one sort in the app. Tracks, albums, playlists, stations and countries
+/// all reach their order through here, so no two of them can come to disagree
+/// about what ordering by a column means.
+pub fn sorted_display<T: Sortable>(
+    items: &[T],
+    sort: Sort,
+    keep: impl Fn(&T) -> bool,
+) -> Vec<usize> {
+    let mut rows: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| keep(t))
+        .map(|(i, _)| i)
+        .collect();
+    // The `#` column is fetch order itself, so there is nothing to compare —
+    // the arrow just says which end it is read from.
+    if sort.key == ColKey::No {
+        if !sort.ascending {
+            rows.reverse();
+        }
+        return rows;
+    }
+    let mut keyed: Vec<(SortCell, usize)> = rows
+        .into_iter()
+        .map(|i| (items[i].cell(sort.key), i))
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    if !sort.ascending {
+        keyed.reverse();
+        // Reversing floats the blanks to the front; put them back on the end.
+        let (blank, filled): (Vec<_>, Vec<_>) =
+            keyed.into_iter().partition(|(c, _)| *c == SortCell::None);
+        keyed = filled.into_iter().chain(blank).collect();
+    }
+    keyed.into_iter().map(|(_, i)| i).collect()
+}
+
+/// A list in fetch order with a display permutation over it.
+///
+/// `items` is what the source sent and is never re-ordered in place: playback
+/// follows fetch order, later pages can only extend it, and a cache key means
+/// nothing against a list that shuffled under it. `display` is what the screen
+/// shows, and every row index the user picks indexes `display`.
+#[derive(Debug, Clone)]
+pub struct SortedList<T> {
+    pub items: Vec<T>,
+    pub display: Vec<usize>,
+    pub sort: Sort,
+}
+
+/// Hand-written: the derive would demand `T: Default`, which no row type has
+/// any business implementing.
+impl<T> Default for SortedList<T> {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Sortable> FromIterator<T> for SortedList<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from_items(iter.into_iter().collect())
+    }
+}
+
+impl<T: Sortable> From<Vec<T>> for SortedList<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self::from_items(items)
+    }
+}
+
+impl<T> SortedList<T> {
+    pub fn new() -> Self {
         Self {
-            key: SortKey::Position,
-            ascending: true,
+            items: Vec::new(),
+            display: Vec::new(),
+            sort: Sort::default(),
+        }
+    }
+
+    /// Rows on screen, which on a filtered list is not `items.len()`.
+    pub fn len(&self) -> usize {
+        self.display.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.display.is_empty()
+    }
+
+    /// The row at display position `row`.
+    pub fn get(&self, row: usize) -> Option<&T> {
+        self.items.get(*self.display.get(row)?)
+    }
+
+    pub fn first(&self) -> Option<&T> {
+        self.get(0)
+    }
+
+    /// The rows in display order.
+    pub fn rows(&self) -> impl Iterator<Item = &T> {
+        self.display.iter().filter_map(|&i| self.items.get(i))
+    }
+}
+
+impl<T: Sortable> SortedList<T> {
+    pub fn from_items(items: Vec<T>) -> Self {
+        let mut list = Self {
+            items,
+            display: Vec::new(),
+            sort: Sort::default(),
+        };
+        list.rebuild();
+        list
+    }
+
+    /// Append a page, putting the new rows on the end of `display`.
+    ///
+    /// The permutation is left to [`AppState::resort_main`], which the caller
+    /// runs next: it is the one that knows which row the selection was on, and
+    /// re-sorting here would move that row out from under it before anything
+    /// had noted where it went.
+    pub fn append(&mut self, page: Vec<T>) {
+        let start = self.items.len();
+        self.items.extend(page);
+        self.display.extend(start..self.items.len());
+    }
+
+    pub fn rebuild(&mut self) {
+        self.display = sorted_display(&self.items, self.sort, |_| true);
+    }
+
+    /// Rebuild with a filter over it. The artist page cuts its catalogue by
+    /// tab, and the tab is a filter the sort then orders within.
+    pub fn rebuild_keeping(&mut self, keep: impl Fn(&T) -> bool) {
+        self.display = sorted_display(&self.items, self.sort, keep);
+    }
+
+    /// The display position of the row whose identity is `id`.
+    pub fn position_of(&self, id: &str) -> Option<usize> {
+        self.display
+            .iter()
+            .position(|&i| self.items[i].identity() == id)
+    }
+}
+
+impl Sortable for Track {
+    fn cell(&self, key: ColKey) -> SortCell {
+        match key {
+            ColKey::Title => SortCell::text(&self.name),
+            ColKey::Artist => SortCell::text(&self.artists),
+            ColKey::Album => SortCell::text(&self.album),
+            ColKey::Year => SortCell::text(&self.release_year),
+            ColKey::Time => SortCell::Num(self.duration_ms),
+            _ => SortCell::None,
+        }
+    }
+
+    fn identity(&self) -> &str {
+        &self.uri
+    }
+}
+
+impl Sortable for AlbumItem {
+    fn cell(&self, key: ColKey) -> SortCell {
+        match key {
+            ColKey::Album | ColKey::Title => SortCell::text(&self.name),
+            ColKey::Artist => SortCell::text(&self.artists),
+            ColKey::Year => SortCell::text(&self.release_year),
+            ColKey::Type => SortCell::text(&self.album_type),
+            ColKey::Tracks => SortCell::Num(u64::from(self.track_count)),
+            _ => SortCell::None,
+        }
+    }
+
+    fn identity(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Sortable for ArtistItem {
+    fn cell(&self, key: ColKey) -> SortCell {
+        match key {
+            ColKey::Artist | ColKey::Name | ColKey::Title => SortCell::text(&self.name),
+            _ => SortCell::None,
+        }
+    }
+
+    fn identity(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Sortable for Playlist {
+    fn cell(&self, key: ColKey) -> SortCell {
+        match key {
+            ColKey::Title | ColKey::Name => SortCell::text(&self.name),
+            ColKey::Owner => SortCell::text(&self.owner),
+            ColKey::Tracks => SortCell::Num(u64::from(self.track_count)),
+            _ => SortCell::None,
+        }
+    }
+
+    fn identity(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Sortable for Station {
+    fn cell(&self, key: ColKey) -> SortCell {
+        match key {
+            ColKey::Station | ColKey::Name | ColKey::Title => SortCell::text(&self.name),
+            ColKey::Tags => SortCell::text(&self.tags),
+            ColKey::Where => SortCell::text(match self.countrycode.is_empty() {
+                true => &self.country,
+                false => &self.countrycode,
+            }),
+            // By what the row says, so the column sorts the way it reads:
+            // "AAC+ 128k" groups the codecs and then ranks inside one.
+            ColKey::Stream => SortCell::text(&self.quality()),
+            _ => SortCell::None,
+        }
+    }
+
+    fn identity(&self) -> &str {
+        &self.uuid
+    }
+}
+
+impl Sortable for RadioRow {
+    fn cell(&self, key: ColKey) -> SortCell {
+        match self {
+            RadioRow::Facet { label, count, .. } => match key {
+                ColKey::Name | ColKey::Title | ColKey::Station => SortCell::text(label),
+                ColKey::Stations => SortCell::Num(u64::from(*count)),
+                _ => SortCell::None,
+            },
+            RadioRow::Station(s) => s.cell(key),
+        }
+    }
+
+    fn identity(&self) -> &str {
+        match self {
+            RadioRow::Facet { key, .. } => key,
+            RadioRow::Station(s) => &s.uuid,
         }
     }
 }
@@ -511,7 +806,9 @@ pub enum RadioRow {
 #[derive(Debug, Clone)]
 pub struct RadioView {
     pub scope: RadioScope,
-    pub rows: Vec<RadioRow>,
+    /// Stations, or the facets of a directory index — one list for both, since
+    /// the directory never mixes the two kinds in one answer.
+    pub rows: SortedList<RadioRow>,
     pub loading: bool,
     /// Matches `AppState.load_generation` while a fetch owns this view, on the
     /// same reasoning as [`TrackList::generation`].
@@ -524,7 +821,7 @@ impl RadioView {
     pub fn new(scope: RadioScope, generation: u64) -> Self {
         Self {
             scope,
-            rows: Vec::new(),
+            rows: SortedList::new(),
             loading: true,
             generation,
             error: None,
@@ -692,12 +989,8 @@ const SPOTIFY_OWNER: &str = "spotify";
 pub struct TrackList {
     pub kind: TrackListKind,
     pub header: ViewHeader,
-    /// Canonical order == context/fetch order. Never re-sorted in place.
-    pub tracks: Vec<Track>,
-    /// Display row -> index into `tracks`. Rebuilt on sort change or page
-    /// arrival; identity while unsorted.
-    pub display: Vec<usize>,
-    pub sort: TrackSort,
+    /// The rows, in fetch order, with the display permutation over them.
+    pub rows: SortedList<Track>,
     /// Expected total from the source's metadata; None = unknown.
     pub total: Option<u32>,
     /// More pages are still arriving for this view.
@@ -722,9 +1015,7 @@ impl TrackList {
                 subtitle: subtitle.into(),
                 cover_url: None,
             },
-            tracks: Vec::new(),
-            display: Vec::new(),
-            sort: TrackSort::default(),
+            rows: SortedList::new(),
             total,
             loading: false,
             generation: 0,
@@ -733,39 +1024,26 @@ impl TrackList {
         }
     }
 
-    /// Album views show the track-number column.
-    pub fn show_track_no(&self) -> bool {
+    /// An album page numbers its rows by the track's own position on the record
+    /// and drops the Album column, which would name the page you are on.
+    pub fn is_album(&self) -> bool {
         self.kind == TrackListKind::Album
     }
+}
 
-    /// Append a page of tracks, keeping `display` consistent.
-    pub fn append(&mut self, page: Vec<Track>) {
-        let start = self.tracks.len();
-        self.tracks.extend(page);
-        self.display.extend(start..self.tracks.len());
+/// The rows read straight through, so `list.display`, `list.items` and
+/// `list.sort` all still name what they always did.
+impl std::ops::Deref for TrackList {
+    type Target = SortedList<Track>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
     }
+}
 
-    /// Recompute `display` from the current sort (stable; identity for
-    /// Position order).
-    pub fn rebuild_display(&mut self) {
-        self.display = (0..self.tracks.len()).collect();
-        let tracks = &self.tracks;
-        match self.sort.key {
-            SortKey::Position => {}
-            SortKey::Title => self
-                .display
-                .sort_by_cached_key(|&i| tracks[i].name.to_lowercase()),
-            SortKey::Artist => self
-                .display
-                .sort_by_cached_key(|&i| tracks[i].artists.to_lowercase()),
-            SortKey::Album => self
-                .display
-                .sort_by_cached_key(|&i| tracks[i].album.to_lowercase()),
-            SortKey::Duration => self.display.sort_by_key(|&i| tracks[i].duration_ms),
-        }
-        if !self.sort.ascending && self.sort.key != SortKey::Position {
-            self.display.reverse();
-        }
+impl std::ops::DerefMut for TrackList {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.rows
     }
 }
 
@@ -835,11 +1113,9 @@ pub struct ArtistView {
     /// response, so the band draws the line only when one arrives.
     pub genres: Vec<String>,
     pub top: TrackList,
-    /// The whole catalogue, every group together.
-    pub albums: Vec<AlbumItem>,
-    /// Indexes into [`Self::albums`] the active tab shows, in the order they
-    /// are drawn — the same display-permutation model [`TrackList`] uses.
-    pub display: Vec<usize>,
+    /// The whole catalogue, every group together, with the active tab as the
+    /// display permutation over it — a filter the sort then orders within.
+    pub albums: SortedList<AlbumItem>,
     pub tab: ArtistTab,
     pub loading: bool,
     /// Why the overview came back with nothing — see [`LoadError`].
@@ -853,17 +1129,15 @@ impl ArtistView {
     /// This is the only place that knows where one section ends and the other
     /// begins, so nothing else has to do the arithmetic.
     pub fn row(&self, index: usize) -> Option<ArtistRow<'_>> {
-        let split = self.top.display.len();
+        let split = self.top.len();
         if index < split {
-            let &ti = self.top.display.get(index)?;
-            return self.top.tracks.get(ti).map(ArtistRow::Track);
+            return self.top.get(index).map(ArtistRow::Track);
         }
-        let &ai = self.display.get(index - split)?;
-        self.albums.get(ai).map(ArtistRow::Album)
+        self.albums.get(index - split).map(ArtistRow::Album)
     }
 
     pub fn len(&self) -> usize {
-        self.top.display.len() + self.display.len()
+        self.top.len() + self.albums.len()
     }
 
     /// The tabs worth drawing: the groups this artist actually has records in.
@@ -874,7 +1148,7 @@ impl ArtistView {
     pub fn tabs(&self) -> Vec<ArtistTab> {
         ArtistTab::ALL
             .into_iter()
-            .filter(|t| self.albums.iter().any(|a| t.holds(a)))
+            .filter(|t| self.albums.items.iter().any(|a| t.holds(a)))
             .collect()
     }
 
@@ -884,19 +1158,16 @@ impl ArtistView {
     /// Called whenever either side of that pairing changes: when the catalogue
     /// lands, and when the tab is switched.
     pub fn retab(&mut self) {
-        if !self.albums.is_empty()
-            && !self.albums.iter().any(|a| self.tab.holds(a))
+        if !self.albums.items.is_empty()
+            && !self.albums.items.iter().any(|a| self.tab.holds(a))
             && let Some(&first) = self.tabs().first()
         {
             self.tab = first;
         }
-        self.display = self
-            .albums
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| self.tab.holds(a))
-            .map(|(i, _)| i)
-            .collect();
+        // Filter first, then sort within it: the tab says which records are on
+        // the page, and the sort only orders the ones that are.
+        let tab = self.tab;
+        self.albums.rebuild_keeping(|a| tab.holds(a));
     }
 
     pub fn set_tab(&mut self, tab: ArtistTab) {
@@ -1223,6 +1494,15 @@ pub struct HitAreas {
     /// The artist page's album-group strip. It scrolls with the body it sits
     /// in, so it is recorded only where the line is on screen.
     pub artist_tabs: Vec<(Rect, ArtistTab)>,
+    /// The sortable labels of the column header the main pane last drew, each
+    /// covering the cells its label occupies and nothing more. Clicking one
+    /// sorts by that column. Recorded above [`Self::main_list`], so a header
+    /// click and a row click can never resolve to each other.
+    pub column_headers: Vec<(Rect, ColKey)>,
+    /// The sortable columns of that same header, in the order they are drawn.
+    /// `o` walks this, so it covers every table and skips a column the pane
+    /// is too narrow to show.
+    pub sort_keys: Vec<ColKey>,
     /// The main pane's flat line model: for each content line of
     /// [`Self::main_list`], the row it belongs to, or `None` for a heading, a
     /// column header, or a spacer.
@@ -1394,6 +1674,12 @@ pub struct AppState {
     /// rather than on a view because the Playlists page carries no state of
     /// its own: it draws [`Self::playlists`], and so does the left rail.
     pub playlists_error: Option<LoadError>,
+    /// The Playlists page's order, and the permutation it draws through. Page
+    /// state that outlives the page, like [`Self::search_tab`]: see
+    /// [`Self::rebuild_playlists_display`] for why it does not live on
+    /// [`MainView::Playlists`].
+    pub playlists_sort: Sort,
+    pub playlists_display: Vec<usize>,
     /// How many times the page on screen has been asked for by hand, counting
     /// only `↻ try again` — 0 until one is pressed, and reset by opening any
     /// page.
@@ -1572,6 +1858,8 @@ impl AppState {
             listen_forward: Vec::new(),
             playlists: Vec::new(),
             playlists_error: None,
+            playlists_sort: Sort::default(),
+            playlists_display: Vec::new(),
             retries: 0,
             liked: std::collections::HashMap::new(),
             me_id: None,
@@ -1803,8 +2091,8 @@ impl AppState {
     pub fn main_len(&self) -> usize {
         match &self.main {
             MainView::Home => self.home_items().len(),
-            MainView::Playlists => self.playlists.len(),
-            MainView::Tracks(list) => list.display.len(),
+            MainView::Playlists => self.playlists_display.len(),
+            MainView::Tracks(list) => list.len(),
             MainView::Search(results) => match self.search_tab {
                 SearchTab::Tracks => results.tracks.len(),
                 SearchTab::Albums => results.albums.len(),
@@ -1815,6 +2103,12 @@ impl AppState {
             MainView::Artist(v) => v.len(),
             MainView::Radio(v) => v.rows.len(),
         }
+    }
+
+    /// The playlist on row `row` of the Playlists page, through its display
+    /// order.
+    pub fn playlist_row(&self, row: usize) -> Option<&Playlist> {
+        self.playlists.get(*self.playlists_display.get(row)?)
     }
 
     /// Number of rows in the player view's queue list.
@@ -2026,7 +2320,7 @@ impl AppState {
         if list.kind != TrackListKind::Album {
             return None;
         }
-        list.tracks.iter().find_map(|t| {
+        list.items.iter().find_map(|t| {
             let id = t.artist_id.clone()?;
             let name = first_artist(&t.artists);
             (!name.is_empty()).then_some(BackTarget::Artist { id, name })
@@ -2106,23 +2400,89 @@ impl AppState {
         true
     }
 
-    /// Rebuild the track view's display order for its current sort, keeping
-    /// the selection anchored to the same track where possible.
+    /// Rebuild the current view's display order for its sort, keeping the
+    /// selection anchored to the same row where possible.
+    ///
+    /// Anchored by [`Sortable::identity`] rather than by index: a re-sort
+    /// moves every row, and an index kept across one points at whatever
+    /// happens to have landed there.
     pub fn resort_main(&mut self) {
-        let MainView::Tracks(list) = &mut self.main else {
+        let index = self.main_index;
+        let tab = self.search_tab;
+        // Ahead of the match, which borrows `main` for its whole length while
+        // this arm reads two other fields of the same state.
+        if matches!(self.main, MainView::Playlists) {
+            let was = self
+                .playlists_display
+                .get(index)
+                .and_then(|&i| self.playlists.get(i))
+                .map(|p| p.id.clone());
+            self.rebuild_playlists_display();
+            self.main_index = was
+                .and_then(|id| {
+                    self.playlists_display
+                        .iter()
+                        .position(|&i| self.playlists[i].id == id)
+                })
+                .unwrap_or_else(|| index.min(self.playlists_display.len().saturating_sub(1)));
             return;
+        }
+        self.main_index = match &mut self.main {
+            MainView::Tracks(list) => anchored(&mut list.rows, index),
+            MainView::Radio(v) => anchored(&mut v.rows, index),
+            MainView::Search(r) => match tab {
+                SearchTab::Tracks => anchored(&mut r.tracks, index),
+                SearchTab::Albums => anchored(&mut r.albums, index),
+                SearchTab::Artists => anchored(&mut r.artists, index),
+                SearchTab::Playlists => anchored(&mut r.playlists, index),
+                SearchTab::Stations => anchored(&mut r.stations, index),
+            },
+            // The catalogue sits under the top tracks, so a row of it is
+            // offset by the block above; the tab filter re-applies with the
+            // sort.
+            MainView::Artist(v) => {
+                // Both lists are rebuilt, whichever the selection is in: the
+                // page draws them one under the other, and leaving the other
+                // in its old order would put a row where the flat index model
+                // says something else is.
+                let tab = v.tab;
+                let split = v.top.len();
+                if index < split {
+                    let row = anchored(&mut v.top.rows, index);
+                    v.albums.rebuild_keeping(|a| tab.holds(a));
+                    row
+                } else {
+                    let row = anchored_keeping(&mut v.albums, index - split, |a| tab.holds(a));
+                    v.top.rebuild();
+                    // Sorting the top tracks can only reorder them, never
+                    // change how many there are, so the split holds.
+                    split + row
+                }
+            }
+            // Resolved above, and Home is navigation rather than a table.
+            MainView::Playlists | MainView::Home => index,
         };
-        let keep = list
-            .display
-            .get(self.main_index)
-            .map(|&i| list.tracks[i].uri.clone());
-        list.rebuild_display();
-        self.main_index = match keep
-            .and_then(|uri| list.display.iter().position(|&i| list.tracks[i].uri == uri))
-        {
-            Some(pos) => pos,
-            None => self.main_index.min(list.display.len().saturating_sub(1)),
-        };
+    }
+
+    /// Re-cut the Playlists page's display order.
+    ///
+    /// The page's sort lives here rather than on [`MainView::Playlists`],
+    /// which carries no data at all — that is what stops a snapshot of it on
+    /// the back stack going stale. [`Self::playlists`] itself stays canonical
+    /// and unsorted: the add-to-playlist picker freezes indices into it, and a
+    /// box that reshuffled under a sort applied on another page would be a
+    /// different list each time it opened.
+    pub fn rebuild_playlists_display(&mut self) {
+        self.playlists_display = sorted_display(&self.playlists, self.playlists_sort, |_| true);
+    }
+
+    /// Install the library, re-cutting the Playlists page's order with it.
+    ///
+    /// The one way in, so the permutation can never be left over a list it is
+    /// not about — a stale one would drop rows off the page.
+    pub fn set_playlists(&mut self, playlists: Vec<Playlist>) {
+        self.playlists = playlists;
+        self.rebuild_playlists_display();
     }
 }
 
@@ -2149,11 +2509,11 @@ mod tests {
     fn picking(query: &str) -> AppState {
         let mut st = AppState::new();
         st.me_id = Some("me".into());
-        st.playlists = vec![
+        st.set_playlists(vec![
             owned("a", "Late Night", "me"),
             owned("b", "Someone Else's", "them"),
             owned("c", "late lunch", "me"),
-        ];
+        ]);
         let uri = "spotify:track:x".to_string();
         st.picker = Some(PlaylistPicker {
             order: st.picker_order(&uri),
@@ -2281,14 +2641,14 @@ mod tests {
     #[test]
     fn home_and_search_offer_only_radio_until_spotify_is_ready() {
         let mut st = AppState::new();
-        st.playlists = vec![Playlist {
+        st.set_playlists(vec![Playlist {
             id: "dw".into(),
             name: "Discover Weekly".into(),
             track_count: 30,
             owner: "Spotify".into(),
             owner_id: SPOTIFY_OWNER.into(),
             snapshot_id: "s".into(),
-        }];
+        }]);
 
         for state in [
             SpotifyState::Off,
@@ -2372,8 +2732,7 @@ mod tests {
             image_url: None,
             genres: Vec::new(),
             top: TrackList::new("artist", "top tracks", None),
-            albums,
-            display: Vec::new(),
+            albums: albums.into(),
             tab: ArtistTab::Albums,
             loading: false,
             error: None,
@@ -2405,7 +2764,7 @@ mod tests {
     fn an_unlabelled_record_falls_under_albums() {
         let v = artist_view(vec![record("A Record", "")]);
         assert_eq!(v.tabs(), vec![ArtistTab::Albums]);
-        assert_eq!(v.display, vec![0]);
+        assert_eq!(v.albums.display, vec![0]);
     }
 
     /// An artist with only guest spots opens on the tab that has them: the
@@ -2414,7 +2773,7 @@ mod tests {
     fn the_page_opens_on_a_group_that_has_records() {
         let v = artist_view(vec![record("A Guest Spot", "appears_on")]);
         assert_eq!(v.tab, ArtistTab::AppearsOn);
-        assert_eq!(v.display, vec![0]);
+        assert_eq!(v.albums.display, vec![0]);
         assert_eq!(v.len(), 1);
     }
 
@@ -2462,19 +2821,19 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_display_sorts_case_insensitively_and_reverses() {
+    fn a_rebuild_sorts_case_insensitively_and_reverses() {
         let mut list = list_of(&["banana", "Apple", "cherry"]);
-        list.sort = TrackSort {
-            key: SortKey::Title,
+        list.sort = Sort {
+            key: ColKey::Title,
             ascending: true,
         };
-        list.rebuild_display();
+        list.rebuild();
         assert_eq!(list.display, vec![1, 0, 2]);
         list.sort.ascending = false;
-        list.rebuild_display();
+        list.rebuild();
         assert_eq!(list.display, vec![2, 0, 1]);
-        list.sort = TrackSort::default();
-        list.rebuild_display();
+        list.sort = Sort::default();
+        list.rebuild();
         assert_eq!(list.display, vec![0, 1, 2]);
     }
 
@@ -2515,8 +2874,8 @@ mod tests {
         assert_eq!(st.back_target(), None);
 
         if let MainView::Tracks(list) = &mut st.main {
-            list.tracks[0].artist_id = Some("r1".into());
-            list.tracks[0].artists = "Donna The Buffalo, Guest".into();
+            list.items[0].artist_id = Some("r1".into());
+            list.items[0].artists = "Donna The Buffalo, Guest".into();
         }
         assert_eq!(
             st.back_target(),
@@ -2541,8 +2900,8 @@ mod tests {
     fn resort_main_keeps_selection_anchored_to_track() {
         let mut st = AppState::new();
         let mut list = list_of(&["banana", "Apple", "cherry"]);
-        list.sort = TrackSort {
-            key: SortKey::Title,
+        list.sort = Sort {
+            key: ColKey::Title,
             ascending: true,
         };
         st.main = MainView::Tracks(list);
@@ -2557,8 +2916,8 @@ mod tests {
     fn resort_main_reanchors_after_page_append() {
         let mut st = AppState::new();
         let mut list = list_of(&["banana", "cherry"]);
-        list.sort = TrackSort {
-            key: SortKey::Title,
+        list.sort = Sort {
+            key: ColKey::Title,
             ascending: true,
         };
         st.main = MainView::Tracks(list);
@@ -2571,6 +2930,137 @@ mod tests {
         st.resort_main();
         // Apple sorts first; cherry moves from row 1 to row 2.
         assert_eq!(st.main_index, 2);
+    }
+
+    /// Every view kind re-anchors the same way: the row you were on is the row
+    /// you are on, wherever the sort has moved it to.
+    #[test]
+    fn a_resort_keeps_the_selection_on_the_same_row_in_every_view() {
+        let by_title = Sort {
+            key: ColKey::Title,
+            ascending: true,
+        };
+
+        // The Playlists page, whose sort lives on the state rather than the
+        // view.
+        let mut st = AppState::new();
+        st.main = MainView::Playlists;
+        st.set_playlists(vec![
+            owned("p1", "banana", "me"),
+            owned("p2", "Apple", "me"),
+            owned("p3", "cherry", "me"),
+        ]);
+        st.playlists_sort = by_title;
+        st.main_index = 0;
+        st.resort_main();
+        assert_eq!(st.playlist_row(st.main_index).unwrap().name, "banana");
+
+        // A search tab, which sorts the tab you are looking at and no other.
+        let mut st = AppState::new();
+        st.search_tab = SearchTab::Albums;
+        st.main = MainView::Search(SearchResults {
+            albums: vec![
+                record("banana", "album"),
+                record("Apple", "album"),
+                record("cherry", "album"),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        st.main_index = 2;
+        if let MainView::Search(r) = &mut st.main {
+            r.albums.sort = by_title;
+        }
+        st.resort_main();
+        let MainView::Search(r) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(r.albums.get(st.main_index).unwrap().name, "cherry");
+
+        // A radio page, whose rows are stations or facets through one list.
+        let mut st = AppState::new();
+        let mut view = RadioView::new(RadioScope::Popular, 0);
+        view.rows = vec![
+            RadioRow::Facet {
+                key: "us".into(),
+                label: "banana".into(),
+                count: 3,
+            },
+            RadioRow::Facet {
+                key: "de".into(),
+                label: "Apple".into(),
+                count: 9,
+            },
+        ]
+        .into();
+        view.rows.sort = by_title;
+        st.main = MainView::Radio(view);
+        st.main_index = 0;
+        st.resort_main();
+        assert_eq!(st.main_index, 1, "banana sorts behind Apple");
+
+        // The artist page, where a catalogue row sits under the top tracks and
+        // the tab filter re-applies with the sort.
+        let mut st = AppState::new();
+        let mut v = artist_view(vec![
+            record("banana", "album"),
+            record("Apple", "album"),
+            record("A Cut", "single"),
+        ]);
+        v.albums.sort = by_title;
+        st.main = MainView::Artist(v);
+        st.main_index = 0;
+        st.resort_main();
+        // Still the record it was on, and the single is still off this tab.
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(st.main_index, 1);
+        assert_eq!(v.albums.len(), 2);
+        match v.row(st.main_index) {
+            Some(ArtistRow::Album(a)) => assert_eq!(a.name, "banana"),
+            _ => panic!("the selection left the record it was on"),
+        }
+
+        // The page's two lists are drawn one under the other through one flat
+        // index, so a re-sort has to rebuild both — whichever the selection
+        // happens to be in.
+        let MainView::Artist(v) = &mut st.main else {
+            unreachable!()
+        };
+        v.top
+            .append(vec![track("banana", 1000), track("Apple", 1000)]);
+        v.top.sort = by_title;
+        st.main_index = 2 + 1;
+        st.resort_main();
+        let MainView::Artist(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.top.get(0).unwrap().name, "Apple");
+        match v.row(st.main_index) {
+            Some(ArtistRow::Album(a)) => assert_eq!(a.name, "banana"),
+            _ => panic!("the card selection moved when the top tracks sorted"),
+        }
+    }
+
+    /// A source that reported nothing for a column says nothing about where
+    /// its row belongs, so it goes last whichever way the arrow points.
+    #[test]
+    fn a_blank_cell_sorts_last_in_both_directions() {
+        let mut list = SortedList::from_items(vec![
+            record("has none", "album"),
+            record("has one", "album"),
+        ]);
+        list.items[0].release_year = String::new();
+        list.sort = Sort {
+            key: ColKey::Year,
+            ascending: true,
+        };
+        list.rebuild();
+        assert_eq!(list.display, vec![1, 0]);
+        list.sort.ascending = false;
+        list.rebuild();
+        assert_eq!(list.display, vec![1, 0]);
     }
 
     /// A playing queue of one named track, for the deck-subject tests.

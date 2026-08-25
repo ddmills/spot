@@ -17,7 +17,7 @@ use crate::api::{Api, PAGE_LIMIT};
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::queue::Queue;
 use crate::app::state::{
-    self, AppState, ArtistTab, ArtistView, MainView, Playback, SortKey, TrackList, TrackListKind,
+    self, AppState, ArtistTab, ArtistView, MainView, Playback, TrackList, TrackListKind,
     UpdateState,
 };
 use crate::cover::{Cover, CoverCache};
@@ -600,7 +600,7 @@ impl Client {
                                 MainView::Tracks(list) => Some((
                                     list.header.name.clone(),
                                     list.header.cover_url.clone(),
-                                    list.tracks
+                                    list.items
                                         .first()
                                         .map(|t| (t.artists.clone(), t.release_year.clone()))
                                         .unwrap_or_default(),
@@ -707,10 +707,10 @@ impl Client {
             if let (Some(k), true) = (key.as_deref(), loading)
                 && let MainView::Tracks(list) = &st.main
                 && list.cache_key.as_deref() == Some(k)
-                && list.sort.key == SortKey::Position
+                && list.sort.is_natural()
             {
                 let started = tracks.get(start).map(|t| t.uri.clone());
-                tracks = list.tracks.clone();
+                tracks = list.items.clone();
                 loading = list.loading;
                 // The clicked row's position in the fuller copy. Fetch order
                 // is stable, so it is where it was — this only matters if a
@@ -1066,7 +1066,12 @@ impl Client {
             }
             results.stations_loading = false;
             match found {
-                Ok(stations) => results.stations = stations,
+                Ok(stations) => {
+                    results.stations = stations.into();
+                    // The station half lands after the other four, so it
+                    // arrives on a page that may already be sorted.
+                    st.resort_main();
+                }
                 // Logged, not toasted, unlike the Spotify half below. The
                 // directory being unreachable is not *this search* failing —
                 // four tabs of perfectly good results are on screen — and a
@@ -1110,7 +1115,8 @@ impl Client {
                 results.albums = found.albums;
                 results.artists = found.artists;
                 results.playlists = found.playlists;
-                let uris: Vec<String> = results.tracks.iter().map(|t| t.uri.clone()).collect();
+                let uris: Vec<String> =
+                    results.tracks.items.iter().map(|t| t.uri.clone()).collect();
                 drop(st);
                 spawn_liked_check(api, self.state.clone(), uris);
             }
@@ -1182,7 +1188,7 @@ impl Client {
             view.loading = false;
             match rows {
                 Ok(rows) => {
-                    view.rows = rows;
+                    view.rows = rows.into();
                     st.main_to_top();
                 }
                 Err(e) => {
@@ -2029,7 +2035,7 @@ impl Client {
             save_playlist_tracks(&st);
         }
         let uncached = uncached_playlists(&st.playlist_tracks, &playlists, st.me_id.as_deref());
-        st.playlists = playlists;
+        st.set_playlists(playlists);
         // The rows the open box holds are indices into the list just replaced.
         st.picker = None;
         drop(st);
@@ -2131,8 +2137,7 @@ impl Client {
             image_url: None,
             genres: Vec::new(),
             top: TrackList::new(name, "top tracks", None),
-            albums: Vec::new(),
-            display: Vec::new(),
+            albums: state::SortedList::new(),
             tab: ArtistTab::Albums,
             loading: true,
             error: None,
@@ -2159,14 +2164,14 @@ impl Client {
                     return;
                 };
                 v.loading = false;
-                match result {
+                let out = match result {
                     Ok(overview) => {
                         let uris: Vec<String> =
                             overview.top.iter().map(|t| t.uri.clone()).collect();
                         v.image_url = overview.image_url;
                         v.genres = overview.genres;
                         v.top.append(overview.top);
-                        v.albums = overview.albums;
+                        v.albums = overview.albums.into();
                         v.retab();
                         // The photo first: it is the one image already on
                         // screen when the page lands, and the fetches run in
@@ -2180,16 +2185,14 @@ impl Client {
                         // would put a queue of other people's records in front
                         // of the ones you came for. `LoadArtistArt` asks for
                         // those sleeves if and when you open that group.
-                        let open = v
-                            .display
-                            .iter()
-                            .filter_map(|&i| v.albums[i].cover_url.clone());
+                        let open = v.albums.rows().filter_map(|a| a.cover_url.clone());
                         let rest = v
                             .albums
+                            .items
                             .iter()
                             .enumerate()
                             .filter(|(i, a)| {
-                                !v.display.contains(i) && !ArtistTab::AppearsOn.holds(a)
+                                !v.albums.display.contains(i) && !ArtistTab::AppearsOn.holds(a)
                             })
                             .filter_map(|(_, a)| a.cover_url.clone());
                         let art: Vec<String> = v
@@ -2206,7 +2209,12 @@ impl Client {
                         st.toast(format!("failed to load artist: {e}"));
                         return;
                     }
-                }
+                };
+                // The catalogue landing on a page that is already sorted takes
+                // the page order rather than fetch order, and the selection
+                // stays on the row it was on.
+                st.resort_main();
+                out
             };
             spawn_page_art(http, state.clone(), art, generation);
             spawn_liked_check(api, state, uris);
@@ -2226,9 +2234,9 @@ impl Client {
                 return;
             };
             let urls: Vec<String> = v
-                .display
-                .iter()
-                .filter_map(|&i| v.albums[i].cover_url.clone())
+                .albums
+                .rows()
+                .filter_map(|a| a.cover_url.clone())
                 .collect();
             (urls, st.load_generation)
         };
@@ -2331,7 +2339,7 @@ impl Client {
                             list.total = Some(total);
                             if !has_more {
                                 list.loading = false;
-                                finished = Some(list.tracks.clone());
+                                finished = Some(list.items.clone());
                             }
                             // Keep an active sort (and the anchored
                             // selection) correct as pages arrive.

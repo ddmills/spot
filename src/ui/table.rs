@@ -236,12 +236,6 @@ pub const ACTIONS_W: usize = LIKE_W + ADD_W;
 /// than a row missing its year.
 pub const ACTIONS_MIN: usize = 30;
 
-/// The header's label for the pair: the two marks it heads, spelled the way
-/// the rows spell them.
-pub fn actions_label() -> String {
-    format!(" {LIKED_MARK}  {ADD_MARK} ")
-}
-
 /// The `★ +` pair for one row, in [`ACTIONS_W`] cells.
 ///
 /// The star is always drawn — dim when the track is unsaved or its state is
