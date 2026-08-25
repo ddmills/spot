@@ -286,10 +286,10 @@ mod tests {
         );
         // The track table reaches the far side: with the rail gone, the header
         // row.s Time column ends in the scrollbar gutter rather than 33 cells
-        // short of it. Row 7 is that heading: label, blank, the name row,
-        // ▶ play, blank, then the columns.
+        // short of it. Row 10 is that heading: label, blank, the band's four
+        // lines and the blank under its control row, then the columns.
         let row: String = (0..100)
-            .filter_map(|x| buffer.cell(Position { x, y: 7 }).map(|c| c.symbol()))
+            .filter_map(|x| buffer.cell(Position { x, y: 10 }).map(|c| c.symbol()))
             .collect();
         assert!(row.contains("Title"), "not the column header: {row:?}");
         assert!(

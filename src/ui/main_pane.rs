@@ -1269,12 +1269,23 @@ fn format_total_duration(ms: u64) -> String {
 const ART_H: u16 = 6;
 const ART_GAP: u16 = 3;
 const MIN_META_W: u16 = 40;
-/// Rows the band spends: the sleeve, then a blank spacer under it. Without a
-/// cover the text alone is three rows, as it always was.
+/// Rows the band spends beside a sleeve: the sleeve itself, then a blank
+/// under it.
 const ART_BAND_H: u16 = ART_H + 1;
+/// Rows the same band spends without one: name, subtitle, totals, a blank
+/// between the metadata and the control, the control, and a blank under it.
+///
+/// The layout is the sleeve's, minus the sleeve. What a playlist has varies —
+/// some have a cover, some a blurb, most neither — and a page that rearranged
+/// itself around each combination would read as several different pages rather
+/// than as one page with more or less to say.
+const STACK_BAND_H: u16 = 6;
+/// Rows the compact band spends: name, subtitle and totals sharing one row,
+/// the control under it, then a blank. The degradation for a pane too short
+/// to seat the real thing.
 const TEXT_BAND_H: u16 = 3;
-/// Rows the track table must still get for a sleeve to be worth drawing: its
-/// column header, a spacer, and enough rows to be a list. A seven-row band
+/// Rows the track table must still get for a band to be worth its own height:
+/// its column header, a spacer, and enough rows to be a list. A seven-row band
 /// over a three-row table is a worse screen than no sleeve at all — the same
 /// judgement `player::Rows::MIN_ART_QUEUE` makes about its queue.
 const MIN_TABLE_H: u16 = 6;
@@ -1304,9 +1315,9 @@ fn header_band(
     let dim = theme::dim();
     let accent = theme::accent();
 
-    // The sleeve, when this is an album, it has one, and there are rows and
-    // cells to spare. A playlist's mosaic is not a record cover, so playlists
-    // and Liked Songs never take this branch.
+    // The sleeve, when the page has one and there are rows and cells to spare.
+    // Only a record cover reaches here: an album's own, or a playlist's when
+    // Spotify made it something better than a mosaic of four others.
     let sleeve_w = super::table::art_w(ART_H);
     let art = (list.header.cover_url.is_some()
         && inner.height >= ART_BAND_H + MIN_TABLE_H
@@ -1329,6 +1340,15 @@ fn header_band(
         None => inner,
     };
 
+    // The stacked layout is what a page wears whether or not it has a sleeve
+    // — losing the art must not also lose the shape. Only a pane too short to
+    // seat it falls back to the one-row band, and that is a degradation rather
+    // than a second design. The blurb is a row of the same block, so it is
+    // counted before deciding there is room.
+    let blurb = !list.header.description.is_empty();
+    let stack_h = STACK_BAND_H + u16::from(blurb);
+    let stacked = art.is_some() || inner.height >= stack_h + MIN_TABLE_H;
+
     // Row 0: name + subtitle on the left, totals right-aligned.
     let info_area = Rect { height: 1, ..text };
     let total_ms: u64 = list.items.iter().map(|t| t.duration_ms).sum();
@@ -1342,10 +1362,9 @@ fn header_band(
         },
         dim,
     );
-    // Beside a sleeve the totals get their own row: the column is narrower
-    // there, and a name squeezed against a right-aligned count reads as two
-    // things fighting rather than as a heading.
-    let stacked = art.is_some();
+    // Stacked, the totals get a row of their own: a name squeezed against a
+    // right-aligned count reads as two things fighting rather than as a
+    // heading. The compact band has no row to spare and puts up with it.
     let totals_w = if stacked {
         0
     } else {
@@ -1365,15 +1384,14 @@ fn header_band(
     frame.render_widget(Paragraph::new(Line::from(left)), name_area);
 
     // Lines are laid down in order and skip what is not there, rather than
-    // taking fixed rows — a playlist has a blurb and an album does not, and a
-    // totals line floating a row below an absent one reads as damage. The
-    // same shape `artist_band` uses for its genres.
+    // taking fixed rows — most playlists have no blurb, and a totals line
+    // floating a row below an absent one reads as damage. The same shape
+    // `artist_band` uses for its genres.
     let row = |n: u16| Rect {
         y: text.y + n,
         height: 1,
         ..text
     };
-    let description = super::table::fit(&list.header.description, text.width as usize);
     let mut n = 1;
     if stacked && !list.header.subtitle.is_empty() {
         frame.render_widget(
@@ -1382,7 +1400,10 @@ fn header_band(
         );
         n += 1;
     }
-    if !list.header.description.is_empty() {
+    // The blurb goes with the sleeve rather than with the name: both are what
+    // a page sheds first, and the compact band has no row to spend on prose.
+    if blurb && stacked {
+        let description = super::table::fit(&list.header.description, text.width as usize);
         frame.render_widget(Paragraph::new(Line::styled(description, dim)), row(n));
         n += 1;
     }
@@ -1425,9 +1446,14 @@ fn header_band(
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
 
-    // A blank under the last line, so the column header below is not flush
-    // against the control row.
-    let used = if stacked { ART_BAND_H } else { n + 2 };
+    // A blank under the control row, so the column header below is not flush
+    // against it — and never less than the sleeve, which the table must clear
+    // however few lines the metadata beside it spent.
+    let floor = match art {
+        Some(_) => ART_BAND_H,
+        None => 0,
+    };
+    let used = (play_area.y - text.y + 2).max(floor);
     Rect {
         y: inner.y + used,
         height: inner.height.saturating_sub(used),
@@ -2977,28 +3003,73 @@ mod tests {
         );
     }
 
-    /// A playlist that Spotify only made a mosaic for keeps the text-only
-    /// band — and so does an album whose art it never gave us at all. The
-    /// mosaic never reaches the header: `playlist_cover` drops it, so the page
-    /// arrives with no cover rather than with one the band has to refuse.
+    /// A page with no cover loses the sleeve and nothing else. A playlist that
+    /// Spotify only made a mosaic for is one of these — `playlist_cover` drops
+    /// the mosaic, so the page arrives with no cover rather than with one the
+    /// band has to refuse — and so is an album whose art it never gave us.
+    ///
+    /// The point is that the two read as one page with less to say, not as two
+    /// different pages. Every line sits where it sits beside a sleeve.
     #[test]
-    fn a_coverless_page_keeps_the_text_band() {
-        for mut st in [tracks_state(vec![track("A", "B")]), {
-            let mut st = album_state();
-            if let MainView::Tracks(list) = &mut st.main {
-                list.header.cover_url = None;
-            }
-            st
-        }] {
+    fn a_coverless_page_keeps_the_layout_and_drops_only_the_sleeve() {
+        for mut st in [
+            {
+                let mut st = tracks_state(vec![track("A", "B")]);
+                if let MainView::Tracks(list) = &mut st.main {
+                    list.header.subtitle = "by me".into();
+                }
+                st
+            },
+            {
+                let mut st = album_state();
+                if let MainView::Tracks(list) = &mut st.main {
+                    list.header.cover_url = None;
+                }
+                st
+            },
+        ] {
             let lines = render(&mut st, 90, 22);
             assert!(
                 !lines.iter().any(|l| l.contains('▀')),
                 "a sleeve appeared: {lines:#?}"
             );
-            // Name and totals share row 2, as they always did.
-            assert!(lines[4].contains("tracks"));
-            assert!(lines[5].contains("▶ play"));
+            assert!(lines[6].contains("tracks"), "{lines:#?}");
+            assert!(lines[8].contains("▶ play"), "{lines:#?}");
         }
+    }
+
+    /// The same page, with and without a sleeve, puts every line of the header
+    /// on the same row. The sleeve is six rows tall, so the table below it
+    /// starts one row lower — that is the art taking up room, not the layout
+    /// rearranging itself around what the page happens to have.
+    #[test]
+    fn a_sleeve_moves_nothing_but_the_table_under_it() {
+        let rows_of = |cover: Option<&str>| {
+            let mut st = playlist_state();
+            if let MainView::Tracks(list) = &mut st.main {
+                list.header.description = "Fresh music every Monday".into();
+                list.header.cover_url = cover.map(str::to_string);
+            }
+            let lines = render(&mut st, 90, 22);
+            let at = |needle: &str| {
+                lines
+                    .iter()
+                    .position(|l| l.contains(needle))
+                    .unwrap_or_else(|| panic!("no {needle:?} in {lines:#?}"))
+            };
+            [
+                at("Discover Weekly"),
+                at("by Spotify"),
+                at("Fresh music"),
+                at("tracks ·"),
+                at("▶ play"),
+            ]
+        };
+        assert_eq!(
+            rows_of(Some("https://i.scdn.co/image/dw")),
+            rows_of(None),
+            "the header rearranged itself around the sleeve"
+        );
     }
 
     /// A playlist with a cover of its own is an album page in every respect
@@ -3041,15 +3112,35 @@ mod tests {
     fn a_blurb_without_a_sleeve_pushes_the_table_down() {
         let mut st = tracks_state(vec![track("A", "B")]);
         if let MainView::Tracks(list) = &mut st.main {
+            list.header.subtitle = "by me".into();
             list.header.description = "Deep cuts chosen for you".into();
         }
         let lines = render(&mut st, 90, 22);
-        assert!(lines[4].contains("tracks"));
-        assert!(lines[5].contains("Deep cuts"));
+        assert!(lines[5].contains("by me"), "{lines:#?}");
+        assert!(lines[6].contains("Deep cuts"), "{lines:#?}");
+        assert!(lines[7].contains("tracks"), "{lines:#?}");
         assert!(
-            lines[6].contains("▶ play"),
+            lines[9].contains("▶ play"),
             "controls moved wrong: {lines:#?}"
         );
+        assert!(lines[11].contains("Title"), "{lines:#?}");
+    }
+
+    /// A pane too short to seat the stacked band falls back to the one-row
+    /// one, blurb and all — that is a degradation, and prose is the first
+    /// thing it can afford to lose.
+    #[test]
+    fn a_short_pane_falls_back_to_the_compact_band() {
+        let mut st = tracks_state(vec![track("A", "B")]);
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.subtitle = "by me".into();
+            list.header.description = "Deep cuts chosen for you".into();
+        }
+        let lines = render(&mut st, 90, 15);
+        assert!(lines[4].contains("by me"), "{lines:#?}");
+        assert!(lines[4].contains("tracks"), "not one row: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("Deep cuts")));
+        assert!(lines[5].contains("▶ play"), "{lines:#?}");
     }
 
     /// The save control is for a playlist someone else made. Your own carries
@@ -3227,8 +3318,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        // border + pad + band(3) + header + spacer + row 0; selected is index 1
-        let row_y = 10;
+        // border + pad + band(5, no subtitle on this fixture) + header +
+        // spacer + row 0; selected is index 1
+        let row_y = 12;
         assert!((1..79u16).any(|x| {
             let cell = buffer.cell(Position { x, y: row_y }).unwrap();
             cell.fg == theme::BRIGHT && cell.modifier.contains(Modifier::BOLD)
