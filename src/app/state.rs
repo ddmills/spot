@@ -91,6 +91,15 @@ pub struct Playlist {
     pub owner_id: String,
     /// Spotify's content-version hash; changes whenever the playlist does.
     pub snapshot_id: String,
+    /// CDN URL of the playlist's own cover, so opening it can show the art
+    /// without a second round trip. `None` when Spotify gave the playlist no
+    /// images, or gave it only a mosaic — see [`crate::cover::is_mosaic`].
+    pub cover_url: Option<String>,
+    /// Whether the playlist is listed on the owner's profile. `None` when
+    /// Spotify would not say, which it does for playlists that are not yours.
+    pub public: Option<bool>,
+    /// Whether anyone the owner invited may add to it.
+    pub collaborative: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -555,10 +564,20 @@ pub struct ViewHeader {
     pub subtitle: String,
     /// CDN URL of the sleeve, for the header band to draw.
     ///
-    /// Only albums set it. A playlist's mosaic is not a record cover, and the
-    /// band reads better without a placeholder swatch standing where artwork
-    /// would be.
+    /// A playlist sets it only when it has a cover of its own: an
+    /// auto-generated mosaic is four sleeves at a sixth of the size each, and
+    /// the band reads better without one. See [`crate::cover::is_mosaic`].
     pub cover_url: Option<String>,
+    /// The blurb Spotify carries for a playlist, already unescaped. Empty for
+    /// albums, for Liked Songs, and for the many playlists with none.
+    pub description: String,
+    /// Spotify id of a playlist's owner, for telling the one control Spotify
+    /// would accept from the one it would refuse.
+    ///
+    /// On the header rather than read off [`AppState::playlists`], because a
+    /// playlist opened from a search is not in that list and still has an
+    /// owner. Empty until known, and on every page that is not a playlist.
+    pub owner_id: String,
 }
 
 /// What kind of context a `TrackList` shows; drives the pane's type label
@@ -1014,6 +1033,8 @@ impl TrackList {
                 name: name.into(),
                 subtitle: subtitle.into(),
                 cover_url: None,
+                description: String::new(),
+                owner_id: String::new(),
             },
             rows: SortedList::new(),
             total,
@@ -1309,8 +1330,12 @@ pub fn liked_key() -> String {
     "liked".to_string()
 }
 
+/// Head of every playlist page's cache key, so building one and reading the id
+/// back out of one cannot drift apart.
+pub const PLAYLIST_KEY_PREFIX: &str = "playlist:";
+
 pub fn playlist_key(id: &str) -> String {
-    format!("playlist:{id}")
+    format!("{PLAYLIST_KEY_PREFIX}{id}")
 }
 
 pub fn album_key(id: &str) -> String {
@@ -1461,6 +1486,46 @@ pub struct PlaylistPicker {
     pub order: Vec<usize>,
 }
 
+/// Which field of the edit box the typing goes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    Name,
+    Description,
+}
+
+impl EditField {
+    /// The other field, for Tab.
+    pub fn other(self) -> Self {
+        match self {
+            EditField::Name => EditField::Description,
+            EditField::Description => EditField::Name,
+        }
+    }
+}
+
+/// The open "edit playlist" box: which playlist it is about, and what has
+/// been typed into its two fields.
+///
+/// An overlay rather than a page, for the same reason the add-to-playlist box
+/// is one: the edit is about the playlist behind it, and walking away to type
+/// would lose the thing being edited.
+#[derive(Debug, Clone)]
+pub struct PlaylistEdit {
+    /// The playlist the change applies to, fixed when the box opens.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub field: EditField,
+    /// A change is in flight; the box stays up and inert until it lands.
+    pub pending: bool,
+    /// The last change that came back refused. The box is the only surface
+    /// that can report one while it covers the toast.
+    pub error: Option<String>,
+    /// Identifies this opening, so a result arriving after the box was closed
+    /// and opened again cannot act on the new one.
+    pub seq: u64,
+}
+
 /// Screen regions recorded during draw, used to resolve mouse events.
 /// Reset at the start of every frame; a region not drawn that frame stays
 /// zero-sized and can never be hit.
@@ -1524,6 +1589,16 @@ pub struct HitAreas {
     /// The shuffle button in a view's header band; plays the whole context
     /// shuffled.
     pub header_shuffle_btn: Rect,
+    /// The save control in a playlist's header band. Empty on a playlist you
+    /// own, where unsaving is how Spotify spells deleting.
+    pub header_save_btn: Rect,
+    /// The edit control in a playlist's header band. Empty on a playlist you
+    /// do not own, which Spotify refuses the change for.
+    pub header_edit_btn: Rect,
+    /// The two fields of the edit box, and its save control.
+    pub edit_name: Rect,
+    pub edit_description: Rect,
+    pub edit_save: Rect,
     /// The `↻ try again` control on a page whose load failed. Empty on every
     /// page that did not draw one, so a click can never reach a page that has
     /// nothing to retry.
@@ -1748,6 +1823,15 @@ pub struct AppState {
     pub picker: Option<PlaylistPicker>,
     /// Stamped onto the next box that opens; see [`PlaylistPicker::seq`].
     pub picker_seq: u64,
+    /// The "edit playlist" box, while one is open. Owns the keyboard the same
+    /// way the add-to-playlist box does.
+    pub edit: Option<PlaylistEdit>,
+    /// Stamped onto the next edit box that opens; see [`PlaylistEdit::seq`].
+    pub edit_seq: u64,
+    /// Whether a playlist is in the library, by playlist id. Absent = not
+    /// checked yet, the same shape [`Self::liked`] has for tracks: unknown
+    /// draws nothing rather than drawing "no".
+    pub saved_playlists: HashMap<String, bool>,
     /// What each playlist holds, by playlist id — the marks in the box are
     /// read out of this.
     ///
@@ -1877,6 +1961,9 @@ impl AppState {
             input_buffer: String::new(),
             picker: None,
             picker_seq: 0,
+            edit: None,
+            edit_seq: 0,
+            saved_playlists: HashMap::new(),
             playlist_tracks: HashMap::new(),
             show_player: false,
             queue: None,
@@ -2481,8 +2568,45 @@ impl AppState {
     /// The one way in, so the permutation can never be left over a list it is
     /// not about — a stale one would drop rows off the page.
     pub fn set_playlists(&mut self, playlists: Vec<Playlist>) {
+        // Everything the library lists is in the library by definition, so the
+        // header's save control knows its answer without a probe. Only a
+        // playlist reached from a search has to ask.
+        for p in &playlists {
+            self.saved_playlists.insert(p.id.clone(), true);
+        }
         self.playlists = playlists;
         self.rebuild_playlists_display();
+    }
+
+    /// The playlist the open page is about, when it is about one.
+    ///
+    /// The page carries its identity in `cache_key` rather than in the header,
+    /// which is display text — see [`playlist_key`].
+    pub fn open_playlist_id(&self) -> Option<&str> {
+        match &self.main {
+            MainView::Tracks(list) if list.kind == TrackListKind::Playlist => list
+                .cache_key
+                .as_deref()
+                .and_then(|k| k.strip_prefix(PLAYLIST_KEY_PREFIX)),
+            _ => None,
+        }
+    }
+
+    /// Whether the open playlist page is one the signed-in user owns.
+    ///
+    /// Judged on the owner id rather than the display name, which need not be
+    /// unique. Unknown until both ids are in hand, and unknown means no: the
+    /// control this gates would be refused by Spotify anyway.
+    pub fn owns_open_playlist(&self) -> bool {
+        let Some(me) = self.me_id.as_deref() else {
+            return false;
+        };
+        match &self.main {
+            MainView::Tracks(list) if list.kind == TrackListKind::Playlist => {
+                !list.header.owner_id.is_empty() && list.header.owner_id == me
+            }
+            _ => false,
+        }
     }
 }
 
@@ -2503,6 +2627,9 @@ mod tests {
             owner: owner_id.into(),
             owner_id: owner_id.into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         }
     }
 
@@ -2648,6 +2775,9 @@ mod tests {
             owner: "Spotify".into(),
             owner_id: SPOTIFY_OWNER.into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         }]);
 
         for state in [

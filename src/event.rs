@@ -10,9 +10,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
-    self as state, AppState, ArtistRow, BackTarget, ColKey, CrumbTarget, HomeItem, InputMode,
-    MainView, PICKER_ROWS, RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SpotifyState,
-    Station, Track, TrackList, UpdateState, ViewKey,
+    self as state, AppState, ArtistRow, BackTarget, ColKey, CrumbTarget, EditField, HomeItem,
+    InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow, RadioScope, RadioTab,
+    SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
 };
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -35,6 +35,12 @@ pub fn handle_event(event: Event, state: &Arc<RwLock<AppState>>, tx: &UnboundedS
             // nothing underneath may read it as a command.
             if state.read().picker.is_some() {
                 handle_picker_key(key, state, tx);
+                return;
+            }
+            // The edit box owns the keyboard for the same reason, and it has
+            // two fields to spend a letter on rather than one.
+            if state.read().edit.is_some() {
+                handle_edit_key(key, state, tx);
                 return;
             }
             let mode = state.read().input_mode;
@@ -90,6 +96,31 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
             return;
         }
         st.picker = None;
+        return;
+    }
+
+    // The edit box, on the same terms as the picker above: every branch
+    // returns, and a click that missed a caret must not close the box and
+    // take the typing with it.
+    if let Some(edit) = st.edit.as_ref() {
+        let pending = edit.pending;
+        if st.hit.edit_name.contains(pos) {
+            if let Some(edit) = st.edit.as_mut().filter(|_| !pending) {
+                edit.field = EditField::Name;
+            }
+            return;
+        }
+        if st.hit.edit_description.contains(pos) {
+            if let Some(edit) = st.edit.as_mut().filter(|_| !pending) {
+                edit.field = EditField::Description;
+            }
+            return;
+        }
+        if st.hit.edit_save.contains(pos) {
+            submit_edit(st, tx);
+            return;
+        }
+        st.edit = None;
         return;
     }
     // The mark is on every screen, in both views, and it is the one control
@@ -322,6 +353,16 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
 
     if st.hit.header_shuffle_btn.contains(pos) {
         play_current_view(st, tx, true);
+        return;
+    }
+
+    if st.hit.header_save_btn.contains(pos) {
+        toggle_saved_playlist(st, tx);
+        return;
+    }
+
+    if st.hit.header_edit_btn.contains(pos) {
+        open_playlist_edit(st);
         return;
     }
 
@@ -576,6 +617,132 @@ fn handle_picker_key(
     cache_visible_playlists(&st, tx);
 }
 
+/// Longest name and blurb Spotify takes. Enforced here rather than trusted to
+/// the API, so the refusal is a key that does nothing rather than a round trip
+/// that comes back with the whole edit rejected.
+const MAX_PLAYLIST_NAME: usize = 100;
+const MAX_PLAYLIST_DESCRIPTION: usize = 300;
+
+/// Keys while the edit box is up. Modal, like [`handle_picker_key`]: both
+/// fields take bare letters, so nothing underneath may read one as a command.
+fn handle_edit_key(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSender<AppCommand>) {
+    let mut st = state.write();
+    match key.code {
+        KeyCode::Esc => {
+            st.edit = None;
+            return;
+        }
+        KeyCode::Enter => {
+            submit_edit(&mut st, tx);
+            return;
+        }
+        _ => {}
+    }
+    let Some(edit) = st.edit.as_mut() else {
+        return;
+    };
+    // A change in flight owns the text it was sent with; letting it be typed
+    // over would leave the box disagreeing with what was asked for.
+    if edit.pending {
+        return;
+    }
+    match key.code {
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+            edit.field = edit.field.other();
+        }
+        KeyCode::Backspace => {
+            match edit.field {
+                EditField::Name => edit.name.pop(),
+                EditField::Description => edit.description.pop(),
+            };
+        }
+        KeyCode::Char(c) => match edit.field {
+            EditField::Name if edit.name.chars().count() < MAX_PLAYLIST_NAME => edit.name.push(c),
+            EditField::Description
+                if edit.description.chars().count() < MAX_PLAYLIST_DESCRIPTION =>
+            {
+                edit.description.push(c)
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Open the edit box for the playlist page on screen.
+///
+/// Only your own: Spotify refuses the change for any other, and a box that
+/// takes an edit it cannot deliver is worse than no box.
+fn open_playlist_edit(st: &mut AppState) {
+    if !st.owns_open_playlist() {
+        return;
+    }
+    let Some(id) = st.open_playlist_id().map(str::to_string) else {
+        return;
+    };
+    let MainView::Tracks(list) = &st.main else {
+        return;
+    };
+    let (name, description) = (list.header.name.clone(), list.header.description.clone());
+    st.edit_seq += 1;
+    st.edit = Some(PlaylistEdit {
+        id,
+        name,
+        description,
+        field: EditField::Name,
+        pending: false,
+        error: None,
+        seq: st.edit_seq,
+    });
+}
+
+/// Send what the box holds, and hold it inert until the answer lands.
+fn submit_edit(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(edit) = st.edit.as_mut() else {
+        return;
+    };
+    if edit.pending {
+        return;
+    }
+    // A playlist has to be called something, and Spotify refuses a blank name
+    // rather than keeping the old one.
+    if edit.name.trim().is_empty() {
+        edit.error = Some("a playlist needs a name".to_string());
+        return;
+    }
+    edit.pending = true;
+    edit.error = None;
+    let _ = tx.send(AppCommand::EditPlaylistDetails {
+        id: edit.id.clone(),
+        name: edit.name.trim().to_string(),
+        description: edit.description.trim().to_string(),
+        seq: edit.seq,
+    });
+}
+
+/// `F` / the header's control: put the open playlist in the library, or take
+/// it out.
+///
+/// Silent on a playlist you own — the control is not drawn there, and the key
+/// must agree with it. Unfollowing your own playlist is how Spotify spells
+/// deleting it, which is not what one keypress should mean.
+fn toggle_saved_playlist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    if st.owns_open_playlist() {
+        return;
+    }
+    let Some(id) = st.open_playlist_id().map(str::to_string) else {
+        return;
+    };
+    // Unknown is not "no": until the check answers, there is nothing to flip
+    // to that would not be a guess at what the library already holds.
+    let Some(saved) = st.saved_playlists.get(&id).copied() else {
+        return;
+    };
+    // The flip itself is the client's, as it is for a track's `★` — see
+    // `send_like`. Doing it here as well would only be the same write twice.
+    let _ = tx.send(AppCommand::SetPlaylistSaved { id, saved: !saved });
+}
+
 /// Ask for the contents of any row on screen that has not been walked yet.
 ///
 /// The prefetch at sign-in normally leaves nothing to do here, so this is the
@@ -798,6 +965,8 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
         KeyCode::Enter => activate_selection(&mut state.write(), tx),
         KeyCode::Char('a') => queue_selection(&mut state.write(), tx),
         KeyCode::Char('L') => toggle_like_selection(&mut state.write(), tx),
+        KeyCode::Char('F') => toggle_saved_playlist(&mut state.write(), tx),
+        KeyCode::Char('E') => open_playlist_edit(&mut state.write()),
 
         KeyCode::Char('b') => open_album_of_selection(&mut state.write(), tx),
         KeyCode::Char('B') => open_artist_of_selection(&mut state.write(), tx),
@@ -873,7 +1042,9 @@ fn handle_player_key(
         // invisible panes underneath. `/` is one of them again: the header
         // draws no prompt over the player, so the key would put you in a mode
         // with nothing on screen to show what you were typing.
-        KeyCode::Char('/' | '1' | '2' | 'b' | 'B' | 'o' | 'O' | 'a' | 'x' | '[' | ']')
+        KeyCode::Char(
+            '/' | '1' | '2' | 'b' | 'B' | 'o' | 'O' | 'a' | 'x' | 'F' | 'E' | '[' | ']',
+        )
         | KeyCode::Tab
         | KeyCode::BackTab
         | KeyCode::Backspace
@@ -1056,7 +1227,7 @@ fn after_pop(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         MainView::Tracks(list) if list.loading => match list.cache_key.as_deref() {
             Some("liked") => drop(tx.send(AppCommand::LoadLikedSongs)),
             Some(key) => {
-                if let Some(id) = key.strip_prefix("playlist:") {
+                if let Some(id) = key.strip_prefix(state::PLAYLIST_KEY_PREFIX) {
                     let _ = tx.send(AppCommand::LoadPlaylistTracks {
                         playlist_id: id.to_string(),
                     });
@@ -1450,14 +1621,16 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                 uri: a.uri.clone(),
                 name: a.name.clone(),
             }),
-            SearchTab::Playlists => results
-                .playlists
-                .get(index)
-                .map(|p| AppCommand::PlayFetched {
-                    source: FetchSource::Playlist { id: p.id.clone() },
-                    name: p.name.clone(),
-                    shuffle: false,
-                }),
+            // Opened, not played — the same gesture every other row here
+            // answers to. `x` is what plays one; see `play_without_opening`.
+            SearchTab::Playlists => {
+                results
+                    .playlists
+                    .get(index)
+                    .map(|p| AppCommand::LoadPlaylistTracks {
+                        playlist_id: p.id.clone(),
+                    })
+            }
             // Resolved above, before this match takes its borrow.
             SearchTab::Stations => None,
         },
@@ -1657,7 +1830,7 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             }
             return;
         }
-        // Only on the Stations tab; the other four fall through to the
+        // Only on the Stations tab; the other three fall through to the
         // current view's list below, as they always have.
         MainView::Search(_) if st.search_tab == SearchTab::Stations => {
             if let Some(station) = selected_station(st).cloned() {
@@ -1665,6 +1838,13 @@ fn play_without_opening(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
             }
             return;
         }
+        // A searched playlist's rows are not in hand either, so it takes the
+        // same source shortcut a library one does. Enter opens it; this is
+        // the gesture that only plays it.
+        MainView::Search(results) if st.search_tab == SearchTab::Playlists => results
+            .playlists
+            .get(st.main_index)
+            .map(|p| (p.id.clone(), p.name.clone())),
         _ => {
             play_current_view(st, tx, false);
             return;
@@ -2231,6 +2411,162 @@ mod tests {
         // The library itself is untouched: the add-to-playlist box freezes
         // indices into it.
         assert_eq!(st.playlists[0].name, "trendy");
+    }
+
+    /// A search's playlist row opens like every other row here. It only ever
+    /// played before, which left a searched playlist with no way in at all.
+    #[test]
+    fn a_searched_playlist_opens_on_enter_and_plays_on_x() {
+        let searched = || {
+            let (tx, rx) = channel();
+            let mut st = connected();
+            st.search_tab = SearchTab::Playlists;
+            st.main = MainView::Search(state::SearchResults {
+                query: "jazz".into(),
+                playlists: vec![playlist("p1", "Blue Note", "someone")].into(),
+                ..Default::default()
+            });
+            (st, tx, rx)
+        };
+
+        let (mut st, tx, mut rx) = searched();
+        activate_selection(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadPlaylistTracks { ref playlist_id }) if playlist_id == "p1"
+        ));
+
+        let (mut st, tx, mut rx) = searched();
+        play_without_opening(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::PlayFetched {
+                source: FetchSource::Playlist { ref id },
+                ..
+            }) if id == "p1"
+        ));
+    }
+
+    /// `F` is about the playlist you are looking at, and only a playlist
+    /// someone else made — Spotify has no unfollow for your own that is not a
+    /// delete, so the key must agree with the control that is not drawn.
+    #[test]
+    fn the_save_key_acts_only_on_a_playlist_you_do_not_own() {
+        let page = |owner: &str| {
+            let mut st = connected();
+            st.me_id = Some("me".into());
+            let mut list = TrackList::new("Blue Note", "", None);
+            list.cache_key = Some(state::playlist_key("p1"));
+            list.header.owner_id = owner.into();
+            st.main = MainView::Tracks(list);
+            st.saved_playlists.insert("p1".into(), true);
+            st
+        };
+
+        let (tx, mut rx) = channel();
+        let mut theirs = page("someone");
+        toggle_saved_playlist(&mut theirs, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::SetPlaylistSaved { ref id, saved: false }) if id == "p1"
+        ));
+
+        let mut mine = page("me");
+        toggle_saved_playlist(&mut mine, &tx);
+        assert!(rx.try_recv().is_err(), "your own playlist was unsaved");
+    }
+
+    /// Until the check answers there is nothing to flip to, so the key does
+    /// nothing rather than guessing at what the library holds.
+    #[test]
+    fn the_save_key_waits_for_the_check() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.me_id = Some("me".into());
+        let mut list = TrackList::new("Blue Note", "", None);
+        list.cache_key = Some(state::playlist_key("p1"));
+        list.header.owner_id = "someone".into();
+        st.main = MainView::Tracks(list);
+
+        toggle_saved_playlist(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// The edit box opens on your own playlist, filled with what the page
+    /// already shows, and refuses to open on anyone else's.
+    #[test]
+    fn the_edit_box_opens_only_on_your_own_playlist() {
+        let page = |owner: &str| {
+            let mut st = connected();
+            st.me_id = Some("me".into());
+            let mut list = TrackList::new("Blue Note", "by me", None);
+            list.cache_key = Some(state::playlist_key("p1"));
+            list.header.owner_id = owner.into();
+            list.header.description = "hard bop".into();
+            st.main = MainView::Tracks(list);
+            st
+        };
+
+        let mut mine = page("me");
+        open_playlist_edit(&mut mine);
+        let edit = mine.edit.expect("no box on your own playlist");
+        assert_eq!(edit.id, "p1");
+        assert_eq!(edit.name, "Blue Note");
+        assert_eq!(edit.description, "hard bop");
+
+        let mut theirs = page("someone");
+        open_playlist_edit(&mut theirs);
+        assert!(theirs.edit.is_none());
+    }
+
+    /// A blank name is refused here rather than by Spotify: the round trip
+    /// would come back having rejected the blurb along with it.
+    #[test]
+    fn an_unnamed_playlist_is_refused_before_it_is_sent() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.edit = Some(PlaylistEdit {
+            id: "p1".into(),
+            name: "  ".into(),
+            description: "hard bop".into(),
+            field: EditField::Name,
+            pending: false,
+            error: None,
+            seq: 1,
+        });
+
+        submit_edit(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
+        let edit = st.edit.expect("the box closed on a refusal");
+        assert!(!edit.pending);
+        assert!(edit.error.is_some());
+    }
+
+    /// A change in flight owns the text it went out with, so a second Enter
+    /// cannot send the same edit twice.
+    #[test]
+    fn a_pending_edit_is_sent_once() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.edit = Some(PlaylistEdit {
+            id: "p1".into(),
+            name: " Blue Note ".into(),
+            description: " hard bop ".into(),
+            field: EditField::Name,
+            pending: false,
+            error: None,
+            seq: 1,
+        });
+
+        submit_edit(&mut st, &tx);
+        // Trimmed: a name typed with a stray space is the name without it.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::EditPlaylistDetails { ref name, ref description, .. })
+                if name == "Blue Note" && description == "hard bop"
+        ));
+        submit_edit(&mut st, &tx);
+        assert!(rx.try_recv().is_err());
     }
 
     /// The Tracks tab of a search plays what is on screen, like every other
@@ -3044,6 +3380,9 @@ mod tests {
             owner: owner_id.into(),
             owner_id: owner_id.into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         }
     }
 
@@ -3909,6 +4248,9 @@ mod tests {
                 owner: "me".into(),
                 owner_id: "me".into(),
                 snapshot_id: "s".into(),
+                cover_url: None,
+                public: None,
+                collaborative: false,
             },
             state::Playlist {
                 id: "p2".into(),
@@ -3917,6 +4259,9 @@ mod tests {
                 owner: "them".into(),
                 owner_id: "them".into(),
                 snapshot_id: "s".into(),
+                cover_url: None,
+                public: None,
+                collaborative: false,
             },
         ]);
         start_playing(&mut st);
@@ -3943,6 +4288,9 @@ mod tests {
                 owner: "me".into(),
                 owner_id: "me".into(),
                 snapshot_id: "s".into(),
+                cover_url: None,
+                public: None,
+                collaborative: false,
             });
         }
     }
@@ -4022,6 +4370,9 @@ mod tests {
             owner: "me".into(),
             owner_id: "me".into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         });
         cache_playlists(&mut st, &["p3"]);
         handle_click(&mut st, Position { x: 72, y: 0 }, &tx);
@@ -4211,6 +4562,9 @@ mod tests {
             owner: "me".into(),
             owner_id: "me".into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         });
         let state = Arc::new(RwLock::new(two));
         {

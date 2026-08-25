@@ -79,6 +79,54 @@ struct RawTrackUri {
     uri: Option<String>,
 }
 
+/// A playlist's own metadata, narrowed to what the header band draws.
+///
+/// Read raw rather than through rspotify's `FullPlaylist` for two reasons:
+/// that type drags the first hundred tracks along, which this call has no use
+/// for, and a `fields`-narrowed response cannot deserialize into it — the same
+/// bind [`Api::artist_albums`] is in.
+#[derive(Deserialize)]
+struct RawPlaylist {
+    name: String,
+    description: Option<String>,
+    #[serde(default)]
+    images: Vec<rspotify::model::Image>,
+    public: Option<bool>,
+    #[serde(default)]
+    collaborative: bool,
+    owner: Option<RawOwner>,
+    /// Spotify renamed `tracks` to `items` in February 2026 and serves both
+    /// for now. Whichever arrives is the total; see rspotify's own shadow
+    /// structs, which straddle the same rename.
+    tracks: Option<RawTotal>,
+    items: Option<RawTotal>,
+}
+
+#[derive(Deserialize)]
+struct RawOwner {
+    id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawTotal {
+    total: u32,
+}
+
+/// What [`Api::playlist_detail`] answers with: everything the playlist page's
+/// header shows that its track pages do not carry.
+#[derive(Debug, Clone)]
+pub struct PlaylistDetail {
+    pub name: String,
+    pub description: String,
+    pub cover_url: Option<String>,
+    pub owner: String,
+    pub owner_id: String,
+    pub public: Option<bool>,
+    pub collaborative: bool,
+    pub total: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct Api {
     client: AuthCodeSpotify,
@@ -490,6 +538,148 @@ impl Api {
             }
         }
     }
+
+    /// A playlist's own metadata: the blurb, the cover, who owns it and how it
+    /// is shared.
+    ///
+    /// The playlist list the library page is built from carries none of the
+    /// first two, and carries nothing at all about a playlist you do not
+    /// follow — so a page opened from a search has only this to fill it.
+    pub async fn playlist_detail(&self, playlist_id: &str) -> Result<PlaylistDetail> {
+        let params: Query = [(
+            "fields",
+            "name,description,images,public,collaborative,\
+             owner(id,display_name),tracks(total),items(total)",
+        )]
+        .into_iter()
+        .collect();
+        let body = self
+            .client
+            .api_get(&format!("playlists/{playlist_id}"), &params)
+            .await
+            .context("failed to read the playlist")?;
+        let p: RawPlaylist = serde_json::from_str(&body)?;
+        let owner_id = p.owner.as_ref().map(|o| o.id.clone()).unwrap_or_default();
+        Ok(PlaylistDetail {
+            name: p.name,
+            description: unescape_html(p.description.as_deref().unwrap_or_default()),
+            cover_url: playlist_cover(&p.images),
+            owner: p
+                .owner
+                .and_then(|o| o.display_name)
+                .unwrap_or_else(|| owner_id.clone()),
+            owner_id,
+            public: p.public,
+            collaborative: p.collaborative,
+            total: p.items.or(p.tracks).map(|t| t.total),
+        })
+    }
+
+    /// Whether the playlist is in the user's library.
+    ///
+    /// "Saved" and "followed" are one thing to Spotify, and the Library API is
+    /// where that lives now — `playlist_check_follow` is deprecated in
+    /// rspotify 0.16, as are `playlist_follow` and `playlist_unfollow`, all
+    /// three being wrappers over these calls. The track side already goes the
+    /// same way; see [`Self::tracks_liked`].
+    pub async fn playlist_saved(&self, playlist_id: &str) -> Result<bool> {
+        let id = LibraryId::Playlist(PlaylistId::from_id(playlist_id.to_owned())?);
+        Ok(self
+            .client
+            .library_contains([id])
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(false))
+    }
+
+    /// Put the playlist in the user's library, or take it out.
+    pub async fn set_playlist_saved(&self, playlist_id: &str, saved: bool) -> Result<()> {
+        let id = LibraryId::Playlist(PlaylistId::from_id(playlist_id.to_owned())?);
+        if saved {
+            self.client.library_add([id]).await
+        } else {
+            self.client.library_remove([id]).await
+        }
+        .with_context(|| {
+            if saved {
+                "failed to save the playlist"
+            } else {
+                "failed to unsave the playlist"
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Rename a playlist and reword its blurb. Spotify refuses this for a
+    /// playlist you do not own, so the caller checks first.
+    pub async fn set_playlist_details(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<()> {
+        let id = PlaylistId::from_id(playlist_id.to_owned())?;
+        self.client
+            .playlist_change_detail(id, Some(name), None, Some(description), None)
+            .await
+            .context("failed to change the playlist")?;
+        Ok(())
+    }
+}
+
+/// The cover to draw for a playlist, which is none when Spotify only made it
+/// a mosaic. See [`crate::cover::is_mosaic`].
+fn playlist_cover(images: &[rspotify::model::Image]) -> Option<String> {
+    crate::cover::pick_url(images).filter(|u| !crate::cover::is_mosaic(u))
+}
+
+/// Turn the XML entities Spotify escapes a playlist description with back into
+/// the characters they stand for.
+///
+/// Descriptions come back HTML-escaped — an apostrophe arrives as `&#x27;` —
+/// and a header band is not a browser. Only the five predefined entities and
+/// numeric references are handled; anything else is left as it was typed,
+/// which is the right answer for text that never was markup.
+fn unescape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let Some(end) = rest[1..].find(';').map(|i| i + 1) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn artists_line(artists: &[rspotify::model::SimplifiedArtist]) -> String {
@@ -559,6 +749,11 @@ fn playlist_from_simplified(p: &SimplifiedPlaylist) -> Playlist {
             .unwrap_or_else(|| p.owner.id.id().to_string()),
         owner_id: p.owner.id.id().to_string(),
         snapshot_id: p.snapshot_id.clone(),
+        // Comes back with the playlist itself, so opening one can show its
+        // cover without a second round trip.
+        cover_url: playlist_cover(&p.images),
+        public: p.public,
+        collaborative: p.collaborative,
     }
 }
 
@@ -609,4 +804,56 @@ fn album_from_raw(a: &RawAlbum) -> Option<AlbumItem> {
         track_count: a.total_tracks.unwrap_or(0),
         cover_url: crate::cover::pick_url(&a.images),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(url: &str) -> rspotify::model::Image {
+        rspotify::model::Image {
+            url: url.into(),
+            width: Some(640),
+            height: Some(640),
+        }
+    }
+
+    /// Spotify escapes a description as if it were markup. A header band is
+    /// not a browser, so the characters come back before it is drawn.
+    #[test]
+    fn a_description_arrives_unescaped() {
+        assert_eq!(
+            unescape_html("Your week&#x27;s mixtape &amp; deep cuts"),
+            "Your week's mixtape & deep cuts"
+        );
+        assert_eq!(unescape_html("&lt;b&gt;bold&lt;/b&gt;"), "<b>bold</b>");
+        assert_eq!(unescape_html("&#65;&#66;"), "AB");
+        assert_eq!(unescape_html("no entities here"), "no entities here");
+    }
+
+    /// An ampersand that is not an entity is an ampersand. Descriptions are
+    /// prose, and prose about "rock & roll" must survive being read.
+    #[test]
+    fn a_bare_ampersand_is_left_alone() {
+        assert_eq!(unescape_html("rock & roll"), "rock & roll");
+        assert_eq!(unescape_html("half an entity &amp"), "half an entity &amp");
+        assert_eq!(unescape_html("&notreal; text"), "&notreal; text");
+        assert_eq!(unescape_html("&#xZZ; text"), "&#xZZ; text");
+        assert_eq!(unescape_html("&"), "&");
+    }
+
+    /// A mosaic is not a cover. The page takes none rather than a quilt of
+    /// four sleeves at a sixth of the size each.
+    #[test]
+    fn a_playlist_takes_no_cover_from_a_mosaic() {
+        assert_eq!(
+            playlist_cover(&[image("https://i.scdn.co/image/dw")]).as_deref(),
+            Some("https://i.scdn.co/image/dw")
+        );
+        assert_eq!(
+            playlist_cover(&[image("https://mosaic.scdn.co/640/abc")]),
+            None
+        );
+        assert_eq!(playlist_cover(&[]), None);
+    }
 }

@@ -102,21 +102,42 @@ pub fn pick_sized(images: &[(&str, u32)]) -> Option<String> {
 /// host. Deliberately a string check rather than a URL parser: the shapes it
 /// has to reject are few, and a dependency here would be the larger risk.
 pub fn is_spotify_cdn(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    let Some(host) = host_of(url) else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // `https://i.scdn.co@evil.com/x` has authority `i.scdn.co@evil.com`, whose
-    // real host is `evil.com`. Rejecting userinfo outright is simpler than
-    // parsing it, and no legitimate CDN URL has any.
-    if authority.contains('@') {
-        return false;
-    }
-    let host = authority.split(':').next().unwrap_or("");
     let suffixed = |suffix: &str| {
         host.len() > suffix.len() && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
     };
     host.eq_ignore_ascii_case("i.scdn.co") || suffixed(".scdn.co") || suffixed(".spotifycdn.com")
+}
+
+/// The host of an `https://` URL, or `None` for anything else.
+fn host_of(url: &str) -> Option<&str> {
+    let authority = url
+        .strip_prefix("https://")?
+        .split(['/', '?', '#'])
+        .next()?;
+    // `https://i.scdn.co@evil.com/x` has authority `i.scdn.co@evil.com`, whose
+    // real host is `evil.com`. Rejecting userinfo outright is simpler than
+    // parsing it, and no legitimate CDN URL has any.
+    if authority.contains('@') {
+        return None;
+    }
+    authority.split(':').next()
+}
+
+/// The host Spotify serves auto-generated playlist mosaics from.
+const MOSAIC_HOST: &str = "mosaic.scdn.co";
+
+/// Whether `url` is one of Spotify's auto-generated 2x2 playlist mosaics.
+///
+/// A mosaic is four album sleeves quilted together, which Spotify makes for a
+/// playlist that has no cover of its own. In a block this size each sleeve
+/// gets a sixth of the grid, and four unrelated covers at that scale read as
+/// noise rather than as a picture — so a playlist wearing one keeps the text
+/// band, and only a playlist with a real cover gets a sleeve.
+pub fn is_mosaic(url: &str) -> bool {
+    host_of(url).is_some_and(|h| h.eq_ignore_ascii_case(MOSAIC_HOST))
 }
 
 /// Fetch and decode the cover at `url`. The decode runs on the blocking pool:
@@ -496,6 +517,19 @@ mod tests {
         assert!(!is_spotify_cdn("https://notscdn.co/image/x"));
         assert!(!is_spotify_cdn("https://i.scdn.co@evil.com/image/x"));
         assert!(!is_spotify_cdn("i.scdn.co/image/x"));
+    }
+
+    /// A mosaic is served from a host of its own, which is the only thing
+    /// telling it from a playlist cover someone actually made.
+    #[test]
+    fn a_mosaic_is_told_by_its_host() {
+        assert!(is_mosaic("https://mosaic.scdn.co/640/abcdef"));
+        assert!(is_mosaic("https://MOSAIC.scdn.co/640/abcdef"));
+        assert!(!is_mosaic("https://i.scdn.co/image/ab67616d00001e02"));
+        assert!(!is_mosaic("https://newjams-images.scdn.co/image/x"));
+        // Not a mosaic and not fetchable either: the same userinfo trick
+        // `is_spotify_cdn` rejects must not read as the mosaic host here.
+        assert!(!is_mosaic("https://mosaic.scdn.co@evil.com/640/x"));
     }
 
     #[test]

@@ -224,6 +224,9 @@ mod tests {
             owner: owner_id.into(),
             owner_id: owner_id.into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         }
     }
 

@@ -171,6 +171,25 @@ fn uncached_playlists(
 /// A playlist nothing has walked is left alone: a set holding one id would
 /// read as a playlist holding one track, and the box would draw every other
 /// record as off it.
+/// The line under a playlist's name: who made it, and how it is shared.
+///
+/// The sharing rides on the same line rather than taking one of its own, the
+/// way an album's year rides beside its artist. Only the answers worth a word
+/// appear — a public playlist is simply a playlist, and saying so on every
+/// page would be a label carried by all to inform on a handful.
+fn playlist_subtitle(owner: &str, public: Option<bool>, collaborative: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !owner.is_empty() {
+        parts.push(format!("by {owner}"));
+    }
+    if collaborative {
+        parts.push("collaborative".to_string());
+    } else if public == Some(false) {
+        parts.push("private".to_string());
+    }
+    parts.join(" · ")
+}
+
 fn set_cached_membership(st: &mut AppState, playlist_id: &str, track_id: &str, on: bool) {
     let Some(contents) = st.playlist_tracks.get_mut(playlist_id) else {
         return;
@@ -547,6 +566,13 @@ impl Client {
                 on,
                 seq,
             } => self.set_on_playlist(playlist_id, uri, on, seq).await,
+            SetPlaylistSaved { id, saved } => self.set_playlist_saved(id, saved).await,
+            EditPlaylistDetails {
+                id,
+                name,
+                description,
+                seq,
+            } => self.edit_playlist_details(id, name, description, seq).await,
             CachePlaylistTracks { playlist_ids } => self.cache_playlist_tracks(playlist_ids).await,
             Search(query) => self.search(query).await,
             LoadPlaylists => self.load_playlists().await,
@@ -1880,6 +1906,90 @@ impl Client {
         }
     }
 
+    /// `F` / the header's control: put a playlist in the library, or take it
+    /// out.
+    ///
+    /// Optimistic and reversed on refusal, for the reason [`Self::set_liked`]
+    /// gives. The library list moves with it: a saved playlist that did not
+    /// appear on the Playlists page until the next refresh would read as the
+    /// control having done nothing.
+    async fn set_playlist_saved(&self, id: String, saved: bool) {
+        let Some(api) = self.api.clone() else { return };
+        let name = {
+            let mut st = self.state.write();
+            st.saved_playlists.insert(id.clone(), saved);
+            st.playlists
+                .iter()
+                .find(|p| p.id == id)
+                .map_or_else(|| "the playlist".to_string(), |p| p.name.clone())
+        };
+        match api.set_playlist_saved(&id, saved).await {
+            Ok(()) => {
+                let mut st = self.state.write();
+                if saved {
+                    // The library list is only refreshed on demand, so the row
+                    // arrives with the next `R`. Nothing here can build a
+                    // `Playlist` — the detail this page has is not what the
+                    // list stores — and a half-filled row is worse than none.
+                    st.toast(format!("saved {name}"));
+                } else {
+                    let mut playlists = std::mem::take(&mut st.playlists);
+                    playlists.retain(|p| p.id != id);
+                    st.set_playlists(playlists);
+                    st.saved_playlists.insert(id, false);
+                    st.toast(format!("unsaved {name}"));
+                }
+            }
+            Err(e) => {
+                let mut st = self.state.write();
+                st.saved_playlists.insert(id, !saved);
+                st.toast(format!("error: {e}"));
+            }
+        }
+    }
+
+    /// Rename a playlist and reword its blurb.
+    ///
+    /// Not optimistic, unlike the marks above: this is text the user typed,
+    /// and showing it as accepted before Spotify has taken it would leave the
+    /// page disagreeing with the account with nothing on screen saying so. The
+    /// box stays up and inert until the answer lands.
+    async fn edit_playlist_details(&self, id: String, name: String, description: String, seq: u64) {
+        let Some(api) = self.api.clone() else { return };
+        let result = api.set_playlist_details(&id, &name, &description).await;
+        let mut st = self.state.write();
+        match result {
+            Ok(()) => {
+                if st.edit.as_ref().is_some_and(|e| e.seq == seq) {
+                    st.edit = None;
+                }
+                if let Some(p) = st.playlists.iter_mut().find(|p| p.id == id) {
+                    p.name = name.clone();
+                }
+                st.rebuild_playlists_display();
+                // The open page, when it is still this playlist. The subtitle
+                // is left alone: neither the owner nor the sharing moved.
+                if let MainView::Tracks(list) = &mut st.main
+                    && list.cache_key.as_deref() == Some(&state::playlist_key(&id))
+                {
+                    list.header.name = name;
+                    list.header.description = description;
+                }
+                st.toast("playlist updated");
+            }
+            Err(e) => {
+                let message = e.to_string();
+                match st.edit.as_mut().filter(|edit| edit.seq == seq) {
+                    Some(edit) => {
+                        edit.pending = false;
+                        edit.error = Some(message);
+                    }
+                    None => st.toast(format!("error: {message}")),
+                }
+            }
+        }
+    }
+
     /// Put the box's record on a playlist, or take it off, and tell the box
     /// which way it went.
     ///
@@ -2053,35 +2163,101 @@ impl Client {
     }
 
     fn load_playlist_view(&self, playlist_id: String, preserve_view: bool) {
-        let info = self
+        let known = self
             .state
             .read()
             .playlists
             .iter()
             .find(|p| p.id == playlist_id)
-            .map(|p| {
-                (
+            .cloned();
+        // A playlist reached from a search is not in the library, so there is
+        // nothing to seed the header from. The page opens on a name that says
+        // what it is and fills in when the detail fetch lands.
+        let mut list = match &known {
+            Some(p) => {
+                let mut list = TrackList::new(
                     p.name.clone(),
-                    p.owner.clone(),
-                    p.track_count,
-                    p.snapshot_id.clone(),
-                )
-            });
-        let (title, owner, total, snapshot) =
-            info.unwrap_or_else(|| ("Playlist".to_string(), String::new(), 0, String::new()));
-        let subtitle = if owner.is_empty() {
-            String::new()
-        } else {
-            format!("by {owner}")
+                    playlist_subtitle(&p.owner, p.public, p.collaborative),
+                    (p.track_count > 0).then_some(p.track_count),
+                );
+                list.header.cover_url = p.cover_url.clone();
+                list.header.owner_id = p.owner_id.clone();
+                list
+            }
+            None => TrackList::new("Playlist", String::new(), None),
         };
-        let mut list = TrackList::new(title, subtitle, (total > 0).then_some(total));
         list.kind = TrackListKind::Playlist;
+        let cover_url = list.header.cover_url.clone();
+        let snapshot = known.as_ref().map(|p| p.snapshot_id.clone());
         self.start_track_fetch(
             list,
-            TrackSource::Playlist(playlist_id),
-            (!snapshot.is_empty()).then_some(snapshot),
+            TrackSource::Playlist(playlist_id.clone()),
+            snapshot.filter(|s| !s.is_empty()),
             preserve_view,
         );
+        // After the view is installed, so a stale fetch cannot clear the slot
+        // the new one just claimed.
+        self.load_view_cover(cover_url);
+        self.load_playlist_detail(playlist_id);
+    }
+
+    /// Fill in what the library list does not carry — the blurb, the sharing,
+    /// and the cover and owner of a playlist you do not follow.
+    ///
+    /// A second fetch rather than a wait: the tracks are what the page is for,
+    /// and holding them back for a line of prose would make every playlist
+    /// open slower to make one of them read better.
+    fn load_playlist_detail(&self, playlist_id: String) {
+        let Some(api) = self.api.clone() else { return };
+        let generation = self.state.read().load_generation;
+        let (state, tx) = (self.state.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let Ok(detail) = api.playlist_detail(&playlist_id).await else {
+                // Nothing to say. The page already has its tracks, and a
+                // missing blurb is not news worth a toast.
+                return;
+            };
+            let saved = api.playlist_saved(&playlist_id).await.ok();
+            let cover_url = {
+                let mut st = state.write();
+                if st.load_generation != generation {
+                    return;
+                }
+                if let Some(saved) = saved {
+                    st.saved_playlists.insert(playlist_id.clone(), saved);
+                }
+                let MainView::Tracks(list) = &mut st.main else {
+                    return;
+                };
+                if list.cache_key.as_deref() != Some(&state::playlist_key(&playlist_id)) {
+                    return;
+                }
+                list.header.name = detail.name;
+                list.header.subtitle =
+                    playlist_subtitle(&detail.owner, detail.public, detail.collaborative);
+                list.header.description = detail.description;
+                list.header.owner_id = detail.owner_id;
+                if let Some(total) = detail.total {
+                    list.total = Some(total);
+                }
+                // Only when the page opened without one: a library playlist
+                // already drew its cover, and re-pointing the slot at the same
+                // URL would blink the art off and back.
+                match (&list.header.cover_url, &detail.cover_url) {
+                    (Some(_), _) | (None, None) => None,
+                    (None, Some(url)) => {
+                        list.header.cover_url = Some(url.clone());
+                        Some(url.clone())
+                    }
+                }
+            };
+            // Back through the loop rather than fetched here: `LoadViewCover`
+            // is already the one way the browsed slot is filled, and it owns
+            // the generation guard that keeps two pages from racing for it.
+            if cover_url.is_some() {
+                let _ = tx.send(AppCommand::LoadViewCover { cover_url });
+            }
+        });
     }
 
     fn load_album_view(
@@ -2763,6 +2939,9 @@ mod tests {
             owner: owner_id.into(),
             owner_id: owner_id.into(),
             snapshot_id: snapshot.into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         }
     }
 

@@ -5,6 +5,7 @@ mod main_pane;
 mod now_playing;
 mod play_state;
 mod player;
+mod playlist_edit;
 mod playlist_picker;
 mod table;
 mod theme;
@@ -98,6 +99,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         playlist_picker::draw(frame, state);
     }
 
+    if state.edit.is_some() {
+        playlist_edit::draw(frame, state);
+    }
+
     if state.show_help {
         help::draw(frame, state);
     }
@@ -163,6 +168,9 @@ mod tests {
                     owner: "me".into(),
                     owner_id: "me".into(),
                     snapshot_id: "s".into(),
+                    cover_url: None,
+                    public: None,
+                    collaborative: false,
                 })
                 .collect(),
         );
@@ -396,6 +404,9 @@ mod tests {
             owner: "Spotify".into(),
             owner_id: "spotify".into(),
             snapshot_id: "s".into(),
+            cover_url: None,
+            public: None,
+            collaborative: false,
         });
         st.main = crate::app::state::MainView::Home;
         let lines = screen(&mut st, 100, 34);
@@ -633,6 +644,47 @@ mod tests {
             l.header.cover_url = Some("https://i.scdn.co/image/abc".into());
         }
         arrive_via(&mut st, "Donna The Buffalo");
+        for (i, l) in screen(&mut st, 100, 26).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_playlist() {
+        let mut st = browse_state();
+        st.me_id = Some("me".into());
+        st.saved_playlists.insert("dw".into(), true);
+        if let crate::app::state::MainView::Tracks(l) = &mut st.main {
+            l.cache_key = Some(crate::app::state::playlist_key("dw"));
+            l.header.name = "Discover Weekly".into();
+            l.header.subtitle = "by Spotify".into();
+            l.header.owner_id = "spotify".into();
+            l.header.description =
+                "Your weekly mixtape of fresh music. Enjoy new discoveries and deep cuts \
+                 chosen just for you. Updated every Monday."
+                    .into();
+            l.header.cover_url = Some("https://i.scdn.co/image/dw".into());
+        }
+        arrive_via(&mut st, "Playlists");
+        for (i, l) in screen(&mut st, 100, 26).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_playlist_edit() {
+        let mut st = browse_state();
+        st.edit = Some(crate::app::state::PlaylistEdit {
+            id: "p1".into(),
+            name: "Road Trip".into(),
+            description: "long drives and open windows".into(),
+            field: crate::app::state::EditField::Name,
+            pending: false,
+            error: None,
+            seq: 1,
+        });
         for (i, l) in screen(&mut st, 100, 26).iter().enumerate() {
             println!("{i:2} |{l}|");
         }

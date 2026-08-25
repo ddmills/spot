@@ -269,6 +269,8 @@ is a worse answer than a row that says why it won't play.
 | `x` | play without opening (a playlist row, or the current view) |
 | `a` | play the selected track next |
 | `L` | like / unlike the track — the selected row, or the playing one in the player view; on a station row, save it |
+| `F` | save / unsave the playlist you are on — not shown on your own, where unsaving is how Spotify spells deleting |
+| `E` | edit the name and blurb of a playlist you own |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction (every list, or click a column header) |
 | `/` | search Spotify and the radio directory at once |

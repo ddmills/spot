@@ -86,6 +86,22 @@ pub enum AppCommand {
         on: bool,
         seq: u64,
     },
+    /// `F` and the header's control: put a playlist in the library, or take
+    /// it out. Spotify calls this following; the library is where it lives.
+    SetPlaylistSaved {
+        id: String,
+        saved: bool,
+    },
+    /// Rename a playlist and reword its blurb, from the edit box.
+    ///
+    /// `seq` is the opening of the box this answers, so a result that arrives
+    /// after it was closed and opened again cannot act on the new one.
+    EditPlaylistDetails {
+        id: String,
+        name: String,
+        description: String,
+        seq: u64,
+    },
     /// Read what these playlists hold, for the box's marks. Carries no track:
     /// the whole playlist is cached, so one walk answers every record.
     ///

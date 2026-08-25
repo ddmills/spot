@@ -40,6 +40,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         context: playing_queue.and_then(|q| q.source_key.clone()),
     };
     let me_id = state.me_id.clone();
+    // Resolved before the split borrow below, which takes the view this reads.
+    let controls = header_controls(state);
     // The station playing, if one is, so a radio page can mark its row the way
     // a track table marks the playing track.
     let playing_station = state.radio.as_ref().map(|r| r.station.url.clone());
@@ -111,8 +113,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             mouse,
         ),
         MainView::Tracks(list) => draw_tracks(
-            frame, list_area, list, view_cover, loading, main_index, main_list, retries, hit,
-            &marks, liked, mouse,
+            frame, list_area, list, view_cover, loading, controls, main_index, main_list, retries,
+            hit, &marks, liked, mouse,
         ),
         MainView::Search(results) => draw_search(
             frame,
@@ -572,10 +574,85 @@ const PLAY_PILL: &str = "▶ play";
 /// emoji- or ambiguous-width, which would drift the recorded hit rect.
 const SHUFFLE_PILL: &str = "shuffle";
 
+/// The playlist controls, beside ▶ play. `★`/`☆` rather than words, matching
+/// the mark a track row already carries for the same idea.
+const SAVED_PILL: &str = "★ saved";
+const SAVE_PILL: &str = "☆ save";
+const EDIT_PILL: &str = "edit";
+
 /// Narrowest text column that seats both card pills with their gap; below it
 /// the card keeps ▶ play alone.
 fn card_pills_min_w() -> usize {
     super::table::width(PLAY_PILL) + 2 + super::table::width(SHUFFLE_PILL)
+}
+
+/// The playlist-only controls a header band carries, settled before the draw
+/// because only the state knows them and the band is handed a view.
+#[derive(Default, Clone, Copy)]
+struct HeaderControls {
+    /// Draw the save control, and whether it reads as already saved. `None`
+    /// on a page that is not a playlist, on one still being asked about, and
+    /// on one you own — Spotify spells deleting your own playlist as unsaving
+    /// it, and that does not belong under one keypress beside ▶ play.
+    save: Option<bool>,
+    /// Draw the edit control. Only a playlist you own takes it; Spotify
+    /// refuses the change for any other.
+    edit: bool,
+}
+
+/// What the open page offers beyond playing itself.
+fn header_controls(st: &AppState) -> HeaderControls {
+    let Some(id) = st.open_playlist_id() else {
+        return HeaderControls::default();
+    };
+    if st.owns_open_playlist() {
+        return HeaderControls {
+            save: None,
+            edit: true,
+        };
+    }
+    HeaderControls {
+        save: st.saved_playlists.get(id).copied(),
+        edit: false,
+    }
+}
+
+/// Append a dim pill after the ones already laid down, and return its hit
+/// rect. Accent under the pointer, which is all `hover_style` promotes.
+fn pill_segment(
+    spans: &mut Vec<Span<'static>>,
+    x: &mut u16,
+    area: Rect,
+    mouse: Option<Position>,
+    label: &'static str,
+) -> Rect {
+    spans.push(Span::raw("  "));
+    *x = x.saturating_add(2);
+    super::table::segment(
+        spans,
+        x,
+        area,
+        mouse,
+        vec![Span::styled(label, theme::dim())],
+    )
+}
+
+/// The save control. Accent when the playlist is in the library and dim when
+/// it is not — the same pair of styles a track row's `★` uses to say it.
+fn save_segment(
+    spans: &mut Vec<Span<'static>>,
+    x: &mut u16,
+    area: Rect,
+    mouse: Option<Position>,
+    saved: bool,
+) -> Rect {
+    spans.push(Span::raw("  "));
+    *x = x.saturating_add(2);
+    let (label, style) = match saved {
+        true => (SAVED_PILL, theme::accent()),
+        false => (SAVE_PILL, theme::dim()),
+    };
+    super::table::segment(spans, x, area, mouse, vec![Span::styled(label, style)])
 }
 
 /// Append the shuffle pill after a band's ▶ play and return its hit rect.
@@ -1203,17 +1280,20 @@ const TEXT_BAND_H: u16 = 3;
 const MIN_TABLE_H: u16 = 6;
 
 /// Summary band above a track table: the record's own sleeve when it has one,
-/// then name + subtitle + totals, a clickable ▶ play for the whole context,
-/// and a passive sort indicator. Returns the area left for the table.
+/// then name + subtitle + blurb + totals, a clickable ▶ play for the whole
+/// context, and whatever else the page can be done to. Returns the area left
+/// for the table.
 ///
 /// Skipped entirely on short panes, and the sleeve is shed before the text is
 /// — the same order the player sheds its own cover in.
+#[allow(clippy::too_many_arguments)]
 fn header_band(
     frame: &mut Frame,
     inner: Rect,
     list: &crate::app::state::TrackList,
     cover: Option<&crate::cover::Cover>,
     loading: bool,
+    controls: HeaderControls,
     hit: &mut HitAreas,
     mouse: Option<Position>,
 ) -> Rect {
@@ -1249,7 +1329,7 @@ fn header_band(
         None => inner,
     };
 
-    // Row 1: name + subtitle on the left, totals right-aligned.
+    // Row 0: name + subtitle on the left, totals right-aligned.
     let info_area = Rect { height: 1, ..text };
     let total_ms: u64 = list.items.iter().map(|t| t.duration_ms).sum();
     let count = list.items.len();
@@ -1283,23 +1363,32 @@ fn header_band(
         left.push(Span::styled(format!("  {}", list.header.subtitle), gray));
     }
     frame.render_widget(Paragraph::new(Line::from(left)), name_area);
-    if stacked {
+
+    // Lines are laid down in order and skip what is not there, rather than
+    // taking fixed rows — a playlist has a blurb and an album does not, and a
+    // totals line floating a row below an absent one reads as damage. The
+    // same shape `artist_band` uses for its genres.
+    let row = |n: u16| Rect {
+        y: text.y + n,
+        height: 1,
+        ..text
+    };
+    let description = super::table::fit(&list.header.description, text.width as usize);
+    let mut n = 1;
+    if stacked && !list.header.subtitle.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(list.header.subtitle.clone(), gray)),
-            Rect {
-                y: text.y + 1,
-                height: 1,
-                ..text
-            },
+            row(n),
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(totals)),
-            Rect {
-                y: text.y + 2,
-                height: 1,
-                ..text
-            },
-        );
+        n += 1;
+    }
+    if !list.header.description.is_empty() {
+        frame.render_widget(Paragraph::new(Line::styled(description, dim)), row(n));
+        n += 1;
+    }
+    if stacked {
+        frame.render_widget(Paragraph::new(Line::from(totals)), row(n));
+        n += 1;
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(totals)),
@@ -1311,14 +1400,11 @@ fn header_band(
         );
     }
 
-    // The ▶ play pill, with the active sort as a passive hint opposite it.
-    // Beside a sleeve it sits low in the block, so the metadata above it and
-    // the control below read as two groups rather than one list.
-    let play_area = Rect {
-        y: text.y + if stacked { 4 } else { 1 },
-        height: 1,
-        ..text
-    };
+    // The ▶ play pill and what else this page can be done to. Beside a sleeve
+    // it sits low in the block, so the metadata above it and the controls
+    // below read as two groups rather than one list — and it stays inside the
+    // sleeve's own rows however many lines the metadata spent.
+    let play_area = row(if stacked { (n + 1).min(ART_H - 1) } else { n });
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut x = play_area.x;
     hit.header_play_btn = super::table::segment(
@@ -1329,12 +1415,22 @@ fn header_band(
         vec![Span::styled(PLAY_PILL, accent)],
     );
     hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
+    hit.header_save_btn = match controls.save {
+        Some(saved) => save_segment(&mut spans, &mut x, play_area, mouse, saved),
+        None => Rect::default(),
+    };
+    hit.header_edit_btn = match controls.edit {
+        true => pill_segment(&mut spans, &mut x, play_area, mouse, EDIT_PILL),
+        false => Rect::default(),
+    };
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
 
-    let used = if stacked { ART_BAND_H } else { TEXT_BAND_H };
+    // A blank under the last line, so the column header below is not flush
+    // against the control row.
+    let used = if stacked { ART_BAND_H } else { n + 2 };
     Rect {
         y: inner.y + used,
-        height: inner.height - used,
+        height: inner.height.saturating_sub(used),
         ..inner
     }
 }
@@ -2141,6 +2237,7 @@ fn draw_tracks(
     list: &crate::app::state::TrackList,
     cover: Option<&crate::cover::Cover>,
     global_loading: bool,
+    controls: HeaderControls,
     main_index: usize,
     list_state: &mut ListState,
     retries: u32,
@@ -2151,7 +2248,7 @@ fn draw_tracks(
 ) {
     let loading = list.loading || global_loading;
     let inner = body_area(area);
-    let body = header_band(frame, inner, list, cover, loading, hit, mouse);
+    let body = header_band(frame, inner, list, cover, loading, controls, hit, mouse);
     // A page that failed before its first row said so only through the toast
     // until now, and drew the very line an empty one draws. A page that
     // failed part-way through keeps the rows it got and leaves the news to
@@ -2492,6 +2589,19 @@ mod tests {
             .collect()
     }
 
+    /// A playlist page with a cover of its own, as Discover Weekly has.
+    fn playlist_state() -> AppState {
+        let mut st = tracks_state(vec![track("One", "Alela"), track("Two", "Sera")]);
+        if let MainView::Tracks(list) = &mut st.main {
+            list.cache_key = Some(crate::app::state::playlist_key("dw"));
+            list.header.name = "Discover Weekly".into();
+            list.header.subtitle = "by Spotify".into();
+            list.header.owner_id = "spotify".into();
+            list.header.cover_url = Some("https://i.scdn.co/image/dw".into());
+        }
+        st
+    }
+
     fn album_state() -> AppState {
         let mut st = tracks_state(vec![track("One", "Donna"), track("Two", "Donna")]);
         if let MainView::Tracks(list) = &mut st.main {
@@ -2729,6 +2839,9 @@ mod tests {
                 owner: "Dalton M".into(),
                 owner_id: "dm".into(),
                 snapshot_id: "s".into(),
+                cover_url: None,
+                public: None,
+                collaborative: false,
             },
             Playlist {
                 id: "p2".into(),
@@ -2737,6 +2850,9 @@ mod tests {
                 owner: "NPR Music".into(),
                 owner_id: "npr".into(),
                 snapshot_id: "s".into(),
+                cover_url: None,
+                public: None,
+                collaborative: false,
             },
         ]);
         let lines = render(&mut st, 90, 22);
@@ -2861,10 +2977,12 @@ mod tests {
         );
     }
 
-    /// A playlist's mosaic is not a record sleeve, so playlists keep the
-    /// text-only band — and so does an album whose art Spotify never gave us.
+    /// A playlist that Spotify only made a mosaic for keeps the text-only
+    /// band — and so does an album whose art it never gave us at all. The
+    /// mosaic never reaches the header: `playlist_cover` drops it, so the page
+    /// arrives with no cover rather than with one the band has to refuse.
     #[test]
-    fn playlists_and_coverless_albums_keep_the_text_band() {
+    fn a_coverless_page_keeps_the_text_band() {
         for mut st in [tracks_state(vec![track("A", "B")]), {
             let mut st = album_state();
             if let MainView::Tracks(list) = &mut st.main {
@@ -2881,6 +2999,88 @@ mod tests {
             assert!(lines[4].contains("tracks"));
             assert!(lines[5].contains("▶ play"));
         }
+    }
+
+    /// A playlist with a cover of its own is an album page in every respect
+    /// that matters: the sleeve, the name beside it, the control below.
+    #[test]
+    fn a_playlist_with_a_cover_draws_the_sleeve() {
+        let mut st = playlist_state();
+        let lines = render(&mut st, 90, 22);
+        assert!(
+            lines.iter().any(|l| l.contains('▀')),
+            "no sleeve: {lines:#?}"
+        );
+        assert!(lines[4].contains("Discover Weekly"));
+        assert!(lines[5].contains("by Spotify"));
+        assert!(lines[6].contains("tracks"));
+        assert!(lines[8].contains("▶ play"));
+    }
+
+    /// The blurb takes a row of its own, and the controls move down for it
+    /// rather than sitting on top of it.
+    #[test]
+    fn a_blurb_spends_a_row_and_moves_the_controls() {
+        let mut st = playlist_state();
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.description = "Your weekly mixtape of fresh music".into();
+        }
+        let lines = render(&mut st, 90, 22);
+        assert!(lines[5].contains("by Spotify"));
+        assert!(lines[6].contains("weekly mixtape"));
+        assert!(lines[7].contains("tracks"));
+        assert!(
+            lines[9].contains("▶ play"),
+            "controls moved wrong: {lines:#?}"
+        );
+    }
+
+    /// Without a sleeve the band grows by the blurb's row rather than drawing
+    /// it over the column header below.
+    #[test]
+    fn a_blurb_without_a_sleeve_pushes_the_table_down() {
+        let mut st = tracks_state(vec![track("A", "B")]);
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.description = "Deep cuts chosen for you".into();
+        }
+        let lines = render(&mut st, 90, 22);
+        assert!(lines[4].contains("tracks"));
+        assert!(lines[5].contains("Deep cuts"));
+        assert!(
+            lines[6].contains("▶ play"),
+            "controls moved wrong: {lines:#?}"
+        );
+    }
+
+    /// The save control is for a playlist someone else made. Your own carries
+    /// `edit` instead: Spotify has no unfollow for an owned playlist that is
+    /// not a delete, and that is not what a pill beside ▶ play should mean.
+    #[test]
+    fn the_playlist_controls_follow_who_owns_it() {
+        let mut st = playlist_state();
+        st.me_id = Some("me".into());
+        st.saved_playlists.insert("dw".into(), true);
+        let theirs = render(&mut st, 90, 22);
+        assert!(theirs[8].contains("★ saved"), "{theirs:#?}");
+        assert!(!theirs[8].contains("edit"));
+
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.owner_id = "me".into();
+        }
+        let mine = render(&mut st, 90, 22);
+        assert!(mine[8].contains("edit"), "{mine:#?}");
+        assert!(!mine[8].contains("save"));
+    }
+
+    /// A playlist nothing has answered about yet draws no save control. A
+    /// dim `☆ save` on a playlist already in the library would be a lie until
+    /// the check lands, and the check is one round trip behind the page.
+    #[test]
+    fn an_unchecked_playlist_draws_no_save_control() {
+        let mut st = playlist_state();
+        st.me_id = Some("me".into());
+        let lines = render(&mut st, 90, 22);
+        assert!(!lines[8].contains("save"), "{lines:#?}");
     }
 
     /// The sleeve is shed before the text is, the same order the player sheds
@@ -3475,6 +3675,9 @@ mod tests {
                 owner: "someone".into(),
                 owner_id: "someone".into(),
                 snapshot_id: "s1".into(),
+                cover_url: None,
+                public: None,
+                collaborative: false,
             }]
             .into(),
             stations: vec![test_station("st1", "Radio Paradise")].into(),
