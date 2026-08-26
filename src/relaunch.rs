@@ -13,6 +13,8 @@ use std::process::Command;
 use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
 
+use crate::link::Link;
+
 /// Set on the child so the relaunched copy can never bounce a second time, and
 /// published in the README as the opt-out for anyone who wants spot in the
 /// console they already have.
@@ -23,7 +25,11 @@ const OPT_OUT: &str = "SPOT_NO_RELAUNCH";
 /// Every check below is a reason to stay put, so anything unexpected - no
 /// Windows Terminal, an API that will not answer, a spawn that fails - ends
 /// with spot running normally in the console it was given.
-pub fn relaunch_in_windows_terminal() -> bool {
+///
+/// `link` goes to the child. A Spotify link clicked on Windows 10 arrives in a
+/// legacy console, which is exactly the case that bounces, so dropping it here
+/// would lose the link on the machines that need this most.
+pub fn relaunch_in_windows_terminal(link: Option<&Link>) -> bool {
     // WT_SESSION means we are already inside Windows Terminal, which is the
     // case on Windows 11, where it is the default terminal for a double-click.
     if std::env::var_os(OPT_OUT).is_some() || std::env::var_os("WT_SESSION").is_some() {
@@ -42,12 +48,18 @@ pub fn relaunch_in_windows_terminal() -> bool {
     // -w -1 forces a new window: without it the tab is grafted onto whichever
     // Windows Terminal window happens to be open, yanking the user out of
     // whatever they were doing there.
-    Command::new(wt)
+    let mut command = Command::new(wt);
+    command
         .args(["-w", "-1", "nt", "--title", "spot"])
         .arg(exe)
-        .env(OPT_OUT, "1")
-        .spawn()
-        .is_ok()
+        .env(OPT_OUT, "1");
+    // The canonical spelling rather than the argument this process was given:
+    // it has already been read and checked, and the child reads it back with
+    // the same parser.
+    if let Some(link) = link {
+        command.arg(link.to_uri());
+    }
+    command.spawn().is_ok()
 }
 
 /// Whether this process is the only one attached to its console, which is what

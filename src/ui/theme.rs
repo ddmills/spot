@@ -22,10 +22,9 @@ pub const WARN: Color = Color::Rgb(0xF0, 0xDC, 0x8A);
 /// carried by weight and brightness rather than a filled bar, so it never
 /// competes with the accent-colored "now playing" marker.
 pub const BRIGHT: Color = Color::Rgb(0xE8, 0xF0, 0xF2);
-/// The search field's resting fill, and the only region of the app that is
-/// painted rather than left transparent to the terminal's own ground. A fill
-/// says "field" without a border, which this UI declines everywhere else (see
-/// [`super::table::draw_scrollbar`]).
+/// The search field's resting fill, and the wash a table row wears under the
+/// pointer (see [`row_hover`]). A fill says "field" without a border, which
+/// this UI declines everywhere else (see [`super::table::draw_scrollbar`]).
 ///
 /// Sits between the terminal's ground and [`DIM`]: dark enough that the row
 /// does not read as a highlight or a selection, light enough that the field
@@ -345,6 +344,15 @@ pub fn green() -> Style {
 /// A background alone: the runs drawn over it bring their own foregrounds.
 pub fn field(hover: bool) -> Style {
     Style::default().bg(if hover { FIELD_HOVER } else { FIELD })
+}
+
+/// The wash a table row wears under the pointer.
+///
+/// [`FIELD`]'s value, for the reason [`FIELD_HOVER`] gives: the pill
+/// [`super::table::hover_style`] paints is sized to a word, and that value
+/// across a whole row would read as a selection.
+pub fn row_hover() -> Style {
+    Style::default().bg(FIELD)
 }
 
 /// The accent in force right now at a fraction of full brightness, for the

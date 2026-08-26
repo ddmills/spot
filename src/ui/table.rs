@@ -9,12 +9,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_width::UnicodeWidthChar;
 
 use super::play_state::PlayState;
 use super::theme;
-use crate::app::state::HitAreas;
+use crate::app::state::{Credit, HitAreas};
 use crate::cover::Cover;
 
 /// Truncate with an ellipsis or pad with spaces to exactly `w` display
@@ -57,6 +57,148 @@ pub fn width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
+/// Byte index of the first character at or after display column `col`.
+///
+/// Columns rather than bytes or chars, because that is what [`fit`] and
+/// [`width`] measure and what a hit rect is in.
+fn byte_at(s: &str, col: usize) -> usize {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        if used >= col {
+            return i;
+        }
+        used += c.width().unwrap_or(0);
+    }
+    s.len()
+}
+
+/// Where one credited artist's name is printed inside a cell: the offset from
+/// the cell's left edge and the cells the name takes, both in display columns,
+/// with the artist it opens.
+///
+/// A run whose credit has no id is drawn and not clickable — the rule [`link`]
+/// follows for a single run, applied to each name of several.
+///
+/// The whole credit rides along rather than the id alone, so a click knows the
+/// name it landed on as well as the page it opens — the crumb the artist page
+/// hangs under is that name, and it is already in hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditRun {
+    pub dx: u16,
+    pub width: u16,
+    pub credit: Credit,
+}
+
+/// The credit line as a `w`-cell cell, with the run each name occupies.
+///
+/// One rule for both halves of the job: the pane records hit rects from the
+/// runs and prints the string, and a second rule for either would put a click
+/// on a name the pointer was not over. The string is exactly what a cell of
+/// this width has always held — [`fit`] of the joined line — so nothing about
+/// the printed row changes.
+///
+/// A name the cell ran out of room for gets no run and cannot be clicked. A
+/// name only *part* of which fits keeps a run as wide as what was printed: the
+/// ellipsis stands for the rest of that name, and belongs with it.
+pub fn credit_line(credits: &[Credit], w: usize) -> (String, Vec<CreditRun>) {
+    let cell = fit(&crate::app::state::artists_line(credits), w);
+    let inked = width(cell.trim_end());
+    let mut runs = Vec::new();
+    let mut dx = 0usize;
+    for (i, credit) in credits.iter().enumerate() {
+        if i > 0 {
+            dx += width(crate::app::state::CREDIT_SEP);
+        }
+        if dx >= inked {
+            break;
+        }
+        let name_w = width(&credit.name);
+        let shown = name_w.min(inked - dx);
+        if shown > 0 {
+            runs.push(CreditRun {
+                dx: dx as u16,
+                width: shown as u16,
+                credit: credit.clone(),
+            });
+        }
+        dx += name_w;
+    }
+    (cell, runs)
+}
+
+/// Spans for a [`credit_line`], with the `hovered` run lit.
+///
+/// The light goes on one name, not on the whole cell: the names either side of
+/// it lead somewhere else, and a pill across all of them would say they lead
+/// to the same place.
+pub fn credit_spans(
+    cell: &str,
+    runs: &[CreditRun],
+    style: Style,
+    hovered: Option<usize>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cut = 0usize;
+    let mut push = |text: &str, style: Style| {
+        if !text.is_empty() {
+            spans.push(Span::styled(text.to_string(), style));
+        }
+    };
+    for (i, run) in runs.iter().enumerate() {
+        let start = byte_at(cell, run.dx as usize);
+        let end = byte_at(cell, (run.dx + run.width) as usize);
+        push(&cell[cut..start], style);
+        push(
+            &cell[start..end],
+            match hovered == Some(i) {
+                true => hover_style(style),
+                false => style,
+            },
+        );
+        cut = end;
+    }
+    push(&cell[cut..], style);
+    spans
+}
+
+/// Which run of a [`credit_line`] the pointer is on, as an index into `runs`.
+///
+/// `cell` is where the line starts on screen. Only a run that leads somewhere
+/// answers: hovering a name with no page behind it must not light it.
+pub fn hovered_credit(cell: Rect, runs: &[CreditRun], mouse: Option<Position>) -> Option<usize> {
+    let at = mouse.filter(|m| m.y == cell.y)?;
+    runs.iter()
+        .position(|run| run.credit.id.is_some() && credit_rect(cell, run).contains(at))
+}
+
+/// Where a run lands on screen, clipped to the cell it is printed in.
+pub fn credit_rect(cell: Rect, run: &CreditRun) -> Rect {
+    Rect {
+        x: cell.x.saturating_add(run.dx),
+        y: cell.y,
+        width: run.width,
+        height: 1,
+    }
+    .intersection(cell)
+}
+
+/// Record every clickable name of a [`credit_line`] drawn at `cell`.
+///
+/// A name Spotify identified by name only gets no entry at all, rather than an
+/// entry that leads nowhere — an absent target is how the rest of the app
+/// spells inert.
+pub fn credit_links(cell: Rect, runs: &[CreditRun], out: &mut Vec<(Rect, Credit)>) {
+    for run in runs {
+        if run.credit.id.is_none() {
+            continue;
+        }
+        let rect = credit_rect(cell, run);
+        if !rect.is_empty() {
+            out.push((rect, run.credit.clone()));
+        }
+    }
+}
+
 /// The style the selected row is painted with. Weight and brightness, not a
 /// filled bar: a solid accent row would drown out the accent-colored marker
 /// and title the playing track already carries.
@@ -68,6 +210,34 @@ pub fn selection_style(style: Style) -> Style {
 pub fn apply_selection(line: &mut Line<'static>) {
     for span in &mut line.spans {
         span.style = selection_style(span.style);
+    }
+}
+
+/// The row the pointer is on, as an index into a list's items.
+///
+/// `rows` is the rect the list renders into and `offset` its first visible
+/// item, so the answer follows the scroll. A pointer past the last row of an
+/// underfilled list is over no row at all.
+pub fn hovered_row(
+    rows: Rect,
+    offset: usize,
+    len: usize,
+    mouse: Option<Position>,
+) -> Option<usize> {
+    let at = mouse.filter(|m| rows.contains(*m))?;
+    Some(offset + (at.y - rows.y) as usize).filter(|&row| row < len)
+}
+
+/// Wash a row under the pointer with [`theme::row_hover`].
+///
+/// A row-wide mark, where [`hover_style`] is a word-wide one. The style covers
+/// the row's whole width before its spans are drawn, so a cell that lights its
+/// own run — one mark of the `★ ⧉ +` run, a clickable artist — keeps its pill on
+/// top of the wash rather than being flattened into it.
+pub fn hover_row(item: ListItem<'static>, hovered: bool) -> ListItem<'static> {
+    match hovered {
+        true => item.style(theme::row_hover()),
+        false => item,
     }
 }
 
@@ -219,29 +389,48 @@ pub const BRAND_W: u16 = 6;
 /// matters anyway.
 pub const LIKED_MARK: &str = "★";
 
+/// The share mark, wearing the `⧉` the deck's `⧉ share` wears.
+///
+/// The copy mark rather than an arrow: the control puts a link on the
+/// clipboard, and an arrow out of the app promises to open something.
+pub const SHARE_MARK: &str = "⧉";
+
 /// The add-to-playlist mark, wearing the `+` the deck's `+ add` wears.
 pub const ADD_MARK: &str = "+";
 
-/// Liked cell of a track row's action pair: the mark with a space either
+/// Liked cell of a track row's action run: the mark with a space either
 /// side, so the control is a target rather than a single cell to hit.
 pub const LIKE_W: usize = 3;
-/// Add-to-playlist cell of the pair, padded to match.
+/// Share cell of the run, padded to match.
+pub const SHARE_W: usize = 3;
+/// Add-to-playlist cell of the run, padded to match.
 pub const ADD_W: usize = 3;
-/// The `★ +` pair at the end of a track row. The two cells sit flush: each
+/// The `★ ⧉ +` run at the end of a track row. The cells sit flush: each
 /// already carries its own padding, and a separator between them would put a
-/// gap belonging to neither control back in the middle.
-pub const ACTIONS_W: usize = LIKE_W + ADD_W;
-/// Narrowest list that still carries the pair. The last thing a narrowing
+/// gap belonging to no control back in between.
+pub const ACTIONS_W: usize = LIKE_W + SHARE_W + ADD_W;
+/// Narrowest list that still carries the run. The last thing a narrowing
 /// list drops: these are controls, and a row you cannot act on is worth less
 /// than a row missing its year.
-pub const ACTIONS_MIN: usize = 30;
+pub const ACTIONS_MIN: usize = 33;
 
-/// The `★ +` pair for one row, in [`ACTIONS_W`] cells.
+/// Which control of a track row's action run the pointer is on.
+///
+/// One enum for the browse table and the player's queue, so the two lists
+/// cannot come to disagree about what the run holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    Like,
+    Share,
+    Add,
+}
+
+/// The `★ ⧉ +` run for one row, in [`ACTIONS_W`] cells.
 ///
 /// The star is always drawn — dim when the track is unsaved or its state is
-/// still unknown, accent when saved. It is one of a pair now, and a control
+/// still unknown, accent when saved. It is one of three now, and a control
 /// that appeared only under the pointer would leave a hole beside its
-/// neighbour and shift what the row looks like as the mouse crosses it.
+/// neighbours and shift what the row looks like as the mouse crosses it.
 ///
 /// Each mark carries a space either side, and the hover pill takes that
 /// padding with it: the lit run is what says how big the target is, and a
@@ -250,11 +439,12 @@ pub const ACTIONS_MIN: usize = 30;
 /// and leave their padding bare — there the padding is a column's leftover,
 /// here it is the control.
 ///
-/// Both views draw the pair from here so the queue and the browse table
-/// cannot drift into two spellings of the same control.
-pub fn action_spans(liked: Option<bool>, hover_like: bool, hover_add: bool) -> Vec<Span<'static>> {
-    let lit = |style: Style, hovered: bool| {
-        if hovered { hover_style(style) } else { style }
+/// Both views draw the run from here so the queue and the browse table
+/// cannot drift into two spellings of the same controls.
+pub fn action_spans(liked: Option<bool>, hover: Option<RowAction>) -> Vec<Span<'static>> {
+    let lit = |style: Style, action: RowAction| match hover == Some(action) {
+        true => hover_style(style),
+        false => style,
     };
     let like_style = if liked == Some(true) {
         theme::accent()
@@ -262,8 +452,12 @@ pub fn action_spans(liked: Option<bool>, hover_like: bool, hover_add: bool) -> V
         theme::dim()
     };
     vec![
-        Span::styled(format!(" {LIKED_MARK} "), lit(like_style, hover_like)),
-        Span::styled(format!(" {ADD_MARK} "), lit(theme::dim(), hover_add)),
+        Span::styled(format!(" {LIKED_MARK} "), lit(like_style, RowAction::Like)),
+        Span::styled(
+            format!(" {SHARE_MARK} "),
+            lit(theme::dim(), RowAction::Share),
+        ),
+        Span::styled(format!(" {ADD_MARK} "), lit(theme::dim(), RowAction::Add)),
     ]
 }
 
@@ -618,7 +812,133 @@ pub fn draw_volume(
 
 #[cfg(test)]
 mod tests {
-    use super::{SPINNER, SPINNER_FRAME, fit, spinner, width};
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Style;
+
+    use super::{
+        ACTIONS_W, ADD_MARK, Credit, LIKED_MARK, RowAction, SHARE_MARK, SPINNER, SPINNER_FRAME,
+        action_spans, credit_line, credit_links, credit_spans, fit, hovered_credit, hovered_row,
+        spinner, width,
+    };
+
+    fn credits(names: &[(&str, Option<&str>)]) -> Vec<Credit> {
+        names
+            .iter()
+            .map(|(name, id)| Credit {
+                name: (*name).into(),
+                id: id.map(Into::into),
+            })
+            .collect()
+    }
+
+    /// A four-row list at (10, 5), 20 wide.
+    fn rows() -> Rect {
+        Rect {
+            x: 10,
+            y: 5,
+            width: 20,
+            height: 4,
+        }
+    }
+
+    fn at(x: u16, y: u16) -> Option<Position> {
+        Some(Position { x, y })
+    }
+
+    /// The cell prints exactly what one link ever printed — the joined line,
+    /// fitted — and the runs land on the names inside it.
+    #[test]
+    fn a_credit_line_splits_the_cell_it_prints() {
+        let c = credits(&[("Zedd", Some("z")), ("Alessia Cara", Some("a"))]);
+        let (cell, runs) = credit_line(&c, 20);
+        assert_eq!(cell, "Zedd, Alessia Cara  ");
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].dx, runs[0].width), (0, 4));
+        // Past the two cells of `, `, which belong to neither name.
+        assert_eq!((runs[1].dx, runs[1].width), (6, 12));
+    }
+
+    /// A name only part of which fits keeps a run as wide as what was printed:
+    /// the ellipsis stands for the rest of that name and belongs with it. A
+    /// name there was no room for at all gets no run.
+    #[test]
+    fn a_clipped_credit_line_stops_at_what_it_printed() {
+        let c = credits(&[("Zedd", Some("z")), ("Alessia Cara", Some("a"))]);
+        let (cell, runs) = credit_line(&c, 10);
+        assert_eq!(cell, "Zedd, Ale…");
+        assert_eq!(runs.len(), 2);
+        // Four cells: `Ale` and the `…` that stands for the rest of the name.
+        assert_eq!((runs[1].dx, runs[1].width), (6, 4));
+
+        let (cell, runs) = credit_line(&c, 4);
+        assert_eq!(cell, "Zed…");
+        assert_eq!(runs.len(), 1, "a name with no room is not a target");
+    }
+
+    /// Only a name with an id is a target; one Spotify identified by name
+    /// alone is drawn and inert.
+    #[test]
+    fn a_credit_without_an_id_is_not_a_target() {
+        let c = credits(&[("Zedd", None), ("Alessia Cara", Some("a"))]);
+        let cell = Rect::new(10, 5, 20, 1);
+        let (_, runs) = credit_line(&c, 20);
+        let mut links = Vec::new();
+        credit_links(cell, &runs, &mut links);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1.name, "Alessia Cara");
+        assert_eq!(links[0].0, Rect::new(16, 5, 12, 1));
+        // Nor does it light under the pointer.
+        assert_eq!(hovered_credit(cell, &runs, at(11, 5)), None);
+        assert_eq!(hovered_credit(cell, &runs, at(17, 5)), Some(1));
+        // A row above or below the line is not on it at all.
+        assert_eq!(hovered_credit(cell, &runs, at(17, 6)), None);
+    }
+
+    /// The spans put back together exactly what [`credit_line`] printed, so
+    /// splitting the cell to light one name cannot change the row.
+    #[test]
+    fn credit_spans_rebuild_the_cell_they_split() {
+        let c = credits(&[("Zedd", Some("z")), ("Alessia Cara", Some("a"))]);
+        for w in [0, 1, 4, 7, 10, 18, 20, 40] {
+            let (cell, runs) = credit_line(&c, w);
+            for lit in [None, Some(0), Some(1)] {
+                let joined: String = credit_spans(&cell, &runs, Style::default(), lit)
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert_eq!(joined, cell, "width {w}, lit {lit:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_hovered_row_is_the_one_under_the_pointer() {
+        assert_eq!(hovered_row(rows(), 0, 4, at(12, 5)), Some(0));
+        assert_eq!(hovered_row(rows(), 0, 4, at(29, 8)), Some(3));
+    }
+
+    /// The offset is added, so the answer names the item the pointer is on
+    /// rather than the screen row it landed on.
+    #[test]
+    fn a_scrolled_list_hovers_the_item_it_shows() {
+        assert_eq!(hovered_row(rows(), 7, 20, at(12, 5)), Some(7));
+    }
+
+    #[test]
+    fn a_pointer_off_the_list_hovers_nothing() {
+        assert_eq!(hovered_row(rows(), 0, 4, at(9, 5)), None);
+        assert_eq!(hovered_row(rows(), 0, 4, at(12, 4)), None);
+        assert_eq!(hovered_row(rows(), 0, 4, at(12, 9)), None);
+        assert_eq!(hovered_row(rows(), 0, 4, None), None);
+    }
+
+    /// A list with fewer items than rows leaves blank cells at the bottom, and
+    /// a pointer resting on one of them is over no row at all.
+    #[test]
+    fn a_pointer_past_the_last_row_hovers_nothing() {
+        assert_eq!(hovered_row(rows(), 0, 2, at(12, 6)), Some(1));
+        assert_eq!(hovered_row(rows(), 0, 2, at(12, 7)), None);
+    }
 
     #[test]
     fn fit_pads_short_strings_to_width() {
@@ -671,5 +991,34 @@ mod tests {
         let first = spinner();
         std::thread::sleep(std::time::Duration::from_millis(SPINNER_FRAME as u64 + 20));
         assert_ne!(first, spinner());
+    }
+
+    /// The run reads `★ ⧉ +` and fills exactly the cells the column reserves,
+    /// so a table laid out from [`ACTIONS_W`] cannot come up short.
+    #[test]
+    fn the_action_run_fills_its_column_in_order() {
+        let spans = action_spans(Some(true), None);
+        let printed: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(printed, format!(" {LIKED_MARK}  {SHARE_MARK}  {ADD_MARK} "));
+        assert_eq!(width(&printed), ACTIONS_W);
+    }
+
+    /// Only the hovered control takes the pill; a run where more than one lit
+    /// would say the pointer is on all of them.
+    #[test]
+    fn one_hover_lights_one_control() {
+        for (i, action) in [RowAction::Like, RowAction::Share, RowAction::Add]
+            .into_iter()
+            .enumerate()
+        {
+            let spans = action_spans(None, Some(action));
+            let lit: Vec<usize> = spans
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.style.bg.is_some())
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(lit, vec![i], "{action:?}");
+        }
     }
 }

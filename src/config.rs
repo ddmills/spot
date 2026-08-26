@@ -59,6 +59,47 @@ pub fn clear_auth() {
     }
 }
 
+/// What spot displaced when it claimed the Spotify link schemes, and the
+/// record that it was asked to.
+///
+/// The file is the consent: spot claims nothing without one, and repairs
+/// nothing when there is none. Written before the registry changes, so a
+/// failure halfway can never strand a claim with no way back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedProtocol {
+    /// The `shell\open\command` that held `spotify:` beforehand, or `None`
+    /// where nothing held it. Restored verbatim.
+    #[serde(default)]
+    pub previous_command: Option<String>,
+    /// The executable the schemes were pointed at. A portable spot gets moved,
+    /// and a registration naming a path that no longer exists opens nothing.
+    #[serde(default)]
+    pub exe: String,
+}
+
+fn protocol_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("protocol.json"))
+}
+
+pub fn load_protocol() -> Option<SavedProtocol> {
+    let path = protocol_file().ok()?;
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+pub fn save_protocol(saved: &SavedProtocol) -> Result<()> {
+    let path = protocol_file()?;
+    fs::write(&path, serde_json::to_string_pretty(saved)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn clear_protocol() {
+    if let Ok(path) = protocol_file() {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// The stations you kept.
 ///
 /// Its own file rather than a field of [`SavedAuth`]: one holds a credential

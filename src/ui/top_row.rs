@@ -693,6 +693,7 @@ mod tests {
             is_playing: true,
             started_at: std::time::Instant::now(),
             title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            channels: Default::default(),
             volume_percent: 50,
             matched: Default::default(),
             failure: None,

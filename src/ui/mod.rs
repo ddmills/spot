@@ -19,7 +19,7 @@ pub use theme::set_cover_colors;
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::ListState;
 
 use crate::app::state::{AppState, HitAreas};
@@ -52,6 +52,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
     // Rebuild mouse hit regions from scratch each frame.
     state.hit = HitAreas::default();
+
+    // Whether the bottom bar drew the toast. It is the only surface that
+    // normally carries one, and it is absent in the player view and on a
+    // browse screen with nothing playing — both of which have controls that
+    // report through a toast, so a message with nowhere to land is a control
+    // that does its work silently.
+    let mut toast_shown = false;
 
     // The player view draws its own play state, progress, volume and
     // transport, so the bottom bar would only repeat itself: it gets the whole
@@ -91,6 +98,21 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         top_row::draw(frame, rows[0], state, page);
         main_pane::draw(frame, rows[1], state);
         now_playing::draw(frame, rows[2], state);
+        toast_shown = bar_h > 0;
+    }
+
+    // The last row of the screen, for a message the bar could not take. The
+    // same corner it uses, so a toast is always read in one place — here it
+    // lies over the bottom line of whatever is under it for its four seconds,
+    // which costs less than a control that says nothing.
+    if !toast_shown && let Some((msg, _)) = &state.toast {
+        let area = frame.area();
+        let row = Rect {
+            y: area.bottom().saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        now_playing::draw_toast(frame, row, Some(msg.as_str()));
     }
 
     // Under the help box: help is the one overlay that answers "what does any
@@ -152,7 +174,7 @@ mod tests {
     use ratatui::layout::Position;
 
     use super::*;
-    use crate::app::state::{Playback, Playlist, TrackList};
+    use crate::app::state::{Credit, Playback, Playlist, TrackList};
 
     fn browse_state() -> AppState {
         let mut st = AppState::new();
@@ -185,7 +207,10 @@ mod tests {
                 duration_ms: 83_000,
                 track_number: i as u32 + 1,
                 album_id: Some("alb".into()),
-                artist_id: Some("art".into()),
+                credits: vec![Credit {
+                    name: format!("Artist {i}"),
+                    id: Some("art".into()),
+                }],
                 cover_url: None,
             })
             .collect::<Vec<_>>())
@@ -606,6 +631,34 @@ mod tests {
         assert_eq!(browse, radio, "the prompt must not retarget");
     }
 
+    /// A toast reaches the screen wherever it is raised — a browse page with
+    /// nothing playing has no bottom bar to carry one, and the player view
+    /// draws none, so both fall back to the last row.
+    #[test]
+    fn a_toast_lands_somewhere_on_every_screen() {
+        for player in [false, true] {
+            let mut st = browse_state();
+            st.show_player = player;
+            st.toast("spotify url copied to clipboard");
+            let lines = screen(&mut st, 100, 34);
+            assert!(
+                lines.iter().any(|l| l.contains("copied to clipboard")),
+                "player={player} {lines:#?}"
+            );
+        }
+
+        // Nothing playing: the bar is dropped from the layout entirely.
+        let mut st = browse_state();
+        st.queue = None;
+        st.playback = None;
+        st.toast("spotify url copied to clipboard");
+        let lines = screen(&mut st, 100, 34);
+        assert!(
+            lines[33].contains("copied to clipboard"),
+            "not on the last row: {lines:#?}"
+        );
+    }
+
     #[test]
     fn a_small_terminal_degrades_without_panicking() {
         for height in 0..12 {
@@ -640,11 +693,21 @@ mod tests {
         if let crate::app::state::MainView::Tracks(l) = &mut st.main {
             l.kind = crate::app::state::TrackListKind::Album;
             l.header.name = "Dance In The Street".into();
-            l.header.subtitle = "Donna The Buffalo · 2018".into();
+            l.header.subtitle = "Donna The Buffalo, Jeb Puryear · 2018".into();
+            l.header.credits = vec![
+                crate::app::state::Credit {
+                    name: "Donna The Buffalo".into(),
+                    id: Some("r1".into()),
+                },
+                crate::app::state::Credit {
+                    name: "Jeb Puryear".into(),
+                    id: Some("r2".into()),
+                },
+            ];
             l.header.cover_url = Some("https://i.scdn.co/image/abc".into());
         }
         arrive_via(&mut st, "Donna The Buffalo");
-        for (i, l) in screen(&mut st, 100, 26).iter().enumerate() {
+        for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
         }
     }
@@ -713,6 +776,10 @@ mod tests {
                         id: format!("a{i}"),
                         name: format!("Record Number {i}"),
                         artists: "Roy Hargrove".into(),
+                        credits: vec![Credit {
+                            name: "Roy Hargrove".into(),
+                            id: Some("roy".into()),
+                        }],
                         release_year: (2010 - i).to_string(),
                         album_type: group.into(),
                         album_group: group.into(),
@@ -814,6 +881,7 @@ mod tests {
             title: std::sync::Arc::new(parking_lot::Mutex::new(Some(
                 "Steve Cobby — The Unvarnished Truth".into(),
             ))),
+            channels: Default::default(),
             volume_percent: 40,
             matched: Default::default(),
             failure: None,
@@ -870,6 +938,7 @@ mod tests {
             title: std::sync::Arc::new(parking_lot::Mutex::new(Some(
                 "Steve Cobby — The Unvarnished Truth".into(),
             ))),
+            channels: Default::default(),
             volume_percent: 40,
             matched: Default::default(),
             failure: None,
@@ -966,9 +1035,9 @@ mod tests {
         assert!(!is_animating(&st), "every visible row is answered");
     }
 
-    /// `+ add` rides beside the `★` on both screens, in the same corner of the
-    /// same title row — the pair is one control set, and one that appeared
-    /// only after pressing `v` would be a control that moves.
+    /// `⧉ share` and `+ add` ride beside the `★` on both screens, in the same
+    /// corner of the same title row — the three are one control set, and one
+    /// that appeared only after pressing `v` would be a control that moves.
     #[test]
     fn both_views_offer_add_to_playlist() {
         for player in [false, true] {
@@ -978,13 +1047,18 @@ mod tests {
             let lines = screen(&mut st, 100, 34);
             // Beside the ★, not instead of it, and one space apart.
             assert!(
-                lines.iter().any(|l| l.contains("★ liked + add")),
+                lines.iter().any(|l| l.contains("★ liked ⧉ share + add")),
                 "player={player} {lines:#?}"
             );
             assert!(!st.hit.add_btn.is_empty(), "player={player}");
             assert_eq!(
-                st.hit.add_btn.x,
+                st.hit.share_btn.x,
                 st.hit.like_btn.right() + 1,
+                "player={player}"
+            );
+            assert_eq!(
+                st.hit.add_btn.x,
+                st.hit.share_btn.right() + 1,
                 "player={player}"
             );
         }

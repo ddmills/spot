@@ -1,5 +1,6 @@
-use crate::app::state::{RadioScope, Station, Track};
+use crate::app::state::{Credit, RadioScope, Station, Track};
 use crate::client::Spotify;
+use crate::link::Link;
 
 /// A playable source whose rows are not in hand yet — a playlist played from
 /// its row, an album played from its card. The client fetches the pages and
@@ -116,12 +117,22 @@ pub enum AppCommand {
     LoadPlaylistTracks {
         playlist_id: String,
     },
+    /// Follow a Spotify link — pasted into the search prompt, or handed to
+    /// this process on the command line by the protocol handler.
+    ///
+    /// A link names an id and nothing else, so the client resolves whatever
+    /// metadata the page needs and then sends the ordinary open command. That
+    /// second command is what reaches the back stack; this one must not go
+    /// through `event::navigate`, which would push a view for a page that is
+    /// still a network call away.
+    OpenLink(Link),
     /// Open a browsable album view. Metadata rides along because the
     /// album-tracks endpoint doesn't return it.
     OpenAlbum {
         id: String,
         name: String,
-        artists: String,
+        /// The credited artists, each of which the header band makes a link.
+        credits: Vec<Credit>,
         year: String,
         /// The sleeve, when the row that opened this already had it. `None`
         /// from a track row, which knows the album's id but not its art — the

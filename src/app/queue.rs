@@ -171,6 +171,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::state::Credit;
 
     fn track(name: &str) -> Track {
         Track {
@@ -182,7 +183,10 @@ mod tests {
             duration_ms: 1000,
             track_number: 1,
             album_id: None,
-            artist_id: None,
+            credits: vec![Credit {
+                name: "artist".into(),
+                id: None,
+            }],
             cover_url: None,
         }
     }

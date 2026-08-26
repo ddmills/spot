@@ -26,7 +26,7 @@
 //! returns there is a pause key, a stop key and a quit that never work again.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -183,6 +183,14 @@ pub struct RadioPlayer {
     /// A generation rather than a flag so an old stream running out cannot
     /// condemn the station that replaced it. See [`Self::stream_ended`].
     ended: Arc<AtomicU64>,
+    /// How many channels the live stream decodes to, or 0 when nothing is
+    /// playing yet.
+    ///
+    /// The directory reports a codec and a bitrate but never a channel count,
+    /// so the decoder is the only thing that knows whether a station is stereo
+    /// or mono. Shared like [`Self::title`] so the deck reads it every frame
+    /// without going through the client.
+    channels: Arc<AtomicU8>,
 }
 
 impl RadioPlayer {
@@ -211,6 +219,7 @@ impl RadioPlayer {
             live: Arc::new(AtomicU64::new(0)),
             paused,
             ended: Arc::new(AtomicU64::new(0)),
+            channels: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -231,6 +240,12 @@ impl RadioPlayer {
         Arc::clone(&self.title)
     }
 
+    /// The shared channel-count slot, cloned into `AppState` beside
+    /// [`Self::title`] and read the same way.
+    pub fn channels(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.channels)
+    }
+
     /// Connect to `url`, decode it, and start playing it.
     ///
     /// Returns once the first audio is heard — so the caller can report a
@@ -247,6 +262,7 @@ impl RadioPlayer {
     pub async fn play(&self, url: &str, volume_percent: u8) -> Result<()> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         *self.title.lock() = None;
+        self.channels.store(0, Ordering::SeqCst);
         // A new station starts playing. Cleared here rather than on the
         // hand-off so that a pause pressed while this one connects is still
         // seen — the audio thread reads the flag when the stream arrives.
@@ -273,6 +289,14 @@ impl RadioPlayer {
         if self.generation.load(Ordering::SeqCst) != generation {
             return Ok(());
         }
+
+        // The decoder has read enough of the stream to know its layout, and
+        // this is the last point at which the station is still the one asked
+        // for.
+        self.channels.store(
+            source.channels().min(u8::MAX.into()) as u8,
+            Ordering::SeqCst,
+        );
 
         // Marked live with the hand-off, not with the request: until the
         // source reaches the thread there is nothing playing to stop. Marked
@@ -362,6 +386,7 @@ impl RadioPlayer {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.live.store(0, Ordering::SeqCst);
         *self.title.lock() = None;
+        self.channels.store(0, Ordering::SeqCst);
         self.send(AudioCmd::Stop);
     }
 
@@ -381,6 +406,7 @@ impl RadioPlayer {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.live.store(0, Ordering::SeqCst);
         *self.title.lock() = None;
+        self.channels.store(0, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
         // Here as well as on the audio thread: the tap is what the header
         // reads to tell a station that is playing from one that is still

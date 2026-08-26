@@ -33,6 +33,9 @@ pub const COUNT_W: usize = 6;
 /// Right-aligned station count on a facet row, wide enough for the heading
 /// over it.
 pub const FACET_COUNT_W: usize = 8;
+/// ISO 3166-1 alpha-2 code on a country row, wide enough for the heading and
+/// its sort mark.
+pub const FACET_CODE_W: usize = 6;
 /// Right-aligned stream quality ("AAC+ 128k", "HLS").
 pub const QUALITY_W: usize = 10;
 /// Country code, or the name where the directory reported no code.
@@ -78,15 +81,21 @@ pub enum ColKey {
     Tracks,
     Owner,
     Station,
+    /// What a station is announcing. Not sortable: it is a reading of a live
+    /// stream, and a sort over it would reorder the page under you every time
+    /// one of the records changed.
+    Now,
     Tags,
     Where,
     Stream,
     Name,
     Stations,
+    /// The country code a facet row queries by.
+    Code,
     /// Whether a station is one you keep. Not sortable: the favourites are a file
     /// of spot's own and are not on the row itself.
     Saved,
-    /// The `★ +` pair. A control rather than a value, so it heads nothing
+    /// The `★ ⧉ +` run. Controls rather than values, so it heads nothing
     /// sortable.
     Actions,
     /// The leading marker column.
@@ -106,13 +115,15 @@ impl ColKey {
             ColKey::Tracks => "Tracks",
             ColKey::Owner => "Owner",
             ColKey::Station => "Station",
+            ColKey::Now => "Now Playing",
             ColKey::Tags => "Tags",
             ColKey::Where => "Where",
             ColKey::Stream => "Stream",
             ColKey::Name => "Name",
             ColKey::Stations => "Stations",
+            ColKey::Code => "Code",
             ColKey::Saved => "Saved",
-            // The `★ +` pair and the duration head themselves: a row of marks
+            // The `★ ⧉ +` run and the duration head themselves: a row of marks
             // and a column of times both say what they are, and a label over
             // either is a word spent on nothing.
             ColKey::Time | ColKey::Actions | ColKey::Mark => "",
@@ -518,12 +529,27 @@ pub fn artists() -> Vec<Column> {
 ///
 /// Tags are the first thing dropped: they are the only column a station reads
 /// fine without.
-pub fn stations() -> Vec<Column> {
-    vec![
+pub fn stations(now: bool) -> Vec<Column> {
+    // The announcement is only ever asked for on the saved page, so only that
+    // page has a column for it. Everywhere else this table is up to
+    // `radio::api::STATION_LIMIT` rows deep, and a column there would promise a
+    // reading of every one of them.
+    let mut cols = vec![
         Column::new(ColKey::Mark, Width::Fixed(PREFIX_W)),
         Column::new(ColKey::Station, Width::Flex(5)).sortable(),
+    ];
+    if now {
+        cols.push(Column::new(ColKey::Now, Width::Flex(6)).drop_below(60));
+    }
+    // Tags go before the announcement does: what a station played last year is
+    // worth less than what it is playing now.
+    let tags_min = match now {
+        true => 100,
+        false => 65,
+    };
+    cols.extend([
         Column::new(ColKey::Tags, Width::Flex(5))
-            .drop_below(65)
+            .drop_below(tags_min)
             .sortable(),
         Column::new(ColKey::Where, Width::Fixed(WHERE_W)).sortable(),
         // Its own column rather than a second meaning for the marker at the
@@ -533,21 +559,28 @@ pub fn stations() -> Vec<Column> {
         Column::new(ColKey::Stream, Width::Fixed(QUALITY_W))
             .right()
             .sortable(),
-    ]
+    ]);
+    cols
 }
 
 /// The Countries and Genres pages of the radio directory. `label` is what the
-/// rows are, which is the one thing the two lists do not share.
-pub fn facets(label: &'static str) -> Vec<Column> {
-    vec![
-        Column::new(ColKey::Mark, Width::Fixed(PREFIX_W)),
+/// rows are, which is the one thing the two lists do not share. `code` heads
+/// the row with the code the directory queries a country by; a genre is its
+/// own key, so a code column there would say the name twice.
+pub fn facets(label: &'static str, code: bool) -> Vec<Column> {
+    let mut cols = vec![Column::new(ColKey::Mark, Width::Fixed(PREFIX_W))];
+    if code {
+        cols.push(Column::new(ColKey::Code, Width::Fixed(FACET_CODE_W)).sortable());
+    }
+    cols.extend([
         Column::new(ColKey::Name, Width::Flex(1))
             .labelled(label)
             .sortable(),
         Column::new(ColKey::Stations, Width::Fixed(FACET_COUNT_W))
             .right()
             .sortable(),
-    ]
+    ]);
+    cols
 }
 
 /// The queue in the player view.
@@ -583,7 +616,7 @@ mod tests {
     #[test]
     fn flex_weights_split_what_the_fixed_columns_leave() {
         let layout = Layout::resolve(&tracks(false), 100, 12);
-        // 100 less the marker, the number, the year, the pair, the time and
+        // 100 less the marker, the number, the year, the run, the time and
         // six gaps.
         let flex: usize = layout
             .cells()
@@ -669,8 +702,8 @@ mod tests {
 
     #[test]
     fn a_dropped_column_gives_its_cells_and_its_gap_to_the_flex() {
-        let wide = Layout::resolve(&stations(), 65, 0);
-        let narrow = Layout::resolve(&stations(), 64, 0);
+        let wide = Layout::resolve(&stations(false), 65, 0);
+        let narrow = Layout::resolve(&stations(false), 64, 0);
         assert!(wide.cell(ColKey::Tags).is_some());
         assert!(!narrow.cell(ColKey::Tags).is_some());
         assert_eq!(

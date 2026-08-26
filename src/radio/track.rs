@@ -638,6 +638,7 @@ pub fn best_match(cands: &[Track], want: &Announcement) -> Option<Track> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::state::Credit;
 
     fn ann(artist: &str, title: &str) -> Option<Announcement> {
         Some(Announcement {
@@ -656,7 +657,10 @@ mod tests {
             duration_ms: 0,
             track_number: 0,
             album_id: None,
-            artist_id: None,
+            credits: vec![Credit {
+                name: artists.to_string(),
+                id: None,
+            }],
             cover_url: None,
         }
     }

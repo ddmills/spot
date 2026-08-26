@@ -24,11 +24,12 @@ use ratatui::widgets::Paragraph;
 
 use super::play_state::{PlayState, RadioForward, RadioSteps};
 use super::table::{
-    art_w, draw_art, draw_volume, fit, link, meter, right_row, segment, state_spans, width,
+    art_w, credit_line, credit_links, credit_spans, draw_art, draw_volume, fit, hovered_credit,
+    link, meter, right_row, segment, state_spans, width,
 };
 use super::theme;
 use crate::app::queue::Queue;
-use crate::app::state::{HitAreas, Playback, RadioPlayback, Track, format_duration};
+use crate::app::state::{Credit, HitAreas, Playback, RadioPlayback, Track, format_duration};
 use crate::cover::Cover;
 
 /// Rows [`masthead`] occupies: the title, and the metadata under it.
@@ -74,19 +75,40 @@ fn like_label(liked: bool) -> String {
     }
 }
 
+/// The label of the control that copies the record's Spotify link. Built from
+/// [`super::table::SHARE_MARK`] for the reason [`like_label`] is built from
+/// `LIKED_MARK`: the track table's column and this control wear the same mark.
+fn share_label() -> String {
+    format!("{} share", super::table::SHARE_MARK)
+}
+
 /// The label of the control that opens the add-to-playlist box.
 const ADD_LABEL: &str = "+ add";
 
-/// Draw the title row's controls — the liked pill, and the `+ add` beside it —
-/// and return the cells they took.
+/// How many of the title row's optional controls a masthead still offers, in
+/// the order a narrowing row gives them up.
 ///
-/// Both mastheads carry the same pair in the same corner, and `right_row`
-/// gives the pair its order: groups are laid out left to right from the row's
-/// right edge, so `+ add` lands right of the `★`.
+/// Share goes first: a record you cannot act on is worth less than one you
+/// cannot link to. The liked control is never dropped this way — it is the
+/// only one of the three that also *reports* something, and a row without it
+/// cannot say whether the record is saved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TitleRung {
+    All,
+    NoShare,
+    LikedOnly,
+}
+
+/// Draw the title row's controls — the liked pill, `⧉ share` and `+ add` — and
+/// return the cells they took.
+///
+/// Both mastheads carry the same three in the same corner, and `right_row`
+/// gives them their order: groups are laid out left to right from the row's
+/// right edge, so share lands between the `★` and the `+`.
 ///
 /// `right_row` is all or nothing — a row too narrow for the groups draws none
-/// of them — so a row that cannot hold both is offered the liked control
-/// alone rather than losing a control that used to fit.
+/// of them — so a row that cannot hold all three is offered fewer, a rung at a
+/// time, rather than losing controls that used to fit.
 fn title_controls(
     frame: &mut Frame,
     row: Rect,
@@ -95,41 +117,49 @@ fn title_controls(
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) -> u16 {
-    let groups = |add: bool| {
+    let groups = |rung: TitleRung| {
         let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
         if let Some(liked) = liked {
             let style = if liked { theme::accent() } else { theme::dim() };
             groups.push(vec![Span::styled(like_label(liked), style)]);
         }
-        if add {
+        if add && rung == TitleRung::All {
+            groups.push(vec![Span::styled(share_label(), theme::dim())]);
+        }
+        if add && rung != TitleRung::LikedOnly {
             groups.push(vec![Span::styled(ADD_LABEL, theme::dim())]);
         }
         groups
     };
 
-    let mut wanted = groups(add);
-    if wanted.is_empty() {
-        return 0;
-    }
-    let mut rects = right_row(frame, row, mouse, wanted);
-    if rects[0].is_empty() && add {
-        wanted = groups(false);
+    let mut drawn = Vec::new();
+    let mut rung = TitleRung::All;
+    for next in [TitleRung::All, TitleRung::NoShare, TitleRung::LikedOnly] {
+        let wanted = groups(next);
         if wanted.is_empty() {
             return 0;
         }
-        rects = right_row(frame, row, mouse, wanted);
+        rung = next;
+        drawn = right_row(frame, row, mouse, wanted);
+        if !drawn[0].is_empty() {
+            break;
+        }
     }
 
     // The cells the controls hold, the gaps `right_row` set between them
     // included, measured from the leftmost one to the row's right edge.
-    let width = rects
+    let width = drawn
         .iter()
         .find(|r| !r.is_empty())
         .map_or(0, |r| row.right() - r.x);
-    let mut rects = rects.into_iter();
+    let mut rects = drawn.into_iter();
     if liked.is_some() {
         hit.like_btn = rects.next().unwrap_or_default();
     }
+    hit.share_btn = match rung {
+        TitleRung::All => rects.next().unwrap_or_default(),
+        _ => Rect::default(),
+    };
     hit.add_btn = rects.next().unwrap_or_default();
     width
 }
@@ -187,7 +217,7 @@ pub fn sleeve(
 /// full-width row is what lets a long one be read. The play state sits under
 /// the progress track instead, between previous and next — see [`transport`].
 ///
-/// Records `hit.volume_slider`, `hit.now_artist` and `hit.now_album`. It does
+/// Records `hit.volume_slider`, `hit.now_artist_links` and `hit.now_album`. It does
 /// *not* touch `hit.now_playing`: which region the wheel adjusts volume over
 /// is the caller's decision.
 #[allow(clippy::too_many_arguments)]
@@ -254,14 +284,13 @@ pub fn masthead(
     }
     let mut spans = Vec::new();
     let mut x = meta.x;
-    hit.now_artist = link(
+    credit_segment(
         &mut spans,
         &mut x,
         meta,
         mouse,
-        clip(&track.artists, meta),
-        theme::text(),
-        track.artist_id.is_some(),
+        &track.credits,
+        &mut hit.now_artist_links,
     );
     // The album is printed even when it only repeats the artist or the track.
     // A self-titled single does read as "Abeichizoku · Abeichizoku", but the
@@ -283,6 +312,36 @@ pub fn masthead(
         spans.push(Span::styled(track.release_year.clone(), dim));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), meta);
+}
+
+/// The credited artists as the row's first metadata segment, each name a link
+/// of its own.
+///
+/// The deck's answer to a track table's Artist column: [`link`] gives a run
+/// one target, and a record credited to three artists needs three. Clipped to
+/// the row the way [`clip`] clips every other segment, so a long credit line
+/// still stops short of the volume slider.
+fn credit_segment(
+    spans: &mut Vec<Span<'static>>,
+    x: &mut u16,
+    meta: Rect,
+    mouse: Option<Position>,
+    credits: &[Credit],
+    links: &mut Vec<(Rect, Credit)>,
+) {
+    let (cell, runs) = credit_line(credits, meta.width as usize);
+    let cell = cell.trim_end();
+    let rect = Rect {
+        x: *x,
+        y: meta.y,
+        width: width(cell) as u16,
+        height: 1,
+    }
+    .intersection(meta);
+    let hovered = hovered_credit(rect, &runs, mouse);
+    spans.extend(credit_spans(cell, &runs, theme::text(), hovered));
+    credit_links(rect, &runs, links);
+    *x = x.saturating_add(rect.width);
 }
 
 /// Clip a metadata segment to the row.
@@ -404,14 +463,13 @@ pub fn radio_masthead(
     if let Some(t) = matched {
         let mut spans = Vec::new();
         let mut x = meta.x;
-        hit.now_artist = link(
+        credit_segment(
             &mut spans,
             &mut x,
             meta,
             mouse,
-            clip(&t.artists, meta),
-            theme::text(),
-            t.artist_id.is_some(),
+            &t.credits,
+            &mut hit.now_artist_links,
         );
         let album = clip(&t.album, meta);
         if sep(&mut spans, &mut x, &album, meta) {
@@ -691,6 +749,14 @@ pub fn radio_station_row(
     if !quality.is_empty() && sep(&mut spans, &mut x, &quality, left) {
         spans.push(Span::styled(quality, dim));
     }
+    // Last, so it is the first thing a tight row gives up: the directory says
+    // nothing about channels, so this is the one segment that reads the live
+    // decoder rather than the station record.
+    if let Some(mode) = radio.channel_label()
+        && sep(&mut spans, &mut x, &mode, left)
+    {
+        spans.push(Span::styled(mode, dim));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), left);
 }
 
@@ -817,9 +883,14 @@ pub fn transport(
 /// state opposite. Repeat is not here because playback is always
 /// repeat-all; see [`super::now_playing`].
 ///
-/// The name is a link, and it is the mouse's way between the two views — it
-/// opens the player from the bar and closes it again from the player. That
-/// is why it is drawn identically in both: it is one control, not two.
+/// The name is a link. From the bottom bar it opens the player; in the player
+/// it is the heading the queue hangs from, and clicking it folds that list
+/// away and back.
+///
+/// `fold` is `Some(folded)` only in the player, where there is a list under
+/// the name to fold. It puts a `▾`/`▸` on the front of the name, inside the
+/// link so the marker is part of the target rather than something beside it —
+/// a control that can be in two states has to say which one it is in.
 ///
 /// Records `hit.shuffle_btn` and `hit.queue_name`.
 pub fn context_row(
@@ -827,6 +898,7 @@ pub fn context_row(
     row: Rect,
     shuffle: bool,
     queue: Option<&Queue>,
+    fold: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -856,10 +928,18 @@ pub fn context_row(
     // A true count of the play order: the rows on the player screen are the
     // rows this number describes.
     let count = format!(" · {} tracks", q.len());
-    // The name is clipped rather than the count: the count is three or four
-    // cells and still says how much of the queue there is, which a name cut in
-    // half does not.
-    let name_w = text.width.saturating_sub(width(&count) as u16);
+    let mark = match fold {
+        Some(true) => "▸ ",
+        Some(false) => "▾ ",
+        None => "",
+    };
+    // The name is clipped rather than the count or the marker: the count is
+    // three or four cells and still says how much of the queue there is, and
+    // the marker says which way the list is, neither of which a name cut in
+    // half does.
+    let name_w = text
+        .width
+        .saturating_sub(width(&count) as u16 + width(mark) as u16);
     let name = fit(q.name(), name_w as usize).trim_end().to_string();
 
     let mut spans = Vec::new();
@@ -869,7 +949,7 @@ pub fn context_row(
         &mut x,
         text,
         mouse,
-        name,
+        format!("{mark}{name}"),
         theme::bright().add_modifier(Modifier::BOLD),
         true,
     );
@@ -904,7 +984,10 @@ mod tests {
             duration_ms: DURATION,
             track_number: 1,
             album_id: Some("alb1".into()),
-            artist_id: Some("art1".into()),
+            credits: vec![Credit {
+                name: "Artist Name".into(),
+                id: Some("art1".into()),
+            }],
             cover_url: None,
         }
     }
@@ -927,13 +1010,27 @@ mod tests {
                     duration_ms: 60_000,
                     track_number: i as u32 + 1,
                     album_id: None,
-                    artist_id: None,
+                    credits: vec![Credit {
+                        name: "Someone".into(),
+                        id: None,
+                    }],
                     cover_url: None,
                 })
                 .collect(),
             0,
             "My Mix",
         )
+    }
+
+    /// The whole credit run the metadata row recorded, from the first name to
+    /// the last. The fixtures credit one artist, so this is that name's rect;
+    /// the tests below use it to place the album segment beside it.
+    fn artist_rect(hit: &HitAreas) -> Rect {
+        hit.now_artist_links
+            .iter()
+            .map(|(rect, _)| *rect)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or_default()
     }
 
     /// Render one deck row set into a bare rect and hand back the text plus
@@ -980,8 +1077,8 @@ mod tests {
         );
         assert!(lines[1].contains("vol ") && lines[1].contains(" 56%"));
         assert_eq!(hit.volume_slider.y, 1);
-        assert_eq!(hit.now_artist.y, 1);
-        assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
+        assert_eq!(artist_rect(&hit).y, 1);
+        assert_eq!(hit.now_album.x, artist_rect(&hit).right() + 3);
     }
 
     /// The control holds the right end of the title row, says which way it would
@@ -1017,8 +1114,8 @@ mod tests {
         assert!(liked_lines[0].starts_with("Song Title"));
     }
 
-    /// `+ add` takes the right end and pushes the liked control left of it,
-    /// so the pair reads in the order the mouse hints name them.
+    /// `+ add` takes the right end and pushes the other two left of it,
+    /// so the run reads in the order the mouse hints name them.
     #[test]
     fn the_add_control_sits_right_of_the_liked_one() {
         let t = song();
@@ -1029,15 +1126,20 @@ mod tests {
         // under the pointer as a third control that does nothing.
         let mark = super::super::table::LIKED_MARK;
         assert!(
-            lines[0].contains(&format!("{mark} liked + add")),
+            lines[0].contains(&format!("{mark} liked ⧉ share + add")),
             "{:?}",
             lines[0]
         );
         assert_eq!(hit.add_btn.y, 0);
         assert_eq!(hit.add_btn.right(), 80);
         assert_eq!(
-            hit.add_btn.x,
+            hit.share_btn.x,
             hit.like_btn.right() + 1,
+            "a gap belonging to neither control"
+        );
+        assert_eq!(
+            hit.add_btn.x,
+            hit.share_btn.right() + 1,
             "a gap belonging to neither control"
         );
         assert!(lines[0].starts_with("Song Title"));
@@ -1054,8 +1156,23 @@ mod tests {
         assert!(hit.like_btn.is_empty());
     }
 
-    /// A row that cannot hold both keeps the one that was there first, rather
-    /// than losing the pair to `right_row`'s all-or-nothing rule.
+    /// The first rung down: share goes before add, because a record you cannot
+    /// act on is worth less than one you cannot link to.
+    #[test]
+    fn a_narrow_title_row_drops_the_share_control_first() {
+        let t = song();
+        let (lines, hit, _) = render(20, 2, |f, a, h| {
+            masthead(f, a, &t, 56, Some(true), true, None, h)
+        });
+        assert!(!lines[0].contains("share"), "{:?}", lines[0]);
+        assert!(hit.share_btn.is_empty());
+        assert!(lines[0].contains("+ add"), "{:?}", lines[0]);
+        assert_eq!(hit.add_btn.x, hit.like_btn.right() + 1);
+    }
+
+    /// The last rung: a row that cannot hold even two keeps the one that was
+    /// there first, rather than losing the set to `right_row`'s all-or-nothing
+    /// rule.
     #[test]
     fn a_narrow_title_row_drops_the_add_control_first() {
         let t = song();
@@ -1064,6 +1181,7 @@ mod tests {
         });
         assert!(!lines[0].contains("+ add"), "{:?}", lines[0]);
         assert!(hit.add_btn.is_empty());
+        assert!(hit.share_btn.is_empty());
         assert!(!hit.like_btn.is_empty(), "the ★ went with it");
     }
 
@@ -1100,20 +1218,23 @@ mod tests {
         let (_, hit, _) = render(80, 2, |f, a, h| {
             masthead(f, a, &t, 56, None, false, None, h)
         });
-        assert_eq!(hit.now_artist.x, 0);
+        assert_eq!(artist_rect(&hit).x, 0);
     }
 
     /// Names without ids are drawn but inert, so no rect is recorded.
     #[test]
     fn metadata_links_need_their_ids() {
         let mut t = song();
-        t.artist_id = None;
+        t.credits = vec![Credit {
+            name: "Artist Name".into(),
+            id: None,
+        }];
         t.album_id = None;
         let (lines, hit, _) = render(80, 2, |f, a, h| {
             masthead(f, a, &t, 56, None, false, None, h)
         });
         assert!(lines[1].contains("Artist Name · Album Name"));
-        assert!(hit.now_artist.is_empty() && hit.now_album.is_empty());
+        assert!(hit.now_artist_links.is_empty() && hit.now_album.is_empty());
     }
 
     /// Segments are dropped whole, and measured in cells — counting `chars`
@@ -1122,6 +1243,10 @@ mod tests {
     #[test]
     fn a_wide_album_name_is_measured_in_cells() {
         let mut t = song();
+        t.credits = vec![Credit {
+            name: "高橋洋子".into(),
+            id: Some("art1".into()),
+        }];
         t.artists = "高橋洋子".into();
         t.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
         let (lines, hit, _) = render(60, 2, |f, a, h| {
@@ -1154,7 +1279,7 @@ mod tests {
             "{:?}",
             lines[1]
         );
-        assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
+        assert_eq!(hit.now_album.x, artist_rect(&hit).right() + 3);
     }
 
     /// The progress track carries no grab handle in either view — the volume
@@ -1345,7 +1470,9 @@ mod tests {
     #[test]
     fn the_context_row_names_the_queue_and_is_clickable() {
         let q = queue(24);
-        let (lines, hit, _) = render(60, 1, |f, a, h| context_row(f, a, false, Some(&q), None, h));
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            context_row(f, a, false, Some(&q), None, None, h)
+        });
         assert!(lines[0].starts_with("My Mix · 24 tracks"), "{:?}", lines[0]);
         assert!(lines[0].contains("shuffle off"));
         assert_eq!(hit.queue_name.x, 0);
@@ -1357,7 +1484,9 @@ mod tests {
     /// claims a click on the empty half of the row.
     #[test]
     fn the_context_row_survives_an_empty_queue() {
-        let (lines, hit, _) = render(60, 1, |f, a, h| context_row(f, a, false, None, None, h));
+        let (lines, hit, _) = render(60, 1, |f, a, h| {
+            context_row(f, a, false, None, None, None, h)
+        });
         assert!(lines[0].contains("shuffle off"));
         assert!(hit.queue_name.is_empty());
     }
@@ -1392,7 +1521,7 @@ mod tests {
                 masthead(f, a, &t, 56, Some(true), false, None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, DURATION, h);
                 transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
-                context_row(f, Rect { height: 1, ..a }, false, Some(&q), None, h);
+                context_row(f, Rect { height: 1, ..a }, false, Some(&q), None, None, h);
             });
         }
     }
@@ -1417,6 +1546,7 @@ mod tests {
             },
             56,
             Default::default(),
+            Default::default(),
         );
         r.is_playing = true;
         r
@@ -1433,7 +1563,10 @@ mod tests {
             duration_ms: 180_000,
             track_number: 3,
             album_id: Some("alb1".into()),
-            artist_id: Some("art1".into()),
+            credits: vec![Credit {
+                name: "Peter Appleyard".into(),
+                id: Some("art1".into()),
+            }],
             cover_url: None,
         }
     }
@@ -1457,8 +1590,8 @@ mod tests {
             lines[1]
         );
         // Laid out exactly as `masthead` lays the same row out.
-        assert_eq!(hit.now_artist.y, 1);
-        assert_eq!(hit.now_album.x, hit.now_artist.right() + 3);
+        assert_eq!(artist_rect(&hit).y, 1);
+        assert_eq!(hit.now_album.x, artist_rect(&hit).right() + 3);
         assert!(
             !hit.like_btn.is_empty(),
             "a matched record must be likeable"
@@ -1496,7 +1629,7 @@ mod tests {
         // The country moved to the station row; saying it twice on one deck
         // means reading it twice to find out it was the same fact.
         assert!(!lines[1].contains("Germany"), "{:?}", lines[1]);
-        assert!(hit.now_artist.is_empty());
+        assert!(hit.now_artist_links.is_empty());
         assert!(hit.now_album.is_empty());
         assert!(hit.like_btn.is_empty(), "nothing to save");
     }
@@ -1557,6 +1690,38 @@ mod tests {
             radio_station_row(f, a, &playing, false, None, h)
         });
         assert_eq!(named[0], lines[0]);
+    }
+
+    /// The directory reports a bitrate but never a channel count, and 128k
+    /// mono and 128k stereo do not sound alike. Only the live decoder knows,
+    /// so the row says nothing until it has decided.
+    #[test]
+    fn the_station_row_says_how_the_live_stream_is_mixed() {
+        let r = radio("Adroit Jazz");
+        let (quiet, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        assert!(
+            !quiet[0].contains("stereo") && !quiet[0].contains("mono"),
+            "{:?}",
+            quiet[0]
+        );
+
+        r.channels.store(2, std::sync::atomic::Ordering::Relaxed);
+        let (lines, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        assert!(
+            lines[0].starts_with("Adroit Jazz · Germany · MP3 128k · stereo"),
+            "{:?}",
+            lines[0]
+        );
+
+        r.channels.store(1, std::sync::atomic::Ordering::Relaxed);
+        let (mono, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        assert!(mono[0].contains("MP3 128k · mono"), "{:?}", mono[0]);
+
+        // The narrow row drops it before it drops the name, the country or the
+        // format, which is what `sep` is for.
+        let (tight, _, _) = render(34, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        assert!(tight[0].contains("Adroit Jazz"), "{:?}", tight[0]);
+        assert!(!tight[0].contains("mono"), "{:?}", tight[0]);
     }
 
     /// Both states are the same width and land on the same cells, so the

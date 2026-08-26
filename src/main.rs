@@ -3,12 +3,19 @@ mod app;
 mod audio_sink;
 mod audio_tap;
 mod auth;
+mod cli;
 mod client;
+mod clipboard;
 mod config;
 #[cfg(windows)]
 mod console_ctrl;
 mod cover;
 mod event;
+#[cfg(windows)]
+mod ipc;
+mod link;
+#[cfg(windows)]
+mod protocol;
 mod radio;
 #[cfg(windows)]
 mod relaunch;
@@ -50,12 +57,32 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Answered before anything else, and before the relaunch below: every one
+    // of these prints and exits, and a new Windows Terminal window would close
+    // with the process, taking what it printed with it.
+    let link = match answer_the_command_line() {
+        Ok(link) => link,
+        Err(code) => return code,
+    };
+
+    // A link belongs to the spot that is already running: a second player
+    // would fight this one for the audio device and for the Spotify session.
+    // Only a launch carrying a link asks — a second window opened on purpose
+    // is still the user's to open.
+    #[cfg(windows)]
+    if let Some(target) = &link
+        && ipc::forward(target).await
+    {
+        return std::process::ExitCode::SUCCESS;
+    }
+
     // Before anything else touches the disk: a double-clicked spot hands
     // itself to Windows Terminal and this process is done. Doing it first
     // keeps the short-lived parent from truncating the log the child is about
-    // to write.
+    // to write. The link goes with it, or a link clicked into a legacy console
+    // would be lost on the way across.
     #[cfg(windows)]
-    if relaunch::relaunch_in_windows_terminal() {
+    if relaunch::relaunch_in_windows_terminal(link.as_ref()) {
         return std::process::ExitCode::SUCCESS;
     }
 
@@ -67,7 +94,7 @@ async fn main() -> std::process::ExitCode {
     // went on streaming from a process nobody could see. `run` has already
     // stopped both engines by this point, so there is nothing left to tear down
     // that is worth risking that on.
-    match run().await {
+    match run(link).await {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             // Everything that can fail here fails before the TUI starts, or
@@ -79,6 +106,98 @@ async fn main() -> std::process::ExitCode {
             eprintln!("\nPress Enter to close.");
             let _ = std::io::stdin().read_line(&mut String::new());
             std::process::exit(1)
+        }
+    }
+}
+
+/// Do whatever the command line asked that is not "start spot", and say
+/// whether there is anything left to do.
+///
+/// `Ok` carries the link to follow, if one came with the launch. `Err` carries
+/// the code to exit with: the work is over, and it was done here.
+///
+/// This is the only place the protocol registration is reached from other than
+/// the Home row, which is what keeps a claim on the `spotify:` scheme to an
+/// act the user asked for — see [`crate::protocol`].
+fn answer_the_command_line() -> Result<Option<link::Link>, std::process::ExitCode> {
+    use std::process::ExitCode;
+
+    match cli::parse(std::env::args().skip(1)) {
+        cli::Invocation::Run(link) => Ok(link),
+        cli::Invocation::Help => {
+            println!("{}", cli::HELP);
+            Err(ExitCode::SUCCESS)
+        }
+        cli::Invocation::Version => {
+            println!("spot {}", env!("CARGO_PKG_VERSION"));
+            Err(ExitCode::SUCCESS)
+        }
+        cli::Invocation::Rejected(why) => {
+            eprintln!("spot: {why}");
+            Err(ExitCode::FAILURE)
+        }
+        #[cfg(windows)]
+        cli::Invocation::Register { force } => Err(register_protocol(force)),
+        #[cfg(windows)]
+        cli::Invocation::Unregister => Err(unregister_protocol()),
+        #[cfg(not(windows))]
+        cli::Invocation::Register { .. } | cli::Invocation::Unregister => {
+            eprintln!("spot: only Windows routes Spotify links to an app.");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// ASCII only on both of these: they may reach a legacy console codepage.
+#[cfg(windows)]
+fn register_protocol(force: bool) -> std::process::ExitCode {
+    match protocol::register(force) {
+        Ok(now) if now.in_force() => {
+            println!(
+                "spot now opens Spotify links.\n\n\
+                 To give them back, run spot {} or use the Links row on Home.",
+                cli::UNREGISTER
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        // Written, but Windows' own default-apps choice outranks it. Saying
+        // this plainly is the whole point: a registration that silently does
+        // nothing is the worst outcome here.
+        Ok(now) => {
+            println!(
+                "spot registered itself, but {}.\n\n\
+                 Windows keeps the answer you gave it once, and no app can change\n\
+                 that on your behalf. Open Settings > Apps > Default apps, find\n\
+                 spot, and set it for the SPOTIFY link type.",
+                now.describe()
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "spot: {e:#}.\n\n\
+                 Nothing was changed. Add --force to replace it anyway; spot keeps\n\
+                 what it replaced and puts it back on {}.",
+                cli::UNREGISTER
+            );
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unregister_protocol() -> std::process::ExitCode {
+    match protocol::unregister() {
+        Ok(()) => {
+            println!(
+                "spot no longer opens Spotify links. {}.",
+                protocol::status().describe()
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("spot: {e:#}");
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -102,8 +221,13 @@ impl AudioPath {
     }
 }
 
-async fn run() -> Result<()> {
+async fn run(link: Option<link::Link>) -> Result<()> {
     init_logging()?;
+    // Only ever a repair, and only for a registration the user already asked
+    // for: spot is one portable file that gets moved, and a handler naming a
+    // path that no longer holds it opens nothing. See [`crate::protocol`].
+    #[cfg(windows)]
+    protocol::repair_path();
     // Installed before anything can open an audio device, so closing the
     // window is never the one quit path that leaves a station playing.
     #[cfg(windows)]
@@ -119,6 +243,11 @@ async fn run() -> Result<()> {
     {
         let mut st = state.write();
         st.audio_tap = Arc::clone(&audio.tap);
+        // Read before the first frame, so Home's Links row says where a
+        // clicked Spotify link goes rather than saying nothing until it is
+        // pressed. A read, never a write — see [`crate::protocol`].
+        #[cfg(windows)]
+        protocol::refresh(&mut st);
         // Read before the first frame, so Home's Radio row can say how many
         // stations are behind it without waiting on anything.
         st.radio_favorites = config::load_radio();
@@ -151,6 +280,14 @@ async fn run() -> Result<()> {
     // would not let that run delete the image it was executing. This one can.
     update::clean_previous();
     let _ = tx.send(AppCommand::CheckForUpdate);
+
+    // The link this launch carried, and every link a later launch hands over.
+    // Both queue behind the sign-in and are served the moment Spotify is up.
+    if let Some(target) = link {
+        let _ = tx.send(AppCommand::OpenLink(target));
+    }
+    #[cfg(windows)]
+    ipc::listen(tx.clone());
 
     if state.read().spotify == SpotifyState::Connecting {
         tokio::spawn(connect_spotify(

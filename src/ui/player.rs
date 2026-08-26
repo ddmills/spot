@@ -26,7 +26,10 @@ use super::columns::{ColKey, GUTTER, Layout, right, row_spans, scroll_col};
 use super::deck;
 use super::main_pane;
 use super::play_state;
-use super::table::{ADD_W, LIKE_W, action_spans, apply_selection, art_w, draw_scrollbar, fit};
+use super::table::{
+    ADD_W, LIKE_W, RowAction, SHARE_W, action_spans, apply_selection, art_w, credit_line,
+    credit_links, credit_spans, draw_scrollbar, fit, hover_row, hovered_row,
+};
 use super::theme;
 use crate::app::queue::Queue;
 use crate::app::state::{AppState, HitAreas, Track, format_duration};
@@ -57,7 +60,10 @@ const PROGRESS_H: u16 = 3;
 /// opposite edges under the track with the state centred between them, the
 /// row says "back", "what it is doing" and "forward" without a label.
 const TRANSPORT_H: u16 = 2;
-const LIST_HEAD_H: u16 = 2;
+/// The queue name, a blank, the column header, and a blank. The two blanks
+/// give the column header the same gap above and below it that a browse page's
+/// table header has.
+const LIST_HEAD_H: u16 = 4;
 /// Rows the visualizer gets when the pane can afford them.
 const VIZ_H: u16 = 9;
 /// Blank rows the progress band puts above its bar.
@@ -265,6 +271,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         queue,
         queue_index,
         queue_list,
+        queue_folded,
         hit,
         viz,
         audio_tap,
@@ -274,6 +281,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ..
     } = state;
     let mouse = *mouse_pos;
+    let folded = *queue_folded;
     let state_cover = state_cover.as_deref();
 
     let rows = Rows::new(inner.width, inner.height);
@@ -295,11 +303,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let progress_area = band(rows.progress);
     let transport_area = band(rows.transport);
     let list_head_area = band(rows.list_head);
-    // The blank under the name-and-count row, which the queue heads its
-    // columns on. Empty on a pane too short for that band to have one.
-    let queue_head = match rows.list_head >= 2 {
+    // The third row of the name-and-count band, which the queue heads its
+    // columns on. Empty on a pane too short for that band to have one, and
+    // while the queue is folded — a table's header over no table is a label
+    // for something that is not there.
+    let queue_head = match rows.list_head >= 3 && !folded {
         true => Rect {
-            y: list_head_area.y + 1,
+            y: list_head_area.y + 2,
             height: 1,
             ..list_head_area
         },
@@ -479,21 +489,24 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             },
             pb.shuffle,
             queue.as_ref(),
+            Some(folded),
             mouse,
             hit,
         );
     }
-    draw_queue(
-        frame,
-        queue_area,
-        queue_head,
-        queue.as_ref(),
-        *queue_index,
-        queue_list,
-        hit,
-        liked,
-        mouse,
-    );
+    if !folded {
+        draw_queue(
+            frame,
+            queue_area,
+            queue_head,
+            queue.as_ref(),
+            *queue_index,
+            queue_list,
+            hit,
+            liked,
+            mouse,
+        );
+    }
 }
 
 /// The now-playing block: cover art on the left, spectrum field on the right.
@@ -808,13 +821,6 @@ fn draw_scope(
     }
 }
 
-/// Which control of a queue row the mouse is over.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum QueueHover {
-    Like,
-    Add,
-}
-
 #[allow(clippy::too_many_arguments)]
 fn draw_queue(
     frame: &mut Frame,
@@ -857,11 +863,8 @@ fn draw_queue(
         rows_area.width as usize,
         q.len(),
     );
-    // The column header costs the queue no rows: `LIST_HEAD_H` is the
-    // name-and-count row plus a blank, and the header takes the blank that is
-    // already there. Growing that band instead would shrink the queue against
-    // `MIN_QUEUE`, and a short pane would end up with a header over one
-    // visible track.
+    // The band above owns both the header's row and the blank under it, so
+    // every row of this band carries a track.
     if header.height > 0 {
         let row = Rect {
             width: rows_area.width,
@@ -893,18 +896,52 @@ fn draw_queue(
     };
     if let Some(actions) = layout.cell(ColKey::Actions) {
         hit.queue_like_col = cell_col(actions.x, LIKE_W);
-        hit.queue_add_col = cell_col(actions.x + LIKE_W, ADD_W);
+        hit.queue_share_col = cell_col(actions.x + LIKE_W, SHARE_W);
+        hit.queue_add_col = cell_col(actions.x + LIKE_W + SHARE_W, ADD_W);
     }
-    let hover_cell: Option<(usize, QueueHover)> = mouse.and_then(|m| {
+    // Each credited artist is a link too, on the same terms the browse table's
+    // Artist column gives them.
+    let artist = layout.cell(ColKey::Artist);
+    let artist_w = artist.map_or(0, |c| c.width);
+    let artist_x = artist.map(|c| rows_area.x.saturating_add(c.x as u16));
+    for (row, t) in q
+        .rows()
+        .iter()
+        .skip(queue_list.offset())
+        .take(filled_rows as usize)
+        .enumerate()
+    {
+        let cell = Rect {
+            x: artist_x.unwrap_or(rows_area.x),
+            y: rows_area.y.saturating_add(row as u16),
+            width: artist_w as u16,
+            height: 1,
+        }
+        .intersection(rows_area);
+        let (_, runs) = credit_line(&t.credits, artist_w);
+        credit_links(cell, &runs, &mut hit.queue_artist_links);
+    }
+    let hover_cell: Option<(usize, RowAction)> = mouse.and_then(|m| {
         let row = |y: u16| queue_list.offset() + (y - rows_area.y) as usize;
         if hit.queue_like_col.contains(m) {
-            Some((row(m.y), QueueHover::Like))
+            Some((row(m.y), RowAction::Like))
+        } else if hit.queue_share_col.contains(m) {
+            Some((row(m.y), RowAction::Share))
         } else if hit.queue_add_col.contains(m) {
-            Some((row(m.y), QueueHover::Add))
+            Some((row(m.y), RowAction::Add))
         } else {
             None
         }
     });
+    // Kept apart from `hover_cell`: that one is the `★ ⧉ +` run, whose light
+    // is a mark of the row's own, where this lights one name inside a cell.
+    let hover_artist: Option<(usize, u16)> = mouse
+        .filter(|m| hit.queue_artist_links.iter().any(|(r, _)| r.contains(*m)))
+        .and_then(|m| {
+            let row = queue_list.offset() + (m.y - rows_area.y) as usize;
+            Some((row, m.x.saturating_sub(artist_x?)))
+        });
+    let hovered = hovered_row(rows_area, queue_list.offset(), q.len(), mouse);
 
     let accent_bold = theme::accent().add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = q
@@ -942,15 +979,19 @@ fn draw_queue(
                 )),
                 ColKey::Title => spans.push(Span::styled(fit(&t.name, cell.width), name_style)),
                 ColKey::Artist => {
-                    spans.push(Span::styled(fit(&t.artists, cell.width), theme::dim()))
+                    let (line, runs) = credit_line(&t.credits, cell.width);
+                    let lit = hover_artist
+                        .filter(|(row, _)| *row == i)
+                        .and_then(|(_, dx)| {
+                            runs.iter().position(|run| {
+                                dx >= run.dx && dx < run.dx.saturating_add(run.width)
+                            })
+                        });
+                    spans.extend(credit_spans(&line, &runs, theme::dim(), lit));
                 }
                 ColKey::Actions => {
                     star_at = Some(spans.len());
-                    spans.extend(action_spans(
-                        saved,
-                        hover == Some(QueueHover::Like),
-                        hover == Some(QueueHover::Add),
-                    ));
+                    spans.extend(action_spans(saved, hover));
                 }
                 ColKey::Time => spans.push(Span::styled(
                     right(&format_duration(t.duration_ms), cell.width),
@@ -977,7 +1018,7 @@ fn draw_queue(
                     span.style = accent_bold;
                 }
             }
-            ListItem::new(line)
+            hover_row(ListItem::new(line), Some(i) == hovered)
         })
         .collect();
     let count = items.len();
@@ -994,7 +1035,7 @@ mod tests {
 
     use super::super::table::VOL_TRACK_W;
     use super::*;
-    use crate::app::state::{CrumbTarget, MainView, Playback, TrackList};
+    use crate::app::state::{Credit, CrumbTarget, MainView, Playback, TrackList};
 
     fn track(name: &str, artists: &str) -> Track {
         Track {
@@ -1006,9 +1047,25 @@ mod tests {
             duration_ms: 83_000,
             track_number: 1,
             album_id: None,
-            artist_id: None,
+            credits: artists
+                .split(", ")
+                .map(|name| Credit {
+                    name: name.into(),
+                    id: None,
+                })
+                .collect(),
             cover_url: None,
         }
+    }
+
+    /// The whole credit run the metadata row recorded, from the first name to
+    /// the last. The fixtures credit one artist, so this is that name's rect.
+    fn artist_rect(hit: &HitAreas) -> Rect {
+        hit.now_artist_links
+            .iter()
+            .map(|(rect, _)| *rect)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or_default()
     }
 
     /// Rewrite the playing row, keeping the queue's shape.
@@ -1190,7 +1247,7 @@ mod tests {
     #[test]
     fn renders_block_viz_and_queue_with_markers() {
         let mut st = playing_state();
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         // No pane frame: the view starts at the very first row.
         assert!(!lines[0].contains(" Player "));
         // The masthead spans the pane above the cover: the title, then
@@ -1237,27 +1294,33 @@ mod tests {
         assert!(lines[17].contains("■ pause"), "{:?}", lines[17]);
         assert!(lines[17].trim_end().ends_with("next ▸▸"), "{:?}", lines[17]);
         assert!(lines[18].trim().is_empty());
-        // Then two rows head the list: name on the left with shuffle opposite,
-        // then the columns — which take the blank that was there rather than a
-        // row of the queue.
+        // Then four rows head the list: name on the left with shuffle
+        // opposite, a blank, the columns, and the blank every other table
+        // keeps between its header and its rows.
         assert!(lines[19].contains("My Mix · 3 tracks"), "{:?}", lines[19]);
         assert!(lines[19].contains("shuffle off"), "{:?}", lines[19]);
-        assert!(lines[20].contains("#   Title"), "{:?}", lines[20]);
-        assert!(lines[20].trim_end().ends_with("Artist"), "{:?}", lines[20]);
+        assert!(lines[20].trim().is_empty(), "{:?}", lines[20]);
+        assert!(lines[21].contains("#   Title"), "{:?}", lines[21]);
+        assert!(lines[21].trim_end().ends_with("Artist"), "{:?}", lines[21]);
+        assert!(lines[22].trim().is_empty(), "{:?}", lines[22]);
         assert!(!lines.iter().any(|l| l.contains("repeat")));
         // Queue rows: numbered, and only the playing one is marked.
-        assert!(lines[21].contains(" 1   Alpha"), "{:?}", lines[21]);
-        assert!(lines[22].contains("▶  2   Beta"), "{:?}", lines[22]);
-        assert!(lines[23].contains(" 3   Gamma"), "{:?}", lines[23]);
+        assert!(lines[23].contains(" 1   Alpha"), "{:?}", lines[23]);
+        assert!(lines[24].contains("▶  2   Beta"), "{:?}", lines[24]);
+        assert!(lines[25].contains(" 3   Gamma"), "{:?}", lines[25]);
         assert!(!lines.iter().any(|l| l.contains("→")));
         assert!(!st.hit.player_queue.is_empty());
-        assert_eq!(st.hit.player_queue.y, BRAND_H + 21);
+        assert_eq!(st.hit.player_queue.y, BRAND_H + 23);
     }
 
     /// A cell of padding on each side of the player view.
     const PANE_INSET: u16 = 1;
-    /// At 80x26 the tall art tier applies: a three-row masthead, then a
-    /// twelve-row cover with twelve LED rows beside it.
+    /// The shortest pane the tall art tier fits in: everything but the cover,
+    /// plus the rows [`Rows::MIN_ART_QUEUE`] holds back for the queue.
+    const TALL_H: u16 =
+        HEADER_H + ART_TALL_H + ART_PROGRESS_H + TRANSPORT_H + LIST_HEAD_H + Rows::MIN_ART_QUEUE;
+    /// In the tall tier the field runs beside the cover: a three-row masthead,
+    /// then twelve LED rows.
     const VIZ_TOP: u16 = HEADER_H;
     const VIZ_BOTTOM: u16 = HEADER_H + ART_TALL_H - 1;
 
@@ -1275,7 +1338,7 @@ mod tests {
 
     /// Every cell of the visualizer field of a freshly-drawn 80x26 player view.
     fn viz_cells(st: &mut AppState) -> Vec<ratatui::buffer::Cell> {
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let field = st.hit.viz;
@@ -1290,7 +1353,7 @@ mod tests {
     #[test]
     fn the_field_fills_the_column_beside_the_cover() {
         let mut st = playing_state();
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let (art, field) = (st.hit.art, st.hit.viz);
         assert_eq!(field.y, BRAND_H + VIZ_TOP);
@@ -1318,7 +1381,7 @@ mod tests {
         edit_playing(&mut st, |t| {
             t.name = "A Title Long Enough To Have Been Clipped By The Old Column".into()
         });
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         assert!(
             lines[0].contains("Been Clipped By The Old Column"),
             "{:?}",
@@ -1383,7 +1446,7 @@ mod tests {
     fn field_in(mode: VizMode, frames: usize) -> (Rect, Vec<ratatui::buffer::Cell>) {
         let mut st = playing_state();
         st.viz.mode = mode;
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         for _ in 0..frames {
             st.audio_tap.push(&broadband(), 1.0);
             terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
@@ -1473,7 +1536,7 @@ mod tests {
         for mode in [VizMode::Bars, VizMode::Wave, VizMode::Scope] {
             let mut st = playing_state();
             st.viz.mode = mode;
-            let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
             for _ in 0..40 {
                 st.audio_tap.push(&broadband(), 1.0);
                 terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
@@ -1537,7 +1600,7 @@ mod tests {
     fn painted_bottom_row(width: u16) -> (Rect, Vec<u16>) {
         let mut st = playing_state();
         st.audio_tap.push(&broadband(), 1.0);
-        let mut terminal = Terminal::new(TestBackend::new(width, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let field = st.hit.viz;
@@ -1720,7 +1783,7 @@ mod tests {
     fn no_queue_shows_hint() {
         let mut st = playing_state();
         st.queue = None;
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         assert!(
             lines
                 .iter()
@@ -1733,7 +1796,7 @@ mod tests {
     fn nothing_playing_shows_hint() {
         let mut st = playing_state();
         st.playback = None;
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         assert!(lines[0].contains("nothing playing"));
         // Nothing to control, so no control records a hit rect.
         for rect in [
@@ -1746,11 +1809,60 @@ mod tests {
         }
     }
 
+    /// Folded, the queue's name keeps its row and everything above it stays
+    /// where it was — the column header and the rows are simply not drawn, and
+    /// nothing under the name can be clicked or scrolled.
+    #[test]
+    fn a_folded_queue_leaves_the_name_and_nothing_under_it() {
+        let mut st = playing_state();
+        let open = render(&mut st, 80, TALL_H);
+        assert!(open[19].contains("▾ My Mix"), "{:?}", open[19]);
+        assert!(open[21].contains("#   Title"), "{:?}", open[21]);
+
+        st.queue_folded = true;
+        // The real draw loop clears the hit areas before every frame; this
+        // harness calls the view directly, so the stale rects go here.
+        st.hit = crate::app::state::HitAreas::default();
+        let lines = render(&mut st, 80, TALL_H);
+        // The name has not moved, and the marker turned to say which way it is.
+        assert!(lines[19].contains("▸ My Mix"), "{:?}", lines[19]);
+        assert!(!lines[19].contains("▾"), "{:?}", lines[19]);
+        for line in &lines[20..] {
+            assert!(line.trim().is_empty(), "{line:?}");
+        }
+        assert!(st.hit.player_queue.is_empty(), "a folded queue took clicks");
+        assert!(st.hit.queue_like_col.is_empty());
+        assert!(!st.hit.queue_name.is_empty(), "no way to unfold it");
+    }
+
+    /// The marker is inside the link, so the whole `▸ name` run is the target
+    /// rather than a mark sitting beside one.
+    #[test]
+    fn the_fold_marker_is_part_of_the_name_target() {
+        let mut st = playing_state();
+        render(&mut st, 80, TALL_H);
+        let name = st.hit.queue_name;
+        assert_eq!(name.width as usize, super::super::table::width("▾ My Mix"));
+    }
+
+    /// The queue reads as a table: the name, a blank, the column header, and
+    /// the blank every other table keeps between its header and its rows.
+    #[test]
+    fn the_queue_header_keeps_a_blank_either_side() {
+        let mut st = playing_state();
+        let lines = render(&mut st, 80, TALL_H);
+        assert!(lines[19].contains("My Mix"), "{:?}", lines[19]);
+        assert!(lines[20].trim().is_empty(), "{:?}", lines[20]);
+        assert!(lines[21].contains("Title"), "{:?}", lines[21]);
+        assert!(lines[22].trim().is_empty(), "{:?}", lines[22]);
+        assert_eq!(st.hit.player_queue.y, BRAND_H + 23);
+    }
+
     #[test]
     fn list_header_names_the_queue() {
         let mut st = playing_state();
         st.queue = Some(Queue::new(vec![track("Alpha", "Ann")], 0, "Search results"));
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         assert!(
             lines[19].contains("Search results · 1 tracks"),
             "{:?}",
@@ -1759,13 +1871,46 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("Up Next")));
     }
 
+    /// The queue row under the pointer wears the same faint wash a browse
+    /// table's does, and it says nothing about selection: the selected row
+    /// keeps its own weight and brightness whether the pointer is on it or not.
+    #[test]
+    fn hovering_washes_the_queue_row_without_touching_selection() {
+        let mut st = playing_state();
+        st.queue_index = 0;
+        render(&mut st, 80, TALL_H);
+        let rows = st.hit.player_queue;
+        st.mouse_pos = Some(Position {
+            x: rows.x + 4,
+            y: rows.y,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let cell = |x: u16, y: u16| buffer.cell(Position { x, y }).unwrap().clone();
+
+        for x in rows.x..rows.right() {
+            assert_eq!(cell(x, rows.y).bg, theme::FIELD, "the row is not washed");
+            assert_ne!(cell(x, rows.y + 1).bg, theme::FIELD, "the row below washed");
+        }
+        // The selected row is the hovered one here, and it still reads as
+        // selected: the wash is a background, the selection a weight.
+        let row: Vec<_> = (rows.x..rows.right()).map(|x| cell(x, rows.y)).collect();
+        assert!(
+            row.iter()
+                .any(|c| c.fg == theme::BRIGHT && c.modifier.contains(Modifier::BOLD)),
+            "the wash flattened the selection"
+        );
+    }
+
     /// Selection is weight and brightness now, not a filled accent bar, so it
     /// never outshouts the accent-colored playing row.
     #[test]
     fn selection_brightens_the_selected_row() {
         let mut st = playing_state();
         st.queue_index = 0;
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let y = st.hit.player_queue.y;
@@ -1787,7 +1932,7 @@ mod tests {
     #[test]
     fn controls_record_hits_on_their_rows() {
         let mut st = playing_state();
-        render(&mut st, 100, 26);
+        render(&mut st, 100, TALL_H);
         // The masthead owns rows 0..2 — the title, metadata and volume, blank
         // — then the cover and the field beside it, then the progress bar, the
         // transport, the list header and the queue.
@@ -1823,7 +1968,7 @@ mod tests {
     #[test]
     fn progress_row_spans_the_pane() {
         let mut st = playing_state();
-        render(&mut st, 100, 26);
+        render(&mut st, 100, TALL_H);
         let inner_w = 100 - 2 * PANE_INSET;
         assert_eq!(st.hit.gauge.x, PANE_INSET + 5, "elapsed label is 5 cells");
         assert_eq!(st.hit.gauge.width, inner_w - deck::TIME_W);
@@ -1837,7 +1982,7 @@ mod tests {
     fn play_state_marker_reports_running_or_stopped() {
         const STATE_ROW: usize = (HEADER_H + ART_TALL_H + ART_PROGRESS_H) as usize;
         let mut playing = playing_state();
-        let lines = render(&mut playing, 80, 26);
+        let lines = render(&mut playing, 80, TALL_H);
         assert!(
             lines[STATE_ROW].contains("■ pause"),
             "{:?}",
@@ -1846,7 +1991,7 @@ mod tests {
 
         let mut paused = playing_state();
         paused.playback.as_mut().unwrap().is_playing = false;
-        let lines = render(&mut paused, 80, 26);
+        let lines = render(&mut paused, 80, TALL_H);
         assert!(
             lines[STATE_ROW].contains("▶ play"),
             "{:?}",
@@ -1857,7 +2002,7 @@ mod tests {
         let marker = |is_playing: bool| {
             let mut st = playing_state();
             st.playback.as_mut().unwrap().is_playing = is_playing;
-            let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
             terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
             // The pill has no padding, so the glyph is its first cell.
             let (x, y) = (st.hit.play_btn.x, st.hit.play_btn.y);
@@ -1902,24 +2047,58 @@ mod tests {
             1,
             "My Mix",
         ));
-        let lines = render(&mut st, 80, 26);
-        assert!(lines[21].contains(" 1   Gamma"), "{:?}", lines[21]);
-        assert!(lines[23].contains(" 3   Alpha"), "{:?}", lines[23]);
+        let lines = render(&mut st, 80, TALL_H);
+        assert!(lines[23].contains(" 1   Gamma"), "{:?}", lines[23]);
+        assert!(lines[25].contains(" 3   Alpha"), "{:?}", lines[25]);
     }
 
-    /// The queue's rows carry the same pair the browse table's do, in the same
+    /// The queue's Artist cell is a run of links, the way the browse table's
+    /// is: one target per credited name, on the row that credits it.
+    #[test]
+    fn the_queue_rows_link_each_credited_artist() {
+        let mut st = playing_state();
+        let mut credited = track("Clarity", "Zedd, Alessia Cara");
+        for (i, credit) in credited.credits.iter_mut().enumerate() {
+            credit.id = Some(format!("a{i}"));
+        }
+        st.queue = Some(Queue::new(
+            vec![credited, track("Beta", "Bob")],
+            0,
+            "My Mix",
+        ));
+        render(&mut st, 100, TALL_H);
+
+        let links = &st.hit.queue_artist_links;
+        assert_eq!(links.len(), 2, "only the identified names are targets");
+        assert_eq!(links[0].1.name, "Zedd");
+        assert_eq!(links[1].1.name, "Alessia Cara");
+        assert_eq!(links[0].0.y, st.hit.player_queue.y, "not on the first row");
+        assert_eq!(links[1].0.y, links[0].0.y, "the pair split across rows");
+        assert_eq!(
+            links[1].0.x,
+            links[0].0.right() + 2,
+            "the `, ` between them belongs to neither"
+        );
+    }
+
+    /// The queue's rows carry the same three the browse table's do, in the same
     /// order, before the time.
     #[test]
     fn the_queue_rows_wear_the_action_pair() {
         let mut st = playing_state();
         st.liked.insert("spotify:track:Alpha".into(), true);
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        let (like, add) = (st.hit.queue_like_col, st.hit.queue_add_col);
+        let (like, share, add) = (
+            st.hit.queue_like_col,
+            st.hit.queue_share_col,
+            st.hit.queue_add_col,
+        );
         assert_eq!(like.width, 3, "the control lost its padding");
-        assert_eq!(add.x, like.right(), "the pair is not flush");
+        assert_eq!(share.x, like.right(), "the run is not flush");
+        assert_eq!(add.x, share.right(), "the run is not flush");
         assert!(st.hit.player_queue.contains(Position {
             x: like.x,
             y: like.y
@@ -1936,6 +2115,7 @@ mod tests {
         };
         for row in 0..3 {
             assert_eq!(cell(like.x, row).symbol(), super::super::table::LIKED_MARK);
+            assert_eq!(cell(share.x, row).symbol(), super::super::table::SHARE_MARK);
             assert_eq!(cell(add.x, row).symbol(), super::super::table::ADD_MARK);
         }
         // "Alpha" is row 0 and saved; the rest are unknown and stay dim.
@@ -1992,7 +2172,7 @@ mod tests {
     fn art_paints_half_blocks_with_fg_and_bg() {
         let mut st = playing_state();
         st.cover = Some(synthetic_cover(|x, y| [x as u8, y as u8, 128]));
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let art = st.hit.art;
@@ -2012,7 +2192,7 @@ mod tests {
     #[test]
     fn art_top_and_bottom_pixels_land_in_one_cell() {
         let mut st = playing_state();
-        render(&mut st, 80, 26);
+        render(&mut st, 80, TALL_H);
         let art = st.hit.art;
 
         // Put the colour change on an *odd* pixel row, so one cell straddles
@@ -2029,7 +2209,7 @@ mod tests {
             }
         }));
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let y = art.y + (split_row / 2) as u16;
@@ -2050,7 +2230,7 @@ mod tests {
         st.cover = Some(synthetic_cover(|x, _| {
             if x < half { [220, 0, 0] } else { [0, 0, 220] }
         }));
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let art = st.hit.art;
@@ -2111,7 +2291,7 @@ mod tests {
     fn placeholder_fills_the_block_when_there_is_no_cover() {
         let mut st = playing_state();
         st.cover = None;
-        let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let art = st.hit.art;
@@ -2137,7 +2317,7 @@ mod tests {
             st.cover = None;
             let id = album_id.map(str::to_string);
             edit_playing(&mut st, |t| t.album_id = id);
-            let mut terminal = Terminal::new(TestBackend::new(80, 26 + BRAND_H)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
             terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
             let buffer = terminal.backend().buffer().clone();
             let art = st.hit.art;
@@ -2163,11 +2343,12 @@ mod tests {
         // With a cover the field rides beside the sleeve, so `viz` — the
         // *stacked* tier's band — is zero in the art tiers.
         for (w, h, art, viz, queue) in [
-            (94u16, 36u16, ART_TALL_H, 0u16, 15u16),
-            (100, 30, ART_TALL_H, 0, 9),
-            (80, 26, ART_TALL_H, 0, 5),
-            (55, 24, ART_SHORT_H, 0, 7),
-            (44, 30, 0, VIZ_H, 11),
+            (94u16, 36u16, ART_TALL_H, 0u16, 13u16),
+            (100, 30, ART_TALL_H, 0, 7),
+            (80, 28, ART_TALL_H, 0, 5),
+            (80, 26, ART_SHORT_H, 0, 7),
+            (55, 24, ART_SHORT_H, 0, 5),
+            (44, 30, 0, VIZ_H, 9),
         ] {
             let rows = Rows::new(w - 2 * PANE_INSET, h);
             assert_eq!(rows.art, art, "{w}x{h} cover");
@@ -2211,24 +2392,30 @@ mod tests {
     #[test]
     fn metadata_lines_are_links_when_their_ids_are_known() {
         let mut st = playing_state();
-        render(&mut st, 100, 26);
-        assert!(st.hit.now_artist.is_empty(), "linked without an artist id");
+        render(&mut st, 100, TALL_H);
+        assert!(
+            st.hit.now_artist_links.is_empty(),
+            "linked without an artist id"
+        );
         assert!(st.hit.now_album.is_empty(), "linked without an album id");
 
         let mut st = playing_state();
         edit_playing(&mut st, |t| {
-            t.artist_id = Some("art1".into());
+            t.credits = vec![Credit {
+                name: "Bob".into(),
+                id: Some("art1".into()),
+            }];
             t.album_id = Some("alb1".into());
         });
-        render(&mut st, 100, 26);
+        render(&mut st, 100, TALL_H);
         // Both sit on the one metadata row, the album after the separator.
-        assert_eq!(st.hit.now_artist.y, BRAND_H + 1);
+        assert_eq!(artist_rect(&st.hit).y, BRAND_H + 1);
         assert_eq!(st.hit.now_album.y, BRAND_H + 1);
         // The rects stop at the text rather than running to the pane edge.
-        assert_eq!(st.hit.now_artist.width, "Bob".len() as u16);
+        assert_eq!(artist_rect(&st.hit).width, "Bob".len() as u16);
         assert_eq!(
             st.hit.now_album.x,
-            st.hit.now_artist.right() + 3,
+            artist_rect(&st.hit).right() + 3,
             "separator is 3 cells"
         );
         assert_eq!(st.hit.now_album.width, "Album Name".len() as u16);
@@ -2244,7 +2431,7 @@ mod tests {
             t.album = "Beta".into();
             t.album_id = Some("alb1".into());
         });
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         assert!(lines[1].contains("Bob · Beta · 2020"), "{:?}", lines[1]);
         assert!(!st.hit.now_album.is_empty(), "the album lost its link");
     }
@@ -2263,7 +2450,7 @@ mod tests {
         );
         assert!(!lines[1].contains("2020"), "{:?}", lines[1]);
         // Wider, and the year comes back.
-        let lines = render(&mut st, 80, 26);
+        let lines = render(&mut st, 80, TALL_H);
         assert!(
             lines[1].contains("Bob · Album Name · 2020"),
             "{:?}",

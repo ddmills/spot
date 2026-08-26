@@ -14,6 +14,7 @@ use crate::app::state::{
     InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow, RadioScope, RadioTab,
     SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
 };
+use crate::link;
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const SCROLL_LINES: i64 = 3;
@@ -219,7 +220,7 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
     // is navigation, so there is no "play" for a second click to mean. The
     // whole two-line block is the target, not the name alone.
     if let Some(row) = card_hit(&st.hit.home_rows) {
-        st.main_index = row;
+        select_row(st, row);
         activate_selection(st, tx);
         return;
     }
@@ -280,17 +281,26 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
                 toggle_like_selection(st, tx);
                 return;
             }
+            if st.hit.main_share_col.contains(pos) {
+                st.last_main_click = None;
+                share_selection(st);
+                return;
+            }
             if st.hit.main_add_col.contains(pos) {
                 st.last_main_click = None;
                 add_selection_to_playlist(st, tx);
                 return;
             }
-            if st.hit.main_artist_col.contains(pos) {
+            // Both tables credit artists in a column of their own, and each
+            // name opens that artist rather than the row it sits on.
+            if let Some(credit) = artist_link_at(&st.hit.main_artist_links, pos)
+                .or_else(|| artist_link_at(&st.hit.album_artist_links, pos))
+            {
                 st.last_main_click = None;
-                open_artist_of_selection(st, tx);
+                open_artist_link(st, tx, credit);
                 return;
             }
-            if st.hit.main_album_col.contains(pos) {
+            if st.hit.main_album_col.hit(pos) {
                 st.last_main_click = None;
                 open_album_of_selection(st, tx);
                 return;
@@ -346,6 +356,12 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
+    // The credit line of a header band: each name opens that artist.
+    if let Some(credit) = artist_link_at(&st.hit.header_artist_links, pos) {
+        open_artist_link(st, tx, credit);
+        return;
+    }
+
     if st.hit.header_play_btn.contains(pos) {
         play_current_view(st, tx, false);
         return;
@@ -353,6 +369,13 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
 
     if st.hit.header_shuffle_btn.contains(pos) {
         play_current_view(st, tx, true);
+        return;
+    }
+
+    // About the page itself, where a row's `⧉` under it is about one record on
+    // the page.
+    if st.hit.header_share_btn.contains(pos) {
+        share_open_page(st);
         return;
     }
 
@@ -372,13 +395,20 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         let index = st.queue_list.offset() + (pos.y - st.hit.player_queue.y) as usize;
         if index < st.queue_len() {
             st.queue_index = index;
+            if let Some(credit) = artist_link_at(&st.hit.queue_artist_links, pos) {
+                st.last_queue_click = None;
+                st.show_player = false;
+                open_artist_link(st, tx, credit);
+                return;
+            }
             let like = st.hit.queue_like_col.contains(pos);
+            let share = st.hit.queue_share_col.contains(pos);
             let add = st.hit.queue_add_col.contains(pos);
-            if like || add {
+            if like || share || add {
                 st.last_queue_click = None;
                 // The row under the pointer, not the playing one: the queue is
-                // a list of records you can act on, and the deck's own pair
-                // two panes down is what speaks for what is playing.
+                // a list of records you can act on, and the deck's own three
+                // two panes down are what speak for what is playing.
                 let Some(uri) = st
                     .queue
                     .as_ref()
@@ -389,6 +419,8 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
                 };
                 if like {
                     send_like(st, uri, tx);
+                } else if share {
+                    share_track(st, &uri);
                 } else {
                     open_playlist_picker_for(st, uri, tx);
                 }
@@ -414,9 +446,15 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
-    // Now-playing info row: artist / album names open their pages.
-    if st.hit.now_artist.contains(pos) {
-        open_deck_artist(st, tx);
+    // Now-playing info row: artist / album names open their pages. The record
+    // may credit several artists, and the name under the pointer is the one
+    // that opens.
+    if let Some(credit) = artist_link_at(&st.hit.now_artist_links, pos) {
+        // Before `navigate`, and unconditionally: clicking a name while
+        // already on that artist's page is a no-op for the path but must
+        // still get you out of the player and onto the page it names.
+        st.show_player = false;
+        open_deck_credit(st, tx, credit);
         return;
     }
     if st.hit.now_album.contains(pos) {
@@ -424,12 +462,14 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
-    // The deck's context row names the queue in both views, so clicking it
-    // is the mouse's `v`: it opens the player from the bar and closes it
-    // again from the player.
+    // The deck's context row names the queue in both views. From the bar the
+    // name is the way into the player; in the player it is the heading the
+    // queue hangs from, so clicking it folds that list away and back. The way
+    // back out of the player is the `← <page>` pill, the status opposite the
+    // mark, and `v`.
     if st.hit.queue_name.contains(pos) {
         if st.show_player {
-            st.show_player = false;
+            st.queue_folded = !st.queue_folded;
         } else {
             open_player(st, tx);
         }
@@ -454,7 +494,11 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         toggle_like_deck(st, tx);
         return;
     }
-    // Its neighbour on the same row, about the same record.
+    // Its neighbours on the same row, about the same record.
+    if st.hit.share_btn.contains(pos) {
+        share_deck(st);
+        return;
+    }
     if st.hit.add_btn.contains(pos) {
         open_playlist_picker(st, tx);
         return;
@@ -541,19 +585,34 @@ fn handle_search_input(
                 // were — nothing there knows it is open — and results the
                 // player was hiding would be worse than a redundant line.
                 st.show_player = false;
-                // One box, one query, both catalogues. Which of them you meant
-                // is a tab on the results rather than a mode on the box: the
-                // old prompt pointed at Spotify or at the station directory
-                // depending on the page behind it, which meant you could not
-                // reach a station without first walking to Radio, and could not
-                // reach Spotify from there at all.
-                //
-                // Before the tab reset, so the snapshot keeps the tab the page
-                // you are leaving was on.
-                navigate(&mut st, AppCommand::Search(query), tx);
-                // The first tab the strip has: Tracks with Spotify behind the
-                // box, and Stations when the directory is the whole of it.
-                st.search_tab = st.search_tabs()[0];
+                // The box takes a pasted link as well as a query, because
+                // Windows can route the `spotify:` scheme to an app but cannot
+                // route an https host: an `open.spotify.com` URL copied out of
+                // a browser has no other way in.
+                match link::parse(&query) {
+                    // Sent rather than navigated: the page is still a fetch
+                    // away, and the client sends the open command once it
+                    // knows what the link names. See `Client::open_link`.
+                    Ok(target) => drop(tx.send(AppCommand::OpenLink(target))),
+                    Err(link::ParseError::Unsupported(what)) => {
+                        st.toast(format!("spot does not play {what}"));
+                    }
+                    // One box, one query, both catalogues. Which of them you
+                    // meant is a tab on the results rather than a mode on the
+                    // box: the old prompt pointed at Spotify or at the station
+                    // directory depending on the page behind it, which meant
+                    // you could not reach a station without first walking to
+                    // Radio, and could not reach Spotify from there at all.
+                    Err(link::ParseError::NotALink) => {
+                        // Before the tab reset, so the snapshot keeps the tab
+                        // the page you are leaving was on.
+                        navigate(&mut st, AppCommand::Search(query), tx);
+                        // The first tab the strip has: Tracks with Spotify
+                        // behind the box, and Stations when the directory is
+                        // the whole of it.
+                        st.search_tab = st.search_tabs()[0];
+                    }
+                }
             }
         }
         KeyCode::Backspace => {
@@ -900,6 +959,9 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
             let mut st = state.write();
             if st.show_help {
                 st.show_help = false;
+            } else if st.links.confirming.take().is_some() {
+                // The armed Links row is the nearest thing to something open,
+                // and Esc is the key its own prompt names.
             } else {
                 go_back_or_up(&mut st, tx);
             }
@@ -1194,7 +1256,11 @@ fn make_way(st: &mut AppState, target: Option<ViewKey>, tx: &UnboundedSender<App
 
 /// Open the page `cmd` leads to, walking back to it instead when it is already
 /// on the path. Every navigation site goes through here.
-fn navigate(st: &mut AppState, cmd: AppCommand, tx: &UnboundedSender<AppCommand>) {
+pub(crate) fn navigate(st: &mut AppState, cmd: AppCommand, tx: &UnboundedSender<AppCommand>) {
+    // Leaving the screen disarms the Links row for the same reason leaving the
+    // row does: its second press claims the `spotify:` scheme, and coming back
+    // to a page has to ask again.
+    st.links.confirming = None;
     if make_way(st, target_key(&cmd), tx) {
         // The count belongs to the page you were on, not to the one opening.
         st.retries = 0;
@@ -1289,12 +1355,28 @@ fn main_rows_on_screen(st: &AppState) -> usize {
     rows
 }
 
+/// Put the selection on `index`, and disarm whatever the row being left had
+/// armed.
+///
+/// Only the Links row arms anything, and its second press is what claims the
+/// `spotify:` scheme — so the arming has to belong to that row rather than to
+/// the screen. Walking away and coming back must ask again.
+fn select_row(st: &mut AppState, index: usize) {
+    if st.main_index != index {
+        st.links.confirming = None;
+    }
+    st.main_index = index;
+}
+
 fn move_selection(st: &mut AppState, delta: i64) {
     let len = st.main_len();
     if len == 0 {
         return;
     }
-    st.main_index = (st.main_index as i64 + delta).clamp(0, len as i64 - 1) as usize;
+    select_row(
+        st,
+        (st.main_index as i64 + delta).clamp(0, len as i64 - 1) as usize,
+    );
     snap_to_selection(st);
 }
 
@@ -1303,7 +1385,7 @@ fn set_selection(st: &mut AppState, index: usize) {
     if len == 0 {
         return;
     }
-    st.main_index = index.min(len - 1);
+    select_row(st, index.min(len - 1));
     snap_to_selection(st);
 }
 
@@ -1463,6 +1545,75 @@ fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand
 }
 
 /// Open a radio tab, from the strip or from ←/→.
+/// The Home row that decides where a clicked Spotify link opens.
+///
+/// Claiming the scheme takes two presses when there is another app to
+/// displace: the first arms the row and names what it would replace, the
+/// second does it. Giving the scheme back takes one — undo must never be
+/// harder than the act. Nothing else in spot reaches
+/// [`crate::protocol::register`], which is what keeps the claim to something
+/// the user asked for twice.
+#[cfg(windows)]
+fn toggle_links(st: &mut AppState) {
+    use crate::protocol::{self, Holder};
+
+    if st.links.in_force {
+        match protocol::unregister() {
+            Ok(()) => {
+                protocol::refresh(st);
+                st.toast("Spotify links go back to where they were".to_string());
+            }
+            Err(e) => {
+                log::error!("could not give the Spotify links back: {e:#}");
+                st.toast("could not give the Spotify links back".to_string());
+            }
+        }
+        return;
+    }
+
+    // Read now rather than trusted from the last draw: this press is about to
+    // overwrite whatever is there, so what is there has to be current.
+    let displaced = match protocol::status().holder {
+        Holder::Other(app) => Some(app),
+        Holder::Spot | Holder::Nobody => None,
+    };
+    let armed = st.links.confirming.take().is_some();
+    if let Some(app) = &displaced
+        && !armed
+    {
+        st.links.confirming = Some(format!(
+            "Enter again to replace {app} · Esc to leave it alone"
+        ));
+        return;
+    }
+
+    // `force` only where the first press already said which app it displaces.
+    match protocol::register(displaced.is_some()) {
+        Ok(now) => {
+            let outranked = !now.in_force();
+            protocol::refresh(st);
+            if outranked {
+                // Written, and overruled by Windows' own default-apps answer.
+                // Saying so is the whole point: a registration that silently
+                // does nothing is the worst outcome this row has.
+                st.toast(
+                    "Windows keeps its own answer for Spotify links — set spot in Settings › Apps › Default apps"
+                        .to_string(),
+                );
+            } else {
+                st.toast("Spotify links now open in spot".to_string());
+            }
+        }
+        Err(e) => {
+            log::error!("could not claim the Spotify links: {e:#}");
+            st.toast(format!("could not claim the Spotify links: {e}"));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn toggle_links(_st: &mut AppState) {}
+
 fn open_radio_tab(st: &mut AppState, tab: RadioTab, tx: &UnboundedSender<AppCommand>) {
     navigate(st, AppCommand::LoadRadio { scope: tab.scope() }, tx);
 }
@@ -1495,6 +1646,9 @@ fn activate_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
                         let _ = tx.send(AppCommand::InstallUpdate);
                     }
                 },
+                // Also a control rather than a destination, and the only one
+                // that reaches outside spot — see [`toggle_links`].
+                HomeItem::Links => toggle_links(st),
                 HomeItem::LikedSongs => navigate(st, AppCommand::LoadLikedSongs, tx),
                 HomeItem::DiscoverWeekly => {
                     // Resolved before the view is pushed: a row that leads
@@ -1889,7 +2043,7 @@ fn open_album_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>) 
         t.album_id.as_ref().map(|id| AppCommand::OpenAlbum {
             id: id.clone(),
             name: t.album.clone(),
-            artists: t.artists.clone(),
+            credits: t.credits.clone(),
             year: t.release_year.clone(),
             cover_url: t.cover_url.clone(),
         })
@@ -1961,8 +2115,11 @@ fn open_deck_album(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     navigate(st, cmd, tx);
 }
 
-/// Open the artist of whatever the deck is about. Same rule as
-/// [`open_deck_album`], and the same reason it does not read `playback`.
+/// Open the artist the deck's record is filed under: what `B` means under a
+/// station, which has no pointer to say which of several names it wanted.
+///
+/// Same rule as [`open_deck_album`], and the same reason it does not read
+/// `playback`.
 fn open_deck_artist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let Some(cmd) = st.deck_track().and_then(|t| t.open_artist()) else {
         return radio_has_no_track(st, "artist");
@@ -1972,6 +2129,43 @@ fn open_deck_artist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     // the player and onto the page it names.
     st.show_player = false;
     navigate(st, cmd, tx);
+}
+
+/// The artist a click at `pos` lands on, out of a run of recorded names.
+///
+/// One lookup for every table and masthead that records them — see
+/// [`state::HitAreas::main_artist_links`].
+fn artist_link_at(links: &[(Rect, state::Credit)], pos: Position) -> Option<state::Credit> {
+    links
+        .iter()
+        .find(|(rect, _)| rect.contains(pos))
+        .map(|(_, credit)| credit.clone())
+}
+
+/// Open the artist page a clicked name leads to.
+///
+/// Goes through [`navigate`] like every other way in, so bouncing between an
+/// album and its artist walks the path rather than growing it.
+///
+/// Ungated, like the deck's other two links and for the same reason: the deck
+/// is about the record that is playing, and what is playing is always
+/// something this session can reach.
+fn open_deck_credit(st: &mut AppState, tx: &UnboundedSender<AppCommand>, credit: state::Credit) {
+    let Some(cmd) = state::open_artist(&credit) else {
+        return;
+    };
+    navigate(st, cmd, tx);
+}
+
+/// [`open_deck_credit`], for a name printed on a *page*.
+///
+/// Gated the way `b` and `B` are: opening a page is browsing Spotify, which an
+/// account that cannot do it must be told about rather than left watching
+/// nothing happen.
+fn open_artist_link(st: &mut AppState, tx: &UnboundedSender<AppCommand>, credit: state::Credit) {
+    if spotify_pages_open(st) {
+        open_deck_credit(st, tx, credit);
+    }
 }
 
 /// The station row's country: open the directory's page for it.
@@ -2041,7 +2235,7 @@ fn open_album_item(a: &crate::app::state::AlbumItem) -> AppCommand {
     AppCommand::OpenAlbum {
         id: a.id.clone(),
         name: a.name.clone(),
-        artists: a.artists.clone(),
+        credits: a.credits.clone(),
         year: a.release_year.clone(),
         cover_url: a.cover_url.clone(),
     }
@@ -2053,13 +2247,7 @@ fn open_artist_of_selection(st: &mut AppState, tx: &UnboundedSender<AppCommand>)
     if !spotify_pages_open(st) {
         return;
     }
-    let from_track = |t: &crate::app::state::Track| {
-        t.artist_id.as_ref().map(|id| AppCommand::OpenArtist {
-            id: id.clone(),
-            uri: format!("spotify:artist:{id}"),
-            name: crate::app::state::first_artist(&t.artists),
-        })
-    };
+    let from_track = |t: &crate::app::state::Track| t.open_artist();
     let cmd = match &st.main {
         MainView::Tracks(list) => list.get(st.main_index).and_then(from_track),
         MainView::Artist(v) => match v.row(st.main_index) {
@@ -2174,6 +2362,56 @@ fn add_selection_to_playlist(st: &mut AppState, tx: &UnboundedSender<AppCommand>
     }
 }
 
+/// The `⧉` on a track row: that row's Spotify link on the clipboard.
+///
+/// Falls back to the deck's record the way the `+` beside it does.
+fn share_selection(st: &mut AppState) {
+    match selected_track_uri(st) {
+        Some(uri) => share_track(st, &uri),
+        None => share_deck(st),
+    }
+}
+
+/// The deck's share control, about the record the deck is about — see
+/// [`toggle_like_deck`] for why that is not always `playback`.
+fn share_deck(st: &mut AppState) {
+    let Some(uri) = st.deck_track().map(|t| t.uri.clone()) else {
+        return radio_has_no_track(st, "track");
+    };
+    share_track(st, &uri);
+}
+
+/// A header band's `⧉ share`: the link to the page itself rather than to any
+/// record on it. The control is drawn only where there is one, so a page that
+/// cannot be linked to has nothing to report.
+fn share_open_page(st: &mut AppState) {
+    let Some(link) = st.open_page_link() else {
+        return;
+    };
+    copy_link(st, &link.to_url());
+}
+
+/// Put a track's link on the clipboard.
+///
+/// A URI spot has already loaded a page or a queue from, so it parses — but a
+/// link that would not parse is one spot cannot be sure of, and a malformed
+/// string on the clipboard is worse than a refusal that says so.
+fn share_track(st: &mut AppState, uri: &str) {
+    match crate::link::parse(uri) {
+        Ok(link) => copy_link(st, &link.to_url()),
+        Err(_) => st.toast("that track has no link to share"),
+    }
+}
+
+/// The clipboard write both share paths end in, and the one place the result
+/// is reported.
+fn copy_link(st: &mut AppState, url: &str) {
+    match crate::clipboard::copy(url) {
+        Ok(()) => st.toast("spotify url copied to clipboard"),
+        Err(e) => st.toast(format!("could not copy: {e}")),
+    }
+}
+
 /// The deck's liked control, and `L` wherever there is no track row to mean.
 ///
 /// Reads the deck's subject rather than `playback` for the reason given on
@@ -2223,7 +2461,7 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
-    use crate::app::state::{AlbumItem, ArtistView, Playlist, TrackList, TrackListKind};
+    use crate::app::state::{AlbumItem, ArtistView, Credit, Playlist, TrackList, TrackListKind};
 
     fn track(name: &str, album_id: Option<&str>) -> Track {
         Track {
@@ -2235,7 +2473,10 @@ mod tests {
             duration_ms: 1000,
             track_number: 1,
             album_id: album_id.map(Into::into),
-            artist_id: Some("r1".into()),
+            credits: vec![Credit {
+                name: "Muse".into(),
+                id: Some("r1".into()),
+            }],
             cover_url: Some("https://i.scdn.co/image/abc".into()),
         }
     }
@@ -2255,6 +2496,10 @@ mod tests {
                 id: "a1".into(),
                 name: "Black Holes".into(),
                 artists: "Muse".into(),
+                credits: vec![Credit {
+                    name: "Muse".into(),
+                    id: Some("r1".into()),
+                }],
                 release_year: "2006".into(),
                 album_type: "album".into(),
                 album_group: "album".into(),
@@ -2940,6 +3185,86 @@ mod tests {
         assert!(st.last_main_click.is_some());
     }
 
+    /// The artist cell is a link the width of the name it prints. Past that
+    /// the row is only a row, so a click in the padding selects and arms the
+    /// double-click rather than opening a page the pointer never lit.
+    #[test]
+    fn the_artist_link_stops_where_its_name_does() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.spotify = SpotifyState::Ready;
+        st.hit.main_list = Rect::new(0, 0, 90, 10);
+        // A six-cell name on each of the first two rows, inside a column
+        // twenty cells wide.
+        st.hit.main_artist_links = (0..2)
+            .map(|row| {
+                (
+                    Rect::new(20, row, 6, 1),
+                    Credit {
+                        name: "Muse".into(),
+                        id: Some("r1".into()),
+                    },
+                )
+            })
+            .collect();
+
+        handle_click(&mut st, Position { x: 25, y: 1 }, &tx);
+        assert_eq!(st.main_index, 1, "the click did not select the row");
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::OpenArtist { .. })));
+        assert!(
+            st.last_main_click.is_none(),
+            "the artist cell armed a double-click"
+        );
+
+        // One cell past the name: the row, not the link.
+        handle_click(&mut st, Position { x: 26, y: 1 }, &tx);
+        assert!(rx.try_recv().is_err(), "the padding opened the artist");
+        assert!(st.last_main_click.is_some());
+    }
+
+    /// A record credits several artists on one line, and each name leads to a
+    /// different page. The one the pointer is on is the one that opens.
+    #[test]
+    fn each_name_of_a_credit_line_opens_its_own_artist() {
+        let (tx, mut rx) = channel();
+        let mut st = liked_state();
+        st.spotify = SpotifyState::Ready;
+        st.hit.main_list = Rect::new(0, 0, 90, 10);
+        // `Zedd, Alessia Cara` at column 20: two names with the separator
+        // between them belonging to neither.
+        st.hit.main_artist_links = vec![
+            (
+                Rect::new(20, 0, 4, 1),
+                Credit {
+                    name: "Zedd".into(),
+                    id: Some("zedd".into()),
+                },
+            ),
+            (
+                Rect::new(26, 0, 12, 1),
+                Credit {
+                    name: "Alessia Cara".into(),
+                    id: Some("cara".into()),
+                },
+            ),
+        ];
+
+        handle_click(&mut st, Position { x: 30, y: 0 }, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::OpenArtist { ref id, ref name, .. })
+                if id == "cara" && name == "Alessia Cara"
+        ));
+
+        // The `, ` between them is not a third control.
+        handle_click(&mut st, Position { x: 25, y: 0 }, &tx);
+        assert!(rx.try_recv().is_err(), "the separator opened an artist");
+        assert!(
+            st.last_main_click.is_some(),
+            "the click did not fall through to the row"
+        );
+    }
+
     /// The `+` beside it opens the box for that row's record, not for whatever
     /// is playing — and like the star, it does not arm a double-click.
     #[test]
@@ -3212,7 +3537,13 @@ mod tests {
         st.push_view();
         start_playing(&mut st);
         st.show_player = true;
-        st.hit.now_artist = Rect::new(4, 9, 6, 1);
+        st.hit.now_artist_links = vec![(
+            Rect::new(4, 9, 6, 1),
+            Credit {
+                name: "Muse".into(),
+                id: Some("r1".into()),
+            },
+        )];
 
         handle_click(&mut st, Position { x: 5, y: 9 }, &tx);
         assert!(!st.show_player, "the click did not leave the player");
@@ -3425,6 +3756,149 @@ mod tests {
         assert_eq!(labels(&st), ["playlists", "trendy"]);
     }
 
+    /// The search box takes a pasted link as well as a query.
+    ///
+    /// This is the whole of the `open.spotify.com` story: Windows can route the
+    /// `spotify:` scheme to an app but cannot route an https host, so a link
+    /// copied out of a browser has no way in but this one.
+    #[test]
+    fn a_pasted_link_opens_rather_than_searching() {
+        const ID: &str = "4uLU6hMCjMI75M1A2tKUQC";
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(connected()));
+
+        for (typed, expected) in [
+            (
+                format!("https://open.spotify.com/album/{ID}?si=x"),
+                crate::link::Link::Album(ID.into()),
+            ),
+            (
+                format!("spotify:track:{ID}"),
+                crate::link::Link::Track(ID.into()),
+            ),
+            (
+                format!("spotify:user:someone:playlist:{ID}"),
+                crate::link::Link::Playlist(ID.into()),
+            ),
+        ] {
+            {
+                let mut st = state.write();
+                st.input_mode = InputMode::Search;
+                st.input_buffer = typed.clone();
+            }
+            handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+            match rx.try_recv() {
+                Ok(AppCommand::OpenLink(target)) => assert_eq!(target, expected, "{typed}"),
+                other => panic!("{typed} sent {other:?}"),
+            }
+            // Sent rather than navigated: the page is still a fetch away, so
+            // nothing may be pushed for it yet.
+            assert!(state.read().view_stack.is_empty(), "{typed}");
+        }
+    }
+
+    /// A query is still a query. Only what parses as a link is diverted, or
+    /// the box would stop being a search box.
+    #[test]
+    fn ordinary_text_still_searches() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(connected()));
+        state.write().input_mode = InputMode::Search;
+        state.write().input_buffer = "drive-by truckers".to_string();
+
+        handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "drive-by truckers"));
+    }
+
+    /// A podcast link is a Spotify link spot cannot play. It says so rather
+    /// than searching for the URL as if it were words.
+    #[test]
+    fn a_podcast_link_says_so_rather_than_searching() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(connected()));
+        state.write().input_mode = InputMode::Search;
+        state.write().input_buffer =
+            "https://open.spotify.com/episode/4uLU6hMCjMI75M1A2tKUQC".to_string();
+
+        handle_search_input(KeyEvent::from(KeyCode::Enter), &state, &tx);
+        assert!(rx.try_recv().is_err(), "nothing is fetched");
+        let said = state.read().toast.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            said.as_deref().is_some_and(|t| t.contains("podcasts")),
+            "{said:?}"
+        );
+    }
+
+    /// What the client does once a link resolves: the page opens the way a
+    /// click on the same record would, so `Esc` returns one step rather than
+    /// none or two.
+    #[test]
+    fn a_resolved_link_lands_on_the_back_stack_like_a_click() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        assert!(st.view_stack.is_empty());
+
+        navigate(
+            &mut st,
+            AppCommand::OpenAlbum {
+                id: "alb".into(),
+                name: "Global Warming".into(),
+                credits: vec![Credit {
+                    name: "Pitbull".into(),
+                    id: Some("pit".into()),
+                }],
+                year: "2012".into(),
+                cover_url: None,
+            },
+            &tx,
+        );
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::OpenAlbum { .. })));
+        assert_eq!(st.view_stack.len(), 1, "exactly one step back");
+    }
+
+    /// The second press that claims the `spotify:` scheme has to belong to the
+    /// Links row, not to the screen. Anything that moves away puts the
+    /// question back, so a press landing somewhere else can never answer it.
+    #[test]
+    fn walking_away_from_the_links_row_asks_again() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        let armed = || Some("Enter again to replace Spotify".to_string());
+
+        st.links.confirming = armed();
+        move_selection(&mut st, 1);
+        assert!(st.links.confirming.is_none(), "moving off it");
+
+        st.links.confirming = armed();
+        set_selection(&mut st, 0);
+        assert!(st.links.confirming.is_none(), "clicking another row");
+
+        st.links.confirming = armed();
+        navigate(&mut st, AppCommand::LoadLikedSongs, &tx);
+        assert!(st.links.confirming.is_none(), "leaving Home");
+        let _ = rx.try_recv();
+
+        // Staying put does not. `j` at the bottom of the list moves nothing
+        // and is not an answer either way — and the bottom is where Links
+        // sits.
+        let mut st = connected();
+        let bottom = st.main_len() - 1;
+        set_selection(&mut st, bottom);
+        st.links.confirming = armed();
+        move_selection(&mut st, 1);
+        assert_eq!(st.main_index, bottom);
+        assert!(st.links.confirming.is_some(), "staying on it");
+    }
+
+    /// Home's rows without the Links entry, which turns on the platform rather
+    /// than on the account and is a control rather than a destination.
+    fn destinations(st: &AppState) -> Vec<HomeItem> {
+        st.home_items()
+            .into_iter()
+            .filter(|item| *item != HomeItem::Links)
+            .collect()
+    }
+
     /// Liked Songs and Discover Weekly are Home rows of their own. Discover
     /// Weekly is Spotify's, so it is only a row when you follow it — and only
     /// when Spotify is the one who made it.
@@ -3433,21 +3907,21 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = connected();
         assert_eq!(
-            st.home_items(),
+            destinations(&st),
             vec![HomeItem::LikedSongs, HomeItem::Playlists, HomeItem::Radio]
         );
 
         // Someone else's playlist of the same name is not Spotify's.
         st.set_playlists(vec![playlist("p1", "Discover Weekly", "dm")]);
         assert_eq!(
-            st.home_items(),
+            destinations(&st),
             vec![HomeItem::LikedSongs, HomeItem::Playlists, HomeItem::Radio]
         );
 
         st.playlists
             .push(playlist("dw", "Discover Weekly", "spotify"));
         assert_eq!(
-            st.home_items(),
+            destinations(&st),
             vec![
                 HomeItem::LikedSongs,
                 HomeItem::DiscoverWeekly,
@@ -3595,10 +4069,14 @@ mod tests {
         let mut st = AppState::new();
         let mut list = TrackList::new("Black Holes", "Muse · 2006", None);
         list.kind = TrackListKind::Album;
+        list.header.credits = vec![Credit {
+            name: "Muse".into(),
+            id: Some("r1".into()),
+        }];
         list.append(vec![track("Starlight", Some("a1"))]);
         st.main = MainView::Tracks(list);
 
-        // Empty stack: up to the artist the tracks credit.
+        // Empty stack: up to the artist the header credits.
         go_back_or_up(&mut st, &tx);
         match rx.try_recv() {
             Ok(AppCommand::OpenArtist { id, uri, name }) => {
@@ -3613,10 +4091,12 @@ mod tests {
         assert_eq!(st.view_stack.len(), 1);
     }
 
-    /// The deck draws the queue's name in both views, so clicking it is the
-    /// mouse's `v`: it opens the player and closes it again.
+    /// The deck draws the queue's name in both views, and it means the list
+    /// under it in each: from the bar that list is a screen away, so the name
+    /// opens the player; in the player it is right there, so the name folds it
+    /// away and back.
     #[test]
-    fn clicking_the_queue_name_toggles_the_player_view() {
+    fn the_queue_name_opens_the_player_then_folds_the_queue() {
         let (tx, mut rx) = channel();
         let mut st = AppState::new();
         st.hit.queue_name = Rect {
@@ -3632,13 +4112,18 @@ mod tests {
         // Nothing to fetch on the way in: the queue is always present and
         // always correct, because spot wrote it on the play.
         assert!(rx.try_recv().is_err());
+        assert!(!st.queue_folded, "the queue opened folded");
 
         handle_click(&mut st, on_name, &tx);
-        assert!(!st.show_player, "clicking it again should close the player");
+        assert!(st.queue_folded, "the name should fold the queue");
+        assert!(st.show_player, "folding the queue closed the player");
 
-        // A click that misses the name leaves the view where it was.
+        handle_click(&mut st, on_name, &tx);
+        assert!(!st.queue_folded, "the name should unfold the queue");
+
+        // A click that misses the name leaves both where they were.
         handle_click(&mut st, Position { x: 40, y: 9 }, &tx);
-        assert!(!st.show_player);
+        assert!(st.show_player && !st.queue_folded);
     }
 
     fn test_station(uuid: &str, name: &str) -> Station {
@@ -3671,6 +4156,7 @@ mod tests {
             is_playing: true,
             started_at: Instant::now(),
             title: Arc::new(parking_lot::Mutex::new(None)),
+            channels: Default::default(),
             volume_percent: 50,
             matched: Default::default(),
             failure: None,
@@ -3686,8 +4172,13 @@ mod tests {
     fn the_home_radio_row_opens_the_chart() {
         let (tx, mut rx) = channel();
         let mut st = connected();
-        st.main_index = st.home_items().len() - 1;
-        assert_eq!(st.home_items()[st.main_index], HomeItem::Radio);
+        // Found rather than assumed last: the Links row sits below Radio on
+        // Windows.
+        st.main_index = st
+            .home_items()
+            .iter()
+            .position(|item| *item == HomeItem::Radio)
+            .expect("Home always offers Radio");
 
         activate_selection(&mut st, &tx);
         assert!(matches!(
@@ -3972,6 +4463,10 @@ mod tests {
             id: "a2".into(),
             name: "Hysteria".into(),
             artists: "Muse".into(),
+            credits: vec![Credit {
+                name: "Muse".into(),
+                id: Some("r1".into()),
+            }],
             release_year: "2003".into(),
             album_type: "single".into(),
             album_group: "single".into(),
@@ -4027,6 +4522,10 @@ mod tests {
             id: "a2".into(),
             name: "Hysteria".into(),
             artists: "Muse".into(),
+            credits: vec![Credit {
+                name: "Muse".into(),
+                id: Some("r1".into()),
+            }],
             release_year: "2003".into(),
             album_type: "single".into(),
             album_group: "single".into(),
@@ -4799,7 +5298,13 @@ mod tests {
         start_playing(&mut st);
         st.radio = Some(matched_radio());
         st.show_player = true;
-        st.hit.now_artist = Rect::new(4, 9, 6, 1);
+        st.hit.now_artist_links = vec![(
+            Rect::new(4, 9, 6, 1),
+            Credit {
+                name: "Muse".into(),
+                id: Some("r1".into()),
+            },
+        )];
 
         handle_click(&mut st, Position { x: 5, y: 9 }, &tx);
         assert!(

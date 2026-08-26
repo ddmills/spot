@@ -104,6 +104,52 @@ with Spotify and can't be changed. Radio goes on playing either way.
   looked up, named and given its sleeve — the library and the transport are what Premium
   buys.
 
+## Spotify links
+
+Paste a link into the search box. Press `/`, paste, `Enter`, and spot opens what it names — an
+album, an artist or a playlist as a page, a track by playing it. Both spellings work:
+
+```
+spotify:album:4aawyAB9vmqN3uQ7FjRGTy
+https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy?si=...
+```
+
+The same link works on the command line, and goes to the spot you already have open rather than
+starting a second one:
+
+```
+spot.exe spotify:track:2epTBfyHb0b3IPvkghf9aj
+```
+
+Links go the other way too. Every track row ends in `★ ⧉ +`, and the `⧉` between them puts
+that record's `https://open.spotify.com/track/...` on the clipboard; the same control sits on
+the bottom bar and in the player view for whatever is playing. An album, artist or playlist
+page carries `⧉ share` beside its `▶ shuffle`, which copies the link to the page itself. Liked
+Songs has none: its only link resolves to whoever opens it rather than to what you are looking
+at.
+
+### Opening clicked links in spot
+
+Windows sends every `spotify:` link to whichever app claims that scheme — normally the Spotify
+desktop app. spot can take it over, and this is **off until you turn it on**:
+
+- On Home, open the **Spotify links** row. It says where links go now; `Enter` claims them. If
+  another app holds the scheme, the first `Enter` names it and asks again — the second one does
+  it. `Enter` on the row afterwards gives them straight back.
+- Or from a shell: `spot.exe --register-protocol`, undone by `spot.exe --unregister-protocol`.
+  Registering refuses to displace an app that already holds the scheme unless you add `--force`.
+
+spot keeps whatever command it replaced and puts it back exactly when you turn this off. Nothing
+is written until you ask: running spot, updating it and opening links all leave the setting alone.
+The change is to your account only (`HKCU`), so it needs no administrator and reaches no one else.
+
+One thing spot cannot do for you: if you have ever answered Windows' own *"How do you want to open
+this?"* for Spotify links, that answer outranks any app and only you can change it, in **Settings →
+Apps → Default apps**. spot says so plainly when it hits this rather than appearing to work.
+
+`https://open.spotify.com/...` links always open in your browser — Windows routes schemes to apps,
+not web addresses. Paste those into `/`.
+
 ## Updating
 
 spot asks GitHub for the newest release once at startup. When there is one, an **Update
@@ -119,6 +165,9 @@ a failed check is silent — spot works offline apart from the music.
 
 - `%APPDATA%\spot\auth.json` — the Web API refresh token
 - `%APPDATA%\spot\radio.json` — your saved radio stations
+- `%APPDATA%\spot\protocol.json` — written only when you turn on **Spotify links**: what spot
+  replaced, so it can put it back. Turn the row off before deleting it, or spot has nothing left
+  to restore.
 - `%LOCALAPPDATA%\spot\creds` — the playback session credentials
 - `%LOCALAPPDATA%\spot\audio` — streamed audio cache, capped at 2 GiB
 - `%LOCALAPPDATA%\spot\spot.log` — the log, rewritten each run
@@ -273,7 +322,7 @@ is a worse answer than a row that says why it won't play.
 | `E` | edit the name and blurb of a playlist you own |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction (every list, or click a column header) |
-| `/` | search Spotify and the radio directory at once |
+| `/` | search Spotify and the radio directory at once, or paste a Spotify link |
 | `R` | refresh the current view and your playlists |
 | `?` | help overlay, which also names the running version |
 | `q`, `Ctrl-c` | quit |

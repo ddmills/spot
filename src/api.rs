@@ -10,7 +10,9 @@ use rspotify::model::{
 use rspotify::{AuthCodeSpotify, Token};
 use serde::Deserialize;
 
-use crate::app::state::{AlbumItem, ArtistItem, Playlist, SearchResults, Track, track_id};
+use crate::app::state::{
+    AlbumItem, ArtistItem, Credit, Playlist, SearchResults, Track, artists_line, track_id,
+};
 
 pub const PAGE_LIMIT: u32 = 50;
 /// Pages of an artist's catalogue to walk before giving up on the rest.
@@ -26,6 +28,10 @@ pub struct Account {
 
 /// Everything the artist page is built from.
 pub struct ArtistOverview {
+    /// Empty when Spotify does not answer for the artist. A page opened from a
+    /// link has no other source for it — every other way in arrives from a row
+    /// that already names the artist.
+    pub name: String,
     pub top: Vec<Track>,
     pub albums: Vec<AlbumItem>,
     pub image_url: Option<String>,
@@ -57,6 +63,7 @@ struct RawAlbum {
 
 #[derive(Deserialize)]
 struct RawArtist {
+    id: Option<String>,
     name: String,
 }
 
@@ -333,6 +340,41 @@ impl Api {
         ))
     }
 
+    /// One album's own metadata, for a link that names an album and nothing
+    /// else.
+    ///
+    /// Every other way into an album page arrives from a row that already
+    /// carries the name, the artists and the year — which is why
+    /// [`Api::album_tracks_page`] asks its caller for them.
+    pub async fn album(&self, album_id: &str) -> Result<AlbumItem> {
+        let id = AlbumId::from_id(album_id.to_owned())?;
+        let album = self.client.album(id.as_ref(), None).await?;
+        let credits = credits(&album.artists);
+        Ok(AlbumItem {
+            id: album.id.id().to_string(),
+            name: album.name,
+            artists: artists_line(&credits),
+            credits,
+            release_year: release_year(Some(&album.release_date)),
+            // Spells to the same snake_case the artist page's raw read
+            // reports, so the two sources of an `AlbumItem` agree.
+            album_type: <&'static str>::from(album.album_type).to_string(),
+            // Meaningful only against an artist, and a link reaches an album
+            // without one.
+            album_group: String::new(),
+            track_count: album.tracks.total,
+            cover_url: crate::cover::pick_url(&album.images),
+        })
+    }
+
+    /// One track's own metadata, for a link that names a track and nothing
+    /// else.
+    pub async fn track(&self, track_id: &str) -> Result<Track> {
+        let id = TrackId::from_id(track_id.to_owned())?;
+        let track = self.client.track(id.as_ref(), None).await?;
+        track_from_full(&track).context("Spotify returned a track with no id")
+    }
+
     /// Everything the artist page draws, fetched in one pass.
     ///
     /// Three concurrent calls: the artist (for the photo the header band
@@ -353,18 +395,19 @@ impl Api {
                 Vec::new()
             }
         };
-        let (image_url, genres) = match artist {
+        let (name, image_url, genres) = match artist {
             // `genres` is deprecated and usually absent now; an empty list is
             // the normal case rather than a failure, and the band omits the
             // line when it comes back empty.
             #[allow(deprecated)]
-            Ok(a) => (crate::cover::pick_url(&a.images), a.genres),
+            Ok(a) => (a.name, crate::cover::pick_url(&a.images), a.genres),
             Err(e) => {
                 log::warn!("artist details unavailable: {e:#}");
-                (None, Vec::new())
+                (String::new(), None, Vec::new())
             }
         };
         Ok(ArtistOverview {
+            name,
             top,
             albums: albums?,
             image_url,
@@ -682,29 +725,43 @@ fn unescape_html(s: &str) -> String {
     out
 }
 
-fn artists_line(artists: &[rspotify::model::SimplifiedArtist]) -> String {
+/// Every credited artist, in the order Spotify credits them.
+///
+/// The whole list rather than the first name and the first id: each name is a
+/// link of its own, and the ids of the rest arrive in the same response.
+fn credits(artists: &[rspotify::model::SimplifiedArtist]) -> Vec<Credit> {
     artists
         .iter()
-        .map(|a| a.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .map(|a| Credit {
+            name: a.name.clone(),
+            id: a.id.as_ref().map(|id| id.id().to_string()),
+        })
+        .collect()
+}
+
+/// [`credits`], for the one endpoint spot reads raw — see [`RawAlbum`].
+fn raw_credits(artists: &[RawArtist]) -> Vec<Credit> {
+    artists
+        .iter()
+        .map(|a| Credit {
+            name: a.name.clone(),
+            id: a.id.clone(),
+        })
+        .collect()
 }
 
 fn track_from_full(t: &FullTrack) -> Option<Track> {
+    let credits = credits(&t.artists);
     Some(Track {
         uri: t.id.as_ref()?.uri(),
         name: t.name.clone(),
-        artists: artists_line(&t.artists),
+        artists: artists_line(&credits),
         album: t.album.name.clone(),
         release_year: release_year(t.album.release_date.as_deref()),
         duration_ms: t.duration.num_milliseconds().max(0) as u64,
         track_number: t.track_number,
         album_id: t.album.id.as_ref().map(|id| id.id().to_string()),
-        artist_id: t
-            .artists
-            .first()
-            .and_then(|a| a.id.as_ref())
-            .map(|id| id.id().to_string()),
+        credits,
         // Comes back on the album object every full track carries, so opening
         // the album from this row costs no extra round trip.
         cover_url: crate::cover::pick_url(&t.album.images),
@@ -717,20 +774,17 @@ fn track_from_simplified(
     album_name: &str,
     year: &str,
 ) -> Option<Track> {
+    let credits = credits(&t.artists);
     Some(Track {
         uri: t.id.as_ref()?.uri(),
         name: t.name.clone(),
-        artists: artists_line(&t.artists),
+        artists: artists_line(&credits),
         album: album_name.to_string(),
         release_year: year.to_string(),
         duration_ms: t.duration.num_milliseconds().max(0) as u64,
         track_number: t.track_number,
         album_id: Some(album_id.to_string()),
-        artist_id: t
-            .artists
-            .first()
-            .and_then(|a| a.id.as_ref())
-            .map(|id| id.id().to_string()),
+        credits,
         // An album's track list does not repeat the album object per track,
         // and these rows name the album whose page they are already on.
         cover_url: None,
@@ -764,10 +818,12 @@ fn release_year(date: Option<&str>) -> String {
 
 fn album_from_simplified(a: &SimplifiedAlbum) -> Option<AlbumItem> {
     let id = a.id.as_ref()?;
+    let credits = credits(&a.artists);
     Some(AlbumItem {
         id: id.id().to_string(),
         name: a.name.clone(),
-        artists: artists_line(&a.artists),
+        artists: artists_line(&credits),
+        credits,
         release_year: release_year(a.release_date.as_deref()),
         album_type: a.album_type.clone().unwrap_or_default(),
         // Neither is modelled by rspotify's `SimplifiedAlbum`; only the artist
@@ -781,15 +837,12 @@ fn album_from_simplified(a: &SimplifiedAlbum) -> Option<AlbumItem> {
 }
 
 fn album_from_raw(a: &RawAlbum) -> Option<AlbumItem> {
+    let credits = raw_credits(&a.artists);
     Some(AlbumItem {
         id: a.id.clone()?,
         name: a.name.clone(),
-        artists: a
-            .artists
-            .iter()
-            .map(|x| x.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
+        artists: artists_line(&credits),
+        credits,
         release_year: release_year(a.release_date.as_deref()),
         album_type: a.album_type.clone().unwrap_or_default(),
         // Spotify sends `album_group` only on this endpoint. Where it is

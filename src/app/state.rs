@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use ratatui::layout::{Position, Rect};
@@ -7,6 +8,7 @@ use ratatui::widgets::ListState;
 
 use crate::app::queue::Queue;
 use crate::audio_tap::AudioTap;
+use crate::link::Link;
 pub use crate::ui::columns::ColKey;
 
 /// Transport state of spot's own player. Everything about *what* is playing
@@ -55,10 +57,40 @@ impl Playback {
     }
 }
 
+/// One credited artist: the name as printed, and the page it leads to.
+///
+/// `id` is `None` where the source named an artist without identifying one —
+/// a radio station's announcement, most often. Such a credit still prints; it
+/// simply leads nowhere, the same rule a station's country follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Credit {
+    pub name: String,
+    pub id: Option<String>,
+}
+
+/// The credit line as one string: what a row sorts and searches by.
+///
+/// The only place credits are joined, so the line and the runs drawn from
+/// [`Credit`] cannot come to disagree about where a name ends.
+pub fn artists_line(credits: &[Credit]) -> String {
+    credits
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(CREDIT_SEP)
+}
+
+/// What separates two credits, wherever they are printed. Dim and inert: each
+/// name is a target of its own and the comma is not a third one.
+pub const CREDIT_SEP: &str = ", ";
+
 #[derive(Debug, Clone)]
 pub struct Track {
     pub uri: String,
     pub name: String,
+    /// The credit line, joined by [`artists_line`]. Held rather than derived:
+    /// it is the sort key and the search haystack of every table, and a
+    /// `String` built per comparison is worse than one built per row.
     pub artists: String,
     pub album: String,
     /// Four-digit year, or empty when Spotify has no release date.
@@ -67,8 +99,10 @@ pub struct Track {
     /// Position within its album disc; 0 when unknown.
     pub track_number: u32,
     pub album_id: Option<String>,
-    /// The first credited artist's id.
-    pub artist_id: Option<String>,
+    /// Every credited artist, in the order Spotify credits them. Each name is
+    /// its own link, so this is what the UI draws and hit-tests against;
+    /// [`Self::artists`] is the same names joined.
+    pub credits: Vec<Credit>,
     /// CDN URL of the album's sleeve, when the row's source reported one, so
     /// opening the album from this row shows its artwork straight away rather
     /// than degrading to the text-only header band.
@@ -106,7 +140,11 @@ pub struct Playlist {
 pub struct AlbumItem {
     pub id: String,
     pub name: String,
+    /// The credit line, joined by [`artists_line`], on the same terms as
+    /// [`Track::artists`].
     pub artists: String,
+    /// Every credited artist, on the same terms as [`Track::credits`].
+    pub credits: Vec<Credit>,
     /// Four-digit year, or empty when Spotify has no release date.
     pub release_year: String,
     /// "album", "single", or "compilation"; may be empty.
@@ -540,8 +578,13 @@ impl Sortable for Station {
 impl Sortable for RadioRow {
     fn cell(&self, key: ColKey) -> SortCell {
         match self {
-            RadioRow::Facet { label, count, .. } => match key {
+            RadioRow::Facet {
+                key: code,
+                label,
+                count,
+            } => match key {
                 ColKey::Name | ColKey::Title | ColKey::Station => SortCell::text(label),
+                ColKey::Code => SortCell::text(code),
                 ColKey::Stations => SortCell::Num(u64::from(*count)),
                 _ => SortCell::None,
             },
@@ -561,7 +604,14 @@ impl Sortable for RadioRow {
 pub struct ViewHeader {
     pub name: String,
     /// e.g. "by owner" for playlists, "Artist · 2011" for albums.
+    ///
+    /// What the band prints where it has no [`Self::credits`] to print
+    /// instead. An album has both: the string is what a narrow band falls
+    /// back to, and the credits are what the full one draws as links.
     pub subtitle: String,
+    /// The page's own credited artists, each a link. Empty on every page that
+    /// is not about a record — a playlist is by its owner, not by an artist.
+    pub credits: Vec<Credit>,
     /// CDN URL of the sleeve, for the header band to draw.
     ///
     /// A playlist sets it only when it has a cover of its own: an
@@ -603,6 +653,9 @@ pub enum HomeItem {
     Playlists,
     Radio,
     Spotify,
+    /// Whether a Spotify link clicked anywhere on this machine opens in spot.
+    /// A control rather than a destination, the way [`HomeItem::Update`] is.
+    Links,
 }
 
 impl HomeItem {
@@ -615,13 +668,14 @@ impl HomeItem {
     ///
     /// [`HomeItem::Update`] leads because it is the one row that is about the
     /// app rather than about music, and it is absent on almost every run.
-    pub const ALL: [HomeItem; 6] = [
+    pub const ALL: [HomeItem; 7] = [
         HomeItem::Update,
         HomeItem::LikedSongs,
         HomeItem::DiscoverWeekly,
         HomeItem::Playlists,
         HomeItem::Radio,
         HomeItem::Spotify,
+        HomeItem::Links,
     ];
 
     pub fn title(self) -> &'static str {
@@ -632,12 +686,13 @@ impl HomeItem {
             HomeItem::Playlists => "Playlists",
             HomeItem::Radio => "Radio",
             HomeItem::Spotify => "Spotify",
+            HomeItem::Links => "Spotify links",
         }
     }
 
     /// The dim line under the name, saying what the destination holds.
     ///
-    /// The Spotify row's line depends on how far the connection got, so it is
+    /// The Spotify, Update and Links rows have lines that move, so it is
     /// [`AppState::home_blurb`] that the screen asks.
     pub fn blurb(self) -> &'static str {
         match self {
@@ -647,8 +702,30 @@ impl HomeItem {
             HomeItem::Playlists => "saved and followed",
             HomeItem::Radio => "live stations from around the world",
             HomeItem::Spotify => "connect an account to play your library",
+            HomeItem::Links => "where a clicked Spotify link opens",
         }
     }
+}
+
+/// What the Links row knows, read rather than assumed.
+///
+/// The answer lives in the registry, where another app can change it between
+/// runs, so spot reads it at startup and again after the row acts. It is kept
+/// here rather than read per frame: it almost never moves, and a syscall to
+/// draw one dim line would be a poor trade.
+#[derive(Debug, Clone, Default)]
+pub struct LinksRow {
+    /// The line the row shows — see `protocol::Registration::describe`.
+    pub status: String,
+    /// Whether a clicked Spotify link reaches spot right now.
+    pub in_force: bool,
+    /// The prompt the row shows while it waits for the second press that
+    /// claims the scheme, naming the app that press would displace. `None`
+    /// when the row is not armed, which is every state but that one.
+    ///
+    /// Claiming reaches outside spot and breaks another app's links, so it
+    /// takes two deliberate presses. Giving it back takes one.
+    pub confirming: Option<String>,
 }
 
 /// How much of Spotify spot has.
@@ -864,6 +941,12 @@ pub struct RadioPlayback {
     /// about six popular stations in ten do. Written from the decoder thread,
     /// which is why it is behind its own lock rather than a plain field.
     pub title: Arc<parking_lot::Mutex<Option<String>>>,
+    /// How many channels the stream decodes to, or 0 before the decoder has
+    /// identified it. The directory reports a codec and a bitrate but never a
+    /// channel count, so this is the only place stereo and mono are told apart.
+    /// Written by the tune-in task rather than the decoder thread, but shared
+    /// for the same reason [`Self::title`] is: the deck reads it every frame.
+    pub channels: Arc<AtomicU8>,
     pub volume_percent: u8,
     /// What Spotify has for [`Self::title`], once the client has looked.
     ///
@@ -905,34 +988,33 @@ impl Track {
         Some(crate::app::command::AppCommand::OpenAlbum {
             id: id.clone(),
             name: self.album.clone(),
-            artists: self.artists.clone(),
+            credits: self.credits.clone(),
             year: self.release_year.clone(),
             cover_url: self.cover_url.clone(),
         })
     }
 
-    /// The `OpenArtist` this record's artist name leads to, when it has one.
+    /// The `OpenArtist` this record's *first* credited artist leads to.
+    ///
+    /// What a keypress opens: `B` has no pointer to say which of several names
+    /// it meant, so it takes the one the record is filed under. A click
+    /// resolves the name under it instead — see `HitAreas::main_artist_links`.
     pub fn open_artist(&self) -> Option<crate::app::command::AppCommand> {
-        let id = self.artist_id.as_deref()?;
-        Some(crate::app::command::AppCommand::OpenArtist {
-            id: id.to_string(),
-            uri: format!("spotify:artist:{id}"),
-            name: first_artist(&self.artists),
-        })
+        open_artist(self.credits.first()?)
     }
 }
 
-/// The first name in a comma-joined credit list.
+/// The `OpenArtist` a credit leads to, when Spotify identified the artist.
 ///
-/// Spotify credits several artists on one string and only the first has an id
-/// on the rows we hold, so it is the only one a page can be opened for.
-pub fn first_artist(artists: &str) -> String {
-    artists
-        .split(',')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+/// One resolution for every control that opens an artist — the deck's link,
+/// `B`, an Artist column, a masthead's credit line — so they cannot drift.
+pub fn open_artist(credit: &Credit) -> Option<crate::app::command::AppCommand> {
+    let id = credit.id.as_deref()?;
+    Some(crate::app::command::AppCommand::OpenArtist {
+        id: id.to_string(),
+        uri: format!("spotify:artist:{id}"),
+        name: credit.name.clone(),
+    })
 }
 
 /// What Spotify has for the track a station just announced.
@@ -957,18 +1039,55 @@ pub enum RadioMatch {
     Matched(Box<Track>),
 }
 
+/// What a station nobody is listening to is announcing.
+///
+/// A state machine for the same reason [`RadioMatch`] is one: "we have not
+/// asked yet", "it says nothing" and "it would not answer" are three different
+/// facts about a row, and one blank cell cannot tell them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NowStatus {
+    /// A probe is out for this station.
+    Probing,
+    Title(String),
+    /// Reached, and announcing nothing. Roughly four popular stations in ten
+    /// interleave no metadata at all.
+    Quiet,
+    Unreachable,
+}
+
+/// One station's announcement and when it was read.
+///
+/// The stamp is what bounds the traffic: a row is re-probed only once its
+/// reading is older than the client's `NOW_TTL`.
+#[derive(Debug, Clone)]
+pub struct StationNow {
+    pub status: NowStatus,
+    pub checked_at: Instant,
+}
+
+impl StationNow {
+    pub fn new(status: NowStatus) -> Self {
+        Self {
+            status,
+            checked_at: Instant::now(),
+        }
+    }
+}
+
 impl RadioPlayback {
     /// A station that has just started: playing, announcing nothing yet.
     pub fn new(
         station: Station,
         volume_percent: u8,
         title: Arc<parking_lot::Mutex<Option<String>>>,
+        channels: Arc<AtomicU8>,
     ) -> Self {
         Self {
             station,
             is_playing: true,
             started_at: Instant::now(),
             title,
+            channels,
             volume_percent,
             matched: RadioMatch::None,
             failure: None,
@@ -985,6 +1104,16 @@ impl RadioPlayback {
     /// The announced track, if there is one worth drawing.
     pub fn now_title(&self) -> Option<String> {
         self.title.lock().clone()
+    }
+
+    /// How the stream is mixed, once the decoder has identified it.
+    pub fn channel_label(&self) -> Option<String> {
+        match self.channels.load(Ordering::Relaxed) {
+            0 => None,
+            1 => Some("mono".to_string()),
+            2 => Some("stereo".to_string()),
+            n => Some(format!("{n} ch")),
+        }
     }
 
     /// The Spotify record behind the announcement, if one was found.
@@ -1032,6 +1161,7 @@ impl TrackList {
             header: ViewHeader {
                 name: name.into(),
                 subtitle: subtitle.into(),
+                credits: Vec::new(),
                 cover_url: None,
                 description: String::new(),
                 owner_id: String::new(),
@@ -1338,8 +1468,11 @@ pub fn playlist_key(id: &str) -> String {
     format!("{PLAYLIST_KEY_PREFIX}{id}")
 }
 
+/// Head of every album page's cache key, the twin of [`PLAYLIST_KEY_PREFIX`].
+pub const ALBUM_KEY_PREFIX: &str = "album:";
+
 pub fn album_key(id: &str) -> String {
-    format!("album:{id}")
+    format!("{ALBUM_KEY_PREFIX}{id}")
 }
 
 /// The bare id at the tail of a Spotify URI.
@@ -1526,6 +1659,39 @@ pub struct PlaylistEdit {
     pub seq: u64,
 }
 
+/// A table column of clickable text, and how much of each row that text fills.
+///
+/// `rect` is the column, so a row still comes from the pointer's y; `widths`
+/// is what each row on screen actually prints in it, from the top row down.
+///
+/// A cell padded out to its column width is mostly empty. The pill that lights
+/// under the pointer covers the text alone (see `ui::main_pane::cell_spans`),
+/// so the target has to be the same run — a click landing in the padding of a
+/// short name would otherwise open a page nothing on screen offered.
+///
+/// The band plus a width per row, rather than a rect per row: one cell of a
+/// column holds one link, so the row the pointer is on is the whole of what a
+/// click has to resolve, and the band is what the hover pill is measured in.
+/// A column whose cell holds *several* links cannot be spelled this way — see
+/// [`HitAreas::main_artist_links`], which keeps a rect per name instead.
+#[derive(Debug, Default, Clone)]
+pub struct TextCol {
+    pub rect: Rect,
+    pub widths: Vec<u16>,
+}
+
+impl TextCol {
+    /// Whether `at` is on a row's printed text rather than on its padding.
+    pub fn hit(&self, at: Position) -> bool {
+        if !self.rect.contains(at) {
+            return false;
+        }
+        let row = (at.y - self.rect.y) as usize;
+        let width = self.widths.get(row).copied().unwrap_or(0);
+        at.x - self.rect.x < width
+    }
+}
+
 /// Screen regions recorded during draw, used to resolve mouse events.
 /// Reset at the start of every frame; a region not drawn that frame stays
 /// zero-sized and can never be hit.
@@ -1548,10 +1714,10 @@ pub struct HitAreas {
     /// The always-on search row at the top of the browse screen.
     pub search_box: Rect,
     /// The playback status opposite the mark on the nav row — `● STREAMING`,
-    /// `● RADIO`, `● LOADING`. Toggles the player view, like
-    /// [`Self::queue_name`]: the two are the same control said in the two
-    /// places you are looking when you want it. Empty when nothing is playing,
-    /// which is when there is no player worth opening.
+    /// `● RADIO`, `● LOADING`. Toggles the player view from either screen, so
+    /// the mouse has a way in and back out on the row it is already reading.
+    /// Empty when nothing is playing, which is when there is no player worth
+    /// opening.
     pub status: Rect,
     pub search_tabs: Vec<(Rect, SearchTab)>,
     /// The radio page's tab strip, in the same spirit as [`Self::search_tabs`].
@@ -1592,9 +1758,20 @@ pub struct HitAreas {
     /// The save control in a playlist's header band. Empty on a playlist you
     /// own, where unsaving is how Spotify spells deleting.
     pub header_save_btn: Rect,
+    /// The share control in a header band, right of the shuffle button: copies
+    /// the Spotify link to the page itself. Empty where the page has no link of
+    /// its own to give — see [`AppState::open_page_link`].
+    pub header_share_btn: Rect,
     /// The edit control in a playlist's header band. Empty on a playlist you
     /// do not own, which Spotify refuses the change for.
     pub header_edit_btn: Rect,
+    /// The credited artists on a header band's own line, on the same terms as
+    /// [`Self::main_artist_links`]. Empty on every page that is not about a
+    /// record.
+    pub header_artist_links: Vec<(Rect, Credit)>,
+    /// The Artist column of an album table, on the same terms as
+    /// [`Self::main_artist_links`].
+    pub album_artist_links: Vec<(Rect, Credit)>,
     /// The two fields of the edit box, and its save control.
     pub edit_name: Rect,
     pub edit_description: Rect,
@@ -1613,23 +1790,40 @@ pub struct HitAreas {
     /// Only the crumbs that lead somewhere are recorded: the head of a browse
     /// screen's trail is the page you are already on, and it gets no rect.
     pub crumbs: Vec<(Rect, CrumbTarget)>,
-    /// Artist column of the track table (row-height rect); clicking a cell
-    /// opens that row's artist page.
-    pub main_artist_col: Rect,
-    /// Album column of the track table; clicking a cell opens the album.
-    pub main_album_col: Rect,
-    /// Liked column of the track table, the first of the `★ +` pair that ends
-    /// a row; clicking a cell likes or unlikes that row. One cell wide — the
-    /// star is always drawn, so the glyph *is* the target, and the space
-    /// separating it from [`Self::main_add_col`] belongs to neither control.
+    /// Every artist name printed in the track table's Artist column: one entry
+    /// per credit per visible row, each covering that name as printed and
+    /// nothing either side of it.
+    ///
+    /// Per-name rather than per-column, because a record credits several
+    /// artists and each leads somewhere different. A rect carries its own row
+    /// in its `y`, so resolving a click needs the pointer and nothing else —
+    /// the reason [`Self::album_names`] carries its row in the data does not
+    /// apply.
+    ///
+    /// The separator between two names gets no entry, and neither does a
+    /// credit Spotify identified by name only: an inert run is spelled as an
+    /// absent target, the same way [`Self::station_country`] spells it.
+    pub main_artist_links: Vec<(Rect, Credit)>,
+    /// Album column of the track table and of the album grid; clicking a row's
+    /// name opens the album. The name as printed, like [`Self::main_artist_col`].
+    pub main_album_col: TextCol,
+    /// Liked column of the track table, the first of the `★ ⧉ +` run that ends
+    /// a row; clicking a cell likes or unlikes that row. Each mark carries a
+    /// space either side and the run takes all of it, so the padding is the
+    /// control here rather than a column's leftover.
     pub main_like_col: Rect,
+    /// Share column of the track table, between the other two; clicking a cell
+    /// copies that row's Spotify link. The row's answer to the deck's
+    /// [`Self::share_btn`].
+    pub main_share_col: Rect,
     /// Add column of the track table, beside [`Self::main_like_col`]; clicking
     /// a cell opens the add-to-playlist box for that row. The row's own answer
     /// to the deck's [`Self::add_btn`], which is only ever about the record
     /// that is playing.
     pub main_add_col: Rect,
-    /// Artist name in the now-playing info row.
-    pub now_artist: Rect,
+    /// The credited artists on the now-playing info row, on the same terms as
+    /// [`Self::main_artist_links`].
+    pub now_artist_links: Vec<(Rect, Credit)>,
     /// Album name in the now-playing info row.
     pub now_album: Rect,
     /// Whole now-playing bar (scroll target for volume).
@@ -1644,6 +1838,11 @@ pub struct HitAreas {
     /// playing track. Empty while its saved state is still unknown — a control
     /// that cannot say which way it would go is worse than no control.
     pub like_btn: Rect,
+    /// The `⧉ share` control between [`Self::like_btn`] and [`Self::add_btn`],
+    /// which copies the playing record's Spotify link. The first control of the
+    /// three to go on a row too narrow for all of them: a record you cannot act
+    /// on is worth less than one you cannot link to.
+    pub share_btn: Rect,
     /// The `+ add` control beside [`Self::like_btn`], which opens the
     /// add-to-playlist box for the same record. On both screens and in the
     /// same corner, like the control it sits against: a pair that appeared
@@ -1672,15 +1871,19 @@ pub struct HitAreas {
     pub save_station_btn: Rect,
     /// Volume slider track only; click position maps linearly to percent.
     pub volume_slider: Rect,
-    /// The playing queue's name on the deck's context row. Clicking it
-    /// toggles the player view: it opens from the bottom bar and closes
-    /// again from the player, so the two views share one way in and out.
+    /// The playing queue's name on the deck's context row. From the bottom
+    /// bar it opens the player; from the player it folds the queue under it
+    /// away and back, the name being the heading that list hangs from.
     pub queue_name: Rect,
     /// Queue list rows in the player view (inside the borders).
     pub player_queue: Rect,
     /// The queue's liked column, the twin of [`Self::main_like_col`] on the
     /// player's own list.
     pub queue_like_col: Rect,
+    /// The queue's artist names, the twin of [`Self::main_artist_links`].
+    pub queue_artist_links: Vec<(Rect, Credit)>,
+    /// The queue's share column, the twin of [`Self::main_share_col`].
+    pub queue_share_col: Rect,
     /// The queue's add column, the twin of [`Self::main_add_col`].
     pub queue_add_col: Rect,
     /// The player view's visualizer band; clicking it toggles playback. The
@@ -1790,6 +1993,12 @@ pub struct AppState {
     /// Stations you kept, loaded from disk at startup. The directory has no
     /// accounts, so this list is the whole of "saved".
     pub radio_favorites: Vec<Station>,
+    /// What each saved station is announcing, keyed by [`Station::uuid`].
+    ///
+    /// Filled only while the saved page is open — see
+    /// `Client::refresh_station_now` — and bounded by the size of
+    /// [`Self::radio_favorites`], so nothing evicts from it.
+    pub radio_now: HashMap<String, StationNow>,
     /// What you were listening to before the current station, oldest first.
     ///
     /// Read only while a station is live: the radio deck's `◂◂ previous` walks
@@ -1851,11 +2060,21 @@ pub struct AppState {
     /// Player view (current track + visualizer + queue) replaces the
     /// library/main panes while set.
     pub show_player: bool,
+
+    /// What the Home row's Links entry knows about where a clicked Spotify
+    /// link goes. Filled from `crate::protocol` at startup and after the row
+    /// acts; empty everywhere else, because no other platform routes a scheme
+    /// to an app.
+    pub links: LinksRow,
     /// The play order spot owns, installed by every play. The player screen
     /// lists it, and its current track is what the deck describes.
     pub queue: Option<Queue>,
     pub queue_index: usize,
     pub queue_list: ListState,
+    /// Whether the player's queue is folded away, leaving the deck above it
+    /// with the pane to itself. Toggled by clicking the queue's name in the
+    /// player, which is the one place the fold can be seen and undone.
+    pub queue_folded: bool,
     /// Bumped by [`Self::set_queue`] and stamped onto the installed queue, so
     /// a background fill can tell the queue it was started for from one that
     /// has replaced it. Independent of `load_generation`: queue fills never
@@ -1938,6 +2157,7 @@ impl AppState {
             playback: None,
             radio: None,
             radio_favorites: Vec::new(),
+            radio_now: HashMap::new(),
             listen_back: Vec::new(),
             listen_forward: Vec::new(),
             playlists: Vec::new(),
@@ -1966,9 +2186,11 @@ impl AppState {
             saved_playlists: HashMap::new(),
             playlist_tracks: HashMap::new(),
             show_player: false,
+            links: LinksRow::default(),
             queue: None,
             queue_index: 0,
             queue_list: ListState::default(),
+            queue_folded: false,
             queue_generation: 0,
             last_queue_click: None,
             audio_tap: Arc::new(AudioTap::new()),
@@ -2009,13 +2231,27 @@ impl AppState {
                 HomeItem::LikedSongs | HomeItem::Playlists => ready,
                 HomeItem::Spotify => !ready,
                 HomeItem::Radio => true,
+                // Windows is the only platform that routes a URL scheme to an
+                // app, so elsewhere the row would offer something spot cannot
+                // do. It stands whether or not Spotify is connected: claiming
+                // the scheme needs no account.
+                HomeItem::Links => cfg!(windows),
             })
             .collect()
     }
 
-    /// The dim line under a Home row's name. The Spotify and Update rows are
-    /// the ones whose lines move; the rest speak for themselves.
-    pub fn home_blurb(&self, item: HomeItem) -> &'static str {
+    /// The dim line under a Home row's name. The Spotify, Update and Links
+    /// rows are the ones whose lines move; the rest speak for themselves.
+    pub fn home_blurb(&self, item: HomeItem) -> &str {
+        if item == HomeItem::Links {
+            // The armed prompt wins: while the row is waiting for a second
+            // press, what it is about to do matters more than what is true.
+            return match &self.links.confirming {
+                Some(prompt) => prompt,
+                None if self.links.status.is_empty() => item.blurb(),
+                None => &self.links.status,
+            };
+        }
         if item == HomeItem::Update {
             return match self.update {
                 Some(UpdateState::Available(_)) | None => HomeItem::Update.blurb(),
@@ -2171,6 +2407,10 @@ impl AppState {
                 SpotifyState::Limited(reason) => reason.clone(),
                 SpotifyState::Ready => String::new(),
             },
+            // Two words for a state the blurb already says in a sentence, and
+            // the tail is where the eye goes for on or off.
+            HomeItem::Links if self.links.in_force => "on".to_string(),
+            HomeItem::Links => "off".to_string(),
         }
     }
 
@@ -2394,9 +2634,9 @@ impl AppState {
     /// History first: back means "the page I came from", labeled with that
     /// page's name. An album page reached with nothing behind it (the very
     /// first thing opened in a session, from the now-playing bar) falls back
-    /// to going *up* to the album's artist. The artist id comes from the
-    /// album's own tracks — `ViewHeader` carries no ids — so the control
-    /// appears once the first page of tracks has landed.
+    /// to going *up* to the album's artist, whom the header names — so the
+    /// control is there from the moment the page opens, before its first page
+    /// of tracks has landed.
     pub fn back_target(&self) -> Option<BackTarget> {
         if let Some(snap) = self.view_stack.last() {
             return Some(BackTarget::History(snap.title()));
@@ -2407,10 +2647,12 @@ impl AppState {
         if list.kind != TrackListKind::Album {
             return None;
         }
-        list.items.iter().find_map(|t| {
-            let id = t.artist_id.clone()?;
-            let name = first_artist(&t.artists);
-            (!name.is_empty()).then_some(BackTarget::Artist { id, name })
+        list.header.credits.iter().find_map(|c| {
+            let id = c.id.clone()?;
+            (!c.name.is_empty()).then(|| BackTarget::Artist {
+                id,
+                name: c.name.clone(),
+            })
         })
     }
 
@@ -2588,6 +2830,32 @@ impl AppState {
                 .cache_key
                 .as_deref()
                 .and_then(|k| k.strip_prefix(PLAYLIST_KEY_PREFIX)),
+            _ => None,
+        }
+    }
+
+    /// The Spotify link to the open page itself, for the header's share
+    /// control.
+    ///
+    /// Liked Songs is deliberately absent. Its only link is
+    /// `/collection/tracks`, which resolves to whoever opens it rather than to
+    /// what is on screen — a link that shows the reader their own library is
+    /// worse than no control at all.
+    pub fn open_page_link(&self) -> Option<Link> {
+        match &self.main {
+            MainView::Artist(v) => Some(Link::Artist(v.id.clone())),
+            MainView::Tracks(list) => {
+                let key = list.cache_key.as_deref()?;
+                match list.kind {
+                    TrackListKind::Playlist => Some(Link::Playlist(
+                        key.strip_prefix(PLAYLIST_KEY_PREFIX)?.into(),
+                    )),
+                    TrackListKind::Album => {
+                        Some(Link::Album(key.strip_prefix(ALBUM_KEY_PREFIX)?.into()))
+                    }
+                    TrackListKind::LikedSongs => None,
+                }
+            }
             _ => None,
         }
     }
@@ -2787,7 +3055,7 @@ mod tests {
         ] {
             st.spotify = state.clone();
             assert_eq!(
-                st.home_items(),
+                destinations(&st),
                 vec![HomeItem::Radio, HomeItem::Spotify],
                 "{state:?}"
             );
@@ -2796,7 +3064,7 @@ mod tests {
 
         st.spotify = SpotifyState::Ready;
         assert_eq!(
-            st.home_items(),
+            destinations(&st),
             vec![
                 HomeItem::LikedSongs,
                 HomeItem::DiscoverWeekly,
@@ -2805,6 +3073,40 @@ mod tests {
             ]
         );
         assert_eq!(st.search_tabs(), SearchTab::ALL.to_vec());
+    }
+
+    /// Home's rows without the Links entry, which turns on the platform rather
+    /// than on the account and is a control rather than a destination.
+    fn destinations(st: &AppState) -> Vec<HomeItem> {
+        st.home_items()
+            .into_iter()
+            .filter(|item| *item != HomeItem::Links)
+            .collect()
+    }
+
+    /// The Links row stands whatever Spotify is doing — claiming the scheme
+    /// needs no account — and it reads as off until something says otherwise,
+    /// which is what keeps a fresh copy of spot from implying a claim it has
+    /// not made.
+    #[test]
+    fn the_links_row_reports_what_was_read_rather_than_assuming() {
+        let mut st = AppState::new();
+        assert_eq!(st.home_items().contains(&HomeItem::Links), cfg!(windows));
+        st.spotify = SpotifyState::Ready;
+        assert_eq!(st.home_items().contains(&HomeItem::Links), cfg!(windows));
+
+        assert_eq!(st.home_count(HomeItem::Links), "off");
+        assert_eq!(st.home_blurb(HomeItem::Links), HomeItem::Links.blurb());
+
+        st.links.in_force = true;
+        st.links.status = "Spotify links open in spot".to_string();
+        assert_eq!(st.home_count(HomeItem::Links), "on");
+        assert_eq!(st.home_blurb(HomeItem::Links), "Spotify links open in spot");
+
+        // While the row waits for the second press, what it is about to do
+        // wins over what is true.
+        st.links.confirming = Some("Enter again to replace Spotify".to_string());
+        assert!(st.home_blurb(HomeItem::Links).starts_with("Enter again"));
     }
 
     /// The Spotify row's tail and line report how far the connection got, so
@@ -2836,7 +3138,10 @@ mod tests {
             duration_ms: dur,
             track_number: 1,
             album_id: None,
-            artist_id: None,
+            credits: vec![Credit {
+                name: "artist".into(),
+                id: None,
+            }],
             cover_url: None,
         }
     }
@@ -2846,6 +3151,10 @@ mod tests {
             id: format!("id-{name}"),
             name: name.into(),
             artists: "artist".into(),
+            credits: vec![Credit {
+                name: "artist".into(),
+                id: None,
+            }],
             release_year: "2020".into(),
             album_type: "album".into(),
             album_group: group.into(),
@@ -2944,6 +3253,20 @@ mod tests {
         }
     }
 
+    /// Nothing is claimed until the decoder has identified the stream, because
+    /// the directory record it would otherwise be guessed from carries no
+    /// channel count at all.
+    #[test]
+    fn a_station_says_how_it_is_mixed_only_once_the_decoder_knows() {
+        let radio = RadioPlayback::new(a_station(), 40, Default::default(), Default::default());
+        assert_eq!(radio.channel_label(), None);
+
+        for (channels, expected) in [(1, "mono"), (2, "stereo"), (6, "6 ch")] {
+            radio.channels.store(channels, Ordering::Relaxed);
+            assert_eq!(radio.channel_label().as_deref(), Some(expected));
+        }
+    }
+
     fn list_of(names: &[&str]) -> TrackList {
         let mut list = TrackList::new("L", "", None);
         list.append(names.iter().map(|n| track(n, 1000)).collect());
@@ -2993,19 +3316,28 @@ mod tests {
 
     /// An album page reached with nothing behind it — the first thing opened
     /// in a session, from the now-playing bar — goes *up* to its artist.
-    /// The id comes from the tracks, so it appears once page one lands.
+    /// The header names it, so the control is there from the moment the page
+    /// opens rather than once its first page of tracks lands.
     #[test]
     fn an_empty_stack_on_an_album_page_falls_back_to_its_artist() {
         let mut st = AppState::new();
         let mut list = list_of(&["one"]);
         list.kind = TrackListKind::Album;
         st.main = MainView::Tracks(list);
-        // No artist id on the tracks yet: nowhere to go.
+        // Nobody credited on the header yet: nowhere to go.
         assert_eq!(st.back_target(), None);
 
         if let MainView::Tracks(list) = &mut st.main {
-            list.items[0].artist_id = Some("r1".into());
-            list.items[0].artists = "Donna The Buffalo, Guest".into();
+            list.header.credits = vec![
+                Credit {
+                    name: "Donna The Buffalo".into(),
+                    id: Some("r1".into()),
+                },
+                Credit {
+                    name: "Guest".into(),
+                    id: Some("r2".into()),
+                },
+            ];
         }
         assert_eq!(
             st.back_target(),
@@ -3216,7 +3548,12 @@ mod tests {
             Some("spotify:track:kept".to_string())
         );
 
-        st.radio = Some(RadioPlayback::new(a_station(), 40, Default::default()));
+        st.radio = Some(RadioPlayback::new(
+            a_station(),
+            40,
+            Default::default(),
+            Default::default(),
+        ));
         // Announcing nothing: the honest answer is that the deck is about no
         // record at all, *not* the one behind the stream.
         assert!(
@@ -3225,7 +3562,10 @@ mod tests {
         );
 
         let mut found = track("announced", 1000);
-        found.artist_id = Some("art1".into());
+        found.credits = vec![Credit {
+            name: "artist".into(),
+            id: Some("art1".into()),
+        }];
         found.album_id = Some("alb1".into());
         if let Some(r) = st.radio.as_mut() {
             r.matched = RadioMatch::Matched(Box::new(found));
@@ -3258,7 +3598,7 @@ mod tests {
         let (pb, q) = playing("kept");
         st.playback = pb;
         st.queue = q;
-        let mut radio = RadioPlayback::new(a_station(), 40, Default::default());
+        let mut radio = RadioPlayback::new(a_station(), 40, Default::default(), Default::default());
         radio.matched = RadioMatch::Unmatched;
         st.radio = Some(radio);
         assert!(st.deck_track().is_none());
@@ -3272,13 +3612,6 @@ mod tests {
         let (_, q) = playing("staged");
         st.queue = q;
         assert!(st.deck_track().is_none(), "a queue alone is not playback");
-    }
-
-    #[test]
-    fn the_first_credited_artist_is_the_one_with_a_page() {
-        assert_eq!(first_artist("Zedd, Alessia Cara"), "Zedd");
-        assert_eq!(first_artist("  Moby  "), "Moby");
-        assert_eq!(first_artist(""), "");
     }
 
     /// Progress runs off the anchor while playing, stands still while paused,
@@ -3322,6 +3655,7 @@ mod tests {
             test_station(uuid),
             50,
             Arc::new(parking_lot::Mutex::new(None)),
+            Default::default(),
         ));
     }
 
@@ -3351,6 +3685,7 @@ mod tests {
                     (**s).clone(),
                     50,
                     Arc::new(parking_lot::Mutex::new(None)),
+                    Default::default(),
                 ));
             } else {
                 st.radio = None;
@@ -3368,6 +3703,7 @@ mod tests {
                 (**s).clone(),
                 50,
                 Arc::new(parking_lot::Mutex::new(None)),
+                Default::default(),
             ));
         }
         assert!(st.step_forward_listen().is_none());
@@ -3438,5 +3774,51 @@ mod tests {
         tune(&mut st, "b");
         st.radio = None;
         assert_eq!(name_of(&st.step_back_listen().expect("a path back")), "a");
+    }
+
+    fn page(kind: TrackListKind, cache_key: Option<&str>) -> AppState {
+        let mut st = AppState::new();
+        let mut list = TrackList::new("Page", "", None);
+        list.kind = kind;
+        list.cache_key = cache_key.map(Into::into);
+        st.main = MainView::Tracks(list);
+        st
+    }
+
+    /// The page's own link, read off the identity it already carries rather
+    /// than off the header, which is display text.
+    #[test]
+    fn a_page_names_its_own_link() {
+        let cases = [
+            (
+                page(TrackListKind::Playlist, Some(&playlist_key("p1"))),
+                Link::Playlist("p1".into()),
+            ),
+            (
+                page(TrackListKind::Album, Some(&album_key("a1"))),
+                Link::Album("a1".into()),
+            ),
+        ];
+        for (st, want) in cases {
+            assert_eq!(st.open_page_link(), Some(want));
+        }
+    }
+
+    /// Every page with no link of its own, so the header knows to draw no
+    /// control rather than one that shares the wrong thing.
+    #[test]
+    fn a_page_without_a_link_names_none() {
+        let mut liked = page(TrackListKind::LikedSongs, Some(&liked_key()));
+        assert_eq!(liked.open_page_link(), None, "liked songs");
+        liked.main = MainView::Home;
+        assert_eq!(liked.open_page_link(), None, "home");
+        liked.main = MainView::Playlists;
+        assert_eq!(liked.open_page_link(), None, "playlists");
+        // A page still loading has no key stamped on it yet.
+        assert_eq!(
+            page(TrackListKind::Album, None).open_page_link(),
+            None,
+            "unstamped"
+        );
     }
 }

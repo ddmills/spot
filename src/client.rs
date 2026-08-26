@@ -17,10 +17,11 @@ use crate::api::{Api, PAGE_LIMIT};
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::queue::Queue;
 use crate::app::state::{
-    self, AppState, ArtistTab, ArtistView, MainView, Playback, TrackList, TrackListKind,
+    self, AppState, ArtistTab, ArtistView, Credit, MainView, Playback, TrackList, TrackListKind,
     UpdateState,
 };
 use crate::cover::{Cover, CoverCache};
+use crate::link::Link;
 use crate::radio::api::RadioApi;
 use crate::radio::player::RadioPlayer;
 
@@ -36,7 +37,7 @@ enum TrackSource {
     Album {
         id: String,
         name: String,
-        artists: String,
+        credits: Vec<Credit>,
         year: String,
         cover_url: Option<String>,
     },
@@ -66,13 +67,13 @@ impl TrackSource {
             TrackSource::Album {
                 id,
                 name,
-                artists,
+                credits,
                 year,
                 cover_url,
             } => AppCommand::OpenAlbum {
                 id: id.clone(),
                 name: name.clone(),
-                artists: artists.clone(),
+                credits: credits.clone(),
                 year: year.clone(),
                 cover_url: cover_url.clone(),
             },
@@ -114,6 +115,17 @@ const COVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// over a whole library at sign-in, behind whatever you are actually doing.
 const PREFETCH_CONCURRENCY: usize = 4;
 
+/// How long a saved station's announcement stands before it is read again.
+///
+/// A record is three or four minutes, so a minute is close enough to live to
+/// be worth reading and far enough from it that a page left open all evening
+/// still costs one connection per station per minute.
+const NOW_TTL: Duration = Duration::from_secs(60);
+/// Saved stations probed at once. These are connections to strangers' servers,
+/// several of them volunteer-run, so the sweep walks the page rather than
+/// arriving at every station on it at the same moment.
+const NOW_CONCURRENCY: usize = 4;
+
 /// Write the cached playlist contents to disk, quietly.
 ///
 /// Nobody asked for this and nothing on screen depends on it landing — a run
@@ -131,6 +143,35 @@ fn save_playlist_tracks(st: &AppState) {
 /// changed, and what was true of the old contents says nothing about the new.
 /// Answers whether anything went, so the file is rewritten only when it holds
 /// something it should not.
+/// The saved stations whose announcement is worth reading now.
+///
+/// Empty unless the saved page is the one on screen: each of these costs a
+/// connection to somebody else's server, so the page you are looking at is the
+/// whole of what it will pay for.
+fn stations_due_for_now(st: &AppState) -> Vec<state::Station> {
+    let MainView::Radio(view) = &st.main else {
+        return Vec::new();
+    };
+    if view.scope != state::RadioScope::Favorites {
+        return Vec::new();
+    }
+    // The live station announces to the deck already, and a second connection
+    // to a stream this machine is holding open is what stations count against
+    // their listener limits.
+    let live = st.radio.as_ref().map(|r| r.station.uuid.as_str());
+    st.radio_favorites
+        .iter()
+        // HLS carries no ICY metadata, and those rows are already drawn as
+        // something that is listed rather than offered.
+        .filter(|s| !s.hls && Some(s.uuid.as_str()) != live)
+        .filter(|s| match st.radio_now.get(&s.uuid) {
+            Some(now) => now.checked_at.elapsed() > NOW_TTL,
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 fn drop_stale_playlist_tracks(
     cache: &mut HashMap<String, state::PlaylistContents>,
     playlists: &[state::Playlist],
@@ -246,6 +287,10 @@ impl std::fmt::Debug for Spotify {
 pub struct Client {
     api: Option<Api>,
     engine: Option<Engine>,
+    /// A link this launch carried, waiting for the account it has to be looked
+    /// up in. Spent by [`AppCommand::SpotifyConnected`]; see
+    /// [`Client::open_link`].
+    pending_link: Option<Link>,
     /// librespot's on-disk cache. The client only writes the volume into it;
     /// the credentials and the audio are librespot's own business. Held
     /// directly rather than through the session, which need not exist.
@@ -324,6 +369,7 @@ impl Client {
             .unwrap_or_default();
         let client = Self {
             api: None,
+            pending_link: None,
             engine: None,
             volume_cache,
             mixer,
@@ -371,6 +417,7 @@ impl Client {
                 _ = tick.tick() => {
                     self.check_radio_stream();
                     self.resolve_radio_track();
+                    self.refresh_station_now();
                 }
             }
         }
@@ -387,6 +434,12 @@ impl Client {
             SpotifyConnected(spotify) => {
                 self.api = Some(spotify.api);
                 self.engine = spotify.engine;
+                // A link that arrived before there was an account to look it
+                // up in. A launch carrying one sends it at startup, seconds
+                // ahead of the sign-in it needs — see [`Client::open_link`].
+                if let Some(target) = self.pending_link.take() {
+                    self.open_link(target).await;
+                }
             }
             // Whichever engine owns the device owns the transport. Radio is
             // checked first everywhere below for that reason: while a station
@@ -574,6 +627,7 @@ impl Client {
                 seq,
             } => self.edit_playlist_details(id, name, description, seq).await,
             CachePlaylistTracks { playlist_ids } => self.cache_playlist_tracks(playlist_ids).await,
+            OpenLink(link) => self.open_link(link).await,
             Search(query) => self.search(query).await,
             LoadPlaylists => self.load_playlists().await,
             LoadLikedSongs => self.load_liked_view(false),
@@ -581,10 +635,10 @@ impl Client {
             OpenAlbum {
                 id,
                 name,
-                artists,
+                credits,
                 year,
                 cover_url,
-            } => self.load_album_view(id, name, artists, year, cover_url, false),
+            } => self.load_album_view(id, name, credits, year, cover_url, false),
             LoadViewCover { cover_url } => self.load_view_cover(cover_url),
             LoadPlayingCover { cover_url } => {
                 // Same URL as what is already up means the same record: two
@@ -598,6 +652,10 @@ impl Client {
             OpenArtist { id, uri, name } => self.load_artist_view(id, uri, name, false),
             LoadArtistArt => self.load_artist_art(),
             Refresh => {
+                // Drops every reading, so the saved page re-probes rather than
+                // waiting out `NOW_TTL` on a station you know has moved on.
+                self.state.write().radio_now.clear();
+                self.refresh_station_now();
                 // Fresh playlists first: snapshot_ids are how playlist changes
                 // are detected.
                 self.load_playlists().await;
@@ -626,18 +684,19 @@ impl Client {
                                 MainView::Tracks(list) => Some((
                                     list.header.name.clone(),
                                     list.header.cover_url.clone(),
+                                    list.header.credits.clone(),
                                     list.items
                                         .first()
-                                        .map(|t| (t.artists.clone(), t.release_year.clone()))
+                                        .map(|t| t.release_year.clone())
                                         .unwrap_or_default(),
                                 )),
                                 _ => None,
                             };
-                            if let Some((name, cover, (artists, year))) = meta {
+                            if let Some((name, cover, credits, year)) = meta {
                                 self.load_album_view(
                                     id.to_string(),
                                     name,
-                                    artists,
+                                    credits,
                                     year,
                                     cover,
                                     true,
@@ -812,7 +871,7 @@ impl Client {
             FetchSource::Album { id, year } => TrackSource::Album {
                 id,
                 name: name.clone(),
-                artists: String::new(),
+                credits: Vec::new(),
                 year,
                 cover_url: None,
             },
@@ -1187,6 +1246,9 @@ impl Client {
             generation
         };
         if scope == RadioScope::Favorites {
+            // Not left to the tick: the page is on screen now, and up to three
+            // seconds of empty cells is the wait the tick would spend.
+            self.refresh_station_now();
             return;
         }
 
@@ -1260,8 +1322,12 @@ impl Client {
 
         {
             let mut st = self.state.write();
-            let mut playback =
-                state::RadioPlayback::new(station.clone(), volume, self.radio_player.title());
+            let mut playback = state::RadioPlayback::new(
+                station.clone(),
+                volume,
+                self.radio_player.title(),
+                self.radio_player.channels(),
+            );
             playback.seek_attempt = attempt;
             playback.tune_seq = tune_seq;
             st.radio = Some(playback);
@@ -1737,6 +1803,59 @@ impl Client {
         });
     }
 
+    /// Read what the saved stations are announcing, for the column that says so.
+    ///
+    /// Only while the saved page is open, and only for rows whose reading has
+    /// gone stale: this opens a connection to somebody else's server per
+    /// station, so the page you are looking at is the whole of what it will
+    /// pay for. Nothing here is generation-guarded — a reading is keyed by
+    /// uuid and is about the station, not about the page it was asked from, so
+    /// one that lands late is still true.
+    fn refresh_station_now(&self) {
+        let due = stations_due_for_now(&self.state.read());
+        if due.is_empty() {
+            return;
+        }
+
+        {
+            // Marked before the probes go out, not when they answer, for the
+            // reason [`Self::radio_probe`] is: otherwise the tick behind this
+            // one queues every station a second time.
+            let mut st = self.state.write();
+            for station in &due {
+                st.radio_now.insert(
+                    station.uuid.clone(),
+                    state::StationNow::new(state::NowStatus::Probing),
+                );
+            }
+        }
+
+        let http = self.http.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            futures::stream::iter(due)
+                .for_each_concurrent(NOW_CONCURRENCY, |station| {
+                    let http = http.clone();
+                    let state = state.clone();
+                    async move {
+                        let status = match crate::radio::now::probe(&http, &station.url).await {
+                            Ok(Some(title)) => state::NowStatus::Title(title),
+                            Ok(None) => state::NowStatus::Quiet,
+                            Err(e) => {
+                                log::debug!("no announcement from {}: {e:#}", station.name);
+                                state::NowStatus::Unreachable
+                            }
+                        };
+                        state
+                            .write()
+                            .radio_now
+                            .insert(station.uuid, state::StationNow::new(status));
+                    }
+                })
+                .await;
+        });
+    }
+
     /// Stop the stream if one is playing, before Spotify takes the device.
     ///
     /// Every Spotify play path calls this, which is what keeps "only one engine
@@ -1802,6 +1921,10 @@ impl Client {
             if st.main_index >= len {
                 st.main_index = len.saturating_sub(1);
             }
+            drop(st);
+            // A station starred onto the page arrives with an empty cell under
+            // Now Playing until something reads it.
+            self.refresh_station_now();
         }
     }
 
@@ -2264,11 +2387,15 @@ impl Client {
         &self,
         id: String,
         name: String,
-        artists: String,
+        credits: Vec<Credit>,
         year: String,
         cover_url: Option<String>,
         preserve_view: bool,
     ) {
+        // What a band too narrow for the credit line falls back to. The band
+        // draws the credits themselves where it has the room, so each name is
+        // a link — see `main_pane::header_band`.
+        let artists = state::artists_line(&credits);
         let subtitle = if year.is_empty() {
             artists.clone()
         } else if artists.is_empty() {
@@ -2278,13 +2405,14 @@ impl Client {
         };
         let mut list = TrackList::new(name.clone(), subtitle, None);
         list.kind = TrackListKind::Album;
+        list.header.credits = credits.clone();
         list.header.cover_url = cover_url.clone();
         self.start_track_fetch(
             list,
             TrackSource::Album {
                 id,
                 name,
-                artists,
+                credits,
                 year,
                 cover_url: cover_url.clone(),
             },
@@ -2294,6 +2422,69 @@ impl Client {
         // After the view is installed, so a stale fetch cannot clear the slot
         // the new one just claimed.
         self.load_view_cover(cover_url);
+    }
+
+    /// Follow a Spotify link: resolve what the id needs, then open it the way
+    /// a click would.
+    ///
+    /// The second command goes through [`crate::event::navigate`] rather than
+    /// straight down `tx`, so a link lands on the back stack exactly as the
+    /// row that opens the same page does — `Esc` then returns one step, not
+    /// none and not two.
+    ///
+    /// A track plays where the other three open. A shared record is a
+    /// listen-to-this, and the browse pane is left where it was: moving it
+    /// would throw away whatever the link interrupted.
+    async fn open_link(&mut self, link: Link) {
+        let Some(api) = self.api.clone() else {
+            // Held rather than refused. A launch carrying a link sends it as
+            // soon as this loop is up, which is seconds ahead of the sign-in
+            // that can resolve it; `SpotifyConnected` spends it. Without an
+            // account it is never spent, which is the honest answer — there is
+            // nothing to open the link against.
+            self.pending_link = Some(link);
+            return;
+        };
+        // Every fetch finishes before the lock is taken: `handle` must not
+        // hold the state across an await.
+        let opened = match link {
+            Link::Album(id) => match api.album(&id).await {
+                Ok(album) => AppCommand::OpenAlbum {
+                    id: album.id,
+                    name: album.name,
+                    credits: album.credits,
+                    year: album.release_year,
+                    cover_url: album.cover_url,
+                },
+                Err(e) => return self.link_failed("album", e),
+            },
+            // Neither needs resolving first: the page's own load fills its
+            // header from the id.
+            Link::Artist(id) => AppCommand::OpenArtist {
+                uri: format!("spotify:artist:{id}"),
+                id,
+                name: String::new(),
+            },
+            Link::Playlist(id) => AppCommand::LoadPlaylistTracks { playlist_id: id },
+            Link::Track(id) => match api.track(&id).await {
+                Ok(track) => {
+                    let name = track.name.clone();
+                    self.play(vec![track], 0, name.clone(), None, false, false);
+                    self.state.write().toast(format!("playing {name}"));
+                    return;
+                }
+                Err(e) => return self.link_failed("track", e),
+            },
+        };
+        let mut st = self.state.write();
+        crate::event::navigate(&mut st, opened, &self.tx);
+    }
+
+    fn link_failed(&self, kind: &str, e: anyhow::Error) {
+        log::warn!("could not open the linked {kind}: {e:#}");
+        self.state
+            .write()
+            .toast(format!("could not open that {kind}"));
     }
 
     /// Install an artist view and fill it from one concurrent overview
@@ -2344,6 +2535,13 @@ impl Client {
                     Ok(overview) => {
                         let uris: Vec<String> =
                             overview.top.iter().map(|t| t.uri.clone()).collect();
+                        // A page opened from a link arrives with no name: the
+                        // link names an id and nothing else. Everywhere else
+                        // this rewrites the row's spelling with Spotify's own.
+                        if !overview.name.is_empty() {
+                            v.name = overview.name.clone();
+                            v.top.header.name = overview.name;
+                        }
                         v.image_url = overview.image_url;
                         v.genres = overview.genres;
                         v.top.append(overview.top);
@@ -3132,6 +3330,78 @@ mod tests {
         assert!(seek_walks_on(1), "the first station a seek landed on");
         assert!(!seek_walks_on(SEEK_ATTEMPTS), "the walk is bounded");
         assert!(!seek_walks_on(SEEK_ATTEMPTS + 1));
+    }
+
+    /// The saved page with these stations kept and nothing read yet.
+    fn saved_page(entries: &[(&str, bool)]) -> AppState {
+        let mut st = AppState::new();
+        let mut view = state::RadioView::new(state::RadioScope::Favorites, 0);
+        view.loading = false;
+        st.radio_favorites = chart(entries);
+        st.main = MainView::Radio(view);
+        st
+    }
+
+    /// Every probe is a connection to somebody else's server, so the sweep
+    /// asks only about rows that are on screen and have nothing readable
+    /// already.
+    #[test]
+    fn only_the_saved_page_is_worth_a_probe() {
+        let st = saved_page(&[("a", false), ("b", false)]);
+        assert_eq!(stations_due_for_now(&st).len(), 2);
+
+        let mut st = saved_page(&[("a", false)]);
+        st.main = MainView::Home;
+        assert!(stations_due_for_now(&st).is_empty(), "off the saved page");
+
+        let mut st = saved_page(&[("a", false)]);
+        st.main = MainView::Radio(state::RadioView::new(state::RadioScope::Popular, 0));
+        assert!(stations_due_for_now(&st).is_empty(), "the chart");
+    }
+
+    /// HLS announces nothing and the live station announces to the deck. Both
+    /// would be a connection spent on an answer already in hand.
+    #[test]
+    fn the_sweep_skips_the_rows_that_need_no_probe() {
+        let st = saved_page(&[("a", false), ("hls", true)]);
+        let due: Vec<String> = stations_due_for_now(&st)
+            .into_iter()
+            .map(|s| s.uuid)
+            .collect();
+        assert_eq!(due, ["a"]);
+
+        let mut st = saved_page(&[("a", false), ("live", false)]);
+        let live = st.radio_favorites[1].clone();
+        st.radio = Some(state::RadioPlayback::new(
+            live,
+            50,
+            Arc::new(Mutex::new(None)),
+            Default::default(),
+        ));
+        let due: Vec<String> = stations_due_for_now(&st)
+            .into_iter()
+            .map(|s| s.uuid)
+            .collect();
+        assert_eq!(due, ["a"]);
+    }
+
+    /// A reading stands for `NOW_TTL`, so a page left open costs one connection
+    /// per station per minute rather than one per tick.
+    #[test]
+    fn a_fresh_reading_is_not_asked_for_again() {
+        let mut st = saved_page(&[("a", false)]);
+        st.radio_now
+            .insert("a".into(), state::StationNow::new(state::NowStatus::Quiet));
+        assert!(stations_due_for_now(&st).is_empty());
+
+        st.radio_now.insert(
+            "a".into(),
+            state::StationNow {
+                status: state::NowStatus::Quiet,
+                checked_at: Instant::now() - NOW_TTL - Duration::from_secs(1),
+            },
+        );
+        assert_eq!(stations_due_for_now(&st).len(), 1);
     }
 
     /// Nothing playable in the country: the caller says so rather than looping.

@@ -26,7 +26,7 @@ rspotify = "0.16.1"
 rand = "0.9"
 ratatui = "0.30.2"
 crossterm = { version = "0.29", features = ["event-stream"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 futures = "0.3"
 chrono = "0.4"
 parking_lot = "0.12"
@@ -38,6 +38,9 @@ anyhow = "1"
 log = "0.4"
 simplelog = "0.12"
 unicode-width = "0.2"
+# The share controls' clipboard. `image-data` is off: spot copies a link and
+# nothing else, and that feature pulls the `image` crate in behind it.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 zune-jpeg = "0.5"
 zune-core = "0.5"
@@ -54,12 +57,15 @@ rodio = { version = "0.21", default-features = false, features = ["playback", "m
 stream-download = { version = "0.24.1", default-features = false, features = ["reqwest-native-tls"] }
 icy-metadata = "0.6"
 
-# Only for the double-click relaunch in src/relaunch.rs.
 [target.'cfg(windows)'.dependencies]
+# The double-click relaunch in src/relaunch.rs.
 windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The URL scheme registration in src/protocol.rs, which is a handful of string
+# reads and writes under HKCU and not worth a page of raw FFI.
+winreg = "0.56"
 
 [profile.release]
 lto = true

@@ -8,8 +8,8 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use super::columns::{Cell, ColKey, GUTTER, Layout, right, row_spans, scroll_col};
 use super::theme;
 use crate::app::state::{
-    AppState, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError, MainView, SearchTab, Sort, Track,
-    format_duration,
+    AppState, Credit, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError, MainView, NowStatus,
+    SearchTab, Sort, Station, StationNow, TextCol, Track, format_duration,
 };
 
 /// Playback context needed to mark the playing row, copied out of the queue
@@ -20,6 +20,30 @@ struct PlayMarks {
     /// The playing queue's source key (`"playlist:<id>"`, …), for marking the
     /// row of the playlist it came out of.
     context: Option<String>,
+}
+
+/// What the saved page knows about the stations on it, resolved once per frame.
+struct NowBoard<'a> {
+    /// Readings taken by `Client::refresh_station_now`, keyed by uuid.
+    probed: &'a std::collections::HashMap<String, StationNow>,
+    /// The station on the deck and what it is announcing. It is already saying
+    /// so to the player, so its row reads that rather than opening a second
+    /// connection to a stream this machine is already holding open.
+    live: Option<(String, Option<String>)>,
+}
+
+impl NowBoard<'_> {
+    fn status(&self, station: &Station) -> Option<NowStatus> {
+        if let Some((uuid, title)) = &self.live
+            && *uuid == station.uuid
+        {
+            return Some(match title {
+                Some(t) => NowStatus::Title(t.clone()),
+                None => NowStatus::Quiet,
+            });
+        }
+        self.probed.get(&station.uuid).map(|n| n.status.clone())
+    }
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -45,12 +69,24 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // The station playing, if one is, so a radio page can mark its row the way
     // a track table marks the playing track.
     let playing_station = state.radio.as_ref().map(|r| r.station.url.clone());
+    // `now_title` takes the decoder thread's lock, so it is read once here
+    // rather than once per row.
+    let live_now = state
+        .radio
+        .as_ref()
+        .map(|r| (r.station.uuid.clone(), r.now_title()));
     // Home's rows and their tails, resolved before the split borrow below —
     // both read `playlists`, which the borrow takes.
-    let home: Vec<(HomeItem, String, &'static str)> = state
+    let home: Vec<(HomeItem, String, String)> = state
         .home_items()
         .into_iter()
-        .map(|item| (item, state.home_count(item), state.home_blurb(item)))
+        .map(|item| {
+            (
+                item,
+                state.home_count(item),
+                state.home_blurb(item).to_string(),
+            )
+        })
         .collect();
     // The strip the search page draws: four of the five tabs are Spotify's,
     // and without an account there is only the directory's own.
@@ -64,6 +100,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         playlists_sort,
         playlists_display,
         radio_favorites,
+        radio_now,
         main_list,
         hit,
         liked,
@@ -73,6 +110,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     } = state;
     let liked = &*liked;
     let radio_favorites = &*radio_favorites;
+    let now_board = NowBoard {
+        probed: &*radio_now,
+        live: live_now,
+    };
     let page_art = &*page_art;
     let playlists = &*playlists;
     let playlists_error = &*playlists_error;
@@ -143,6 +184,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             v,
             radio_favorites,
             playing_station.as_deref(),
+            &now_board,
             main_index,
             main_list,
             retries,
@@ -178,7 +220,7 @@ const HOME_INDENT: usize = 2;
 fn draw_home(
     frame: &mut Frame,
     area: Rect,
-    items: &[(HomeItem, String, &'static str)],
+    items: &[(HomeItem, String, String)],
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
@@ -307,29 +349,34 @@ fn draw_playlists(
 
     // Playlists only. Liked Songs is a Home row of its own: it is not a
     // playlist, so it does not belong under a heading that says it is.
-    let items: Vec<ListItem> = display
+    let rows: Vec<_> = display.iter().filter_map(|&i| playlists.get(i)).collect();
+    let count = rows.len();
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    let hover = super::table::hovered_row(rows_area, list_state.offset(), count, mouse);
+    let items: Vec<ListItem> = rows
         .iter()
-        .filter_map(|&i| playlists.get(i))
         .enumerate()
         .map(|(i, p)| {
             let playing =
                 marks.context.as_deref() == Some(crate::app::state::playlist_key(&p.id).as_str());
-            playlist_row(p, &layout, me_id, playing, i == main_index)
+            super::table::hover_row(
+                playlist_row(p, &layout, me_id, playing, i == main_index),
+                Some(i) == hover,
+            )
         })
         .collect();
-    let count = items.len();
-    super::clamp_offset(list_state, count, rows_area.height as usize);
     frame.render_stateful_widget(List::new(items), rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
 
-/// One station row.
+/// One station row. `now` is what it is announcing, where the page asked.
 fn station_row(
     s: &crate::app::state::Station,
     layout: &Layout,
     saved: bool,
     playing: bool,
     selected: bool,
+    now: Option<NowStatus>,
 ) -> ListItem<'static> {
     let dim = theme::dim();
     // An HLS station is listed but cannot be played, so it is drawn as
@@ -353,6 +400,22 @@ fn station_row(
             spans.push(Span::styled(fit(mark, cell.width), theme::accent()));
         }
         ColKey::Station => spans.push(Span::styled(fit(&s.name, cell.width), name_style)),
+        // A station that was reached and says nothing reads the same as one
+        // that would not answer: both are "no record to name", and the row has
+        // no room to spell the difference. What separates them is that the
+        // first is a settled answer and the second will be asked again.
+        ColKey::Now => {
+            let (text, style) = match &now {
+                Some(NowStatus::Title(t)) => (t.as_str(), theme::text()),
+                Some(NowStatus::Probing) => ("…", dim),
+                _ => ("—", dim),
+            };
+            let style = match playing {
+                true => theme::accent(),
+                false => style,
+            };
+            spans.push(Span::styled(fit(text, cell.width), style));
+        }
         ColKey::Tags => spans.push(Span::styled(fit(&s.tags, cell.width), dim)),
         ColKey::Where => {
             let where_ = match s.countrycode.is_empty() {
@@ -384,38 +447,58 @@ fn render_station_table(
     stations: &[&crate::app::state::Station],
     favorites: &[crate::app::state::Station],
     playing_url: Option<&str>,
+    now: Option<&NowBoard>,
     sort: Sort,
     main_index: usize,
     list_state: &mut ListState,
     hit: &mut HitAreas,
     mouse: Option<Position>,
 ) {
-    let layout = Layout::resolve(&super::columns::stations(), body.width as usize, 0);
+    let layout = Layout::resolve(
+        &super::columns::stations(now.is_some()),
+        body.width as usize,
+        0,
+    );
     let rows_area = layout.draw_header(frame, body, Some(sort), mouse, hit);
     hit.main_list = rows_area;
 
+    let count = stations.len();
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    let hover = super::table::hovered_row(rows_area, list_state.offset(), count, mouse);
     let items: Vec<ListItem> = stations
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            station_row(
-                s,
-                &layout,
-                favorites.iter().any(|f| f.uuid == s.uuid),
-                playing_url == Some(s.url.as_str()),
-                i == main_index,
+            super::table::hover_row(
+                station_row(
+                    s,
+                    &layout,
+                    favorites.iter().any(|f| f.uuid == s.uuid),
+                    playing_url == Some(s.url.as_str()),
+                    i == main_index,
+                    now.and_then(|board| board.status(s)),
+                ),
+                Some(i) == hover,
             )
         })
         .collect();
-    let count = items.len();
-    super::clamp_offset(list_state, count, rows_area.height as usize);
     frame.render_stateful_widget(List::new(items), rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
 
 /// One country or genre row: a name and how many stations are behind it.
-fn facet_row(label: &str, count: u32, layout: &Layout, selected: bool) -> ListItem<'static> {
+fn facet_row(
+    key: &str,
+    label: &str,
+    count: u32,
+    layout: &Layout,
+    selected: bool,
+) -> ListItem<'static> {
     let spans = row_spans(layout, |cell, spans| match cell.key {
+        ColKey::Code => spans.push(Span::styled(
+            fit(&key.to_uppercase(), cell.width),
+            theme::dim(),
+        )),
         ColKey::Name => spans.push(Span::styled(fit(label, cell.width), theme::text())),
         ColKey::Stations => spans.push(Span::styled(
             right(&count.to_string(), cell.width),
@@ -443,13 +526,14 @@ fn draw_radio(
     view: &crate::app::state::RadioView,
     favorites: &[crate::app::state::Station],
     playing_url: Option<&str>,
+    now: &NowBoard,
     main_index: usize,
     list_state: &mut ListState,
     retries: u32,
     hit: &mut HitAreas,
     mouse: Option<Position>,
 ) {
-    use crate::app::state::{RadioRow, RadioTab};
+    use crate::app::state::{RadioRow, RadioScope, RadioTab};
 
     let facets = matches!(view.rows.first(), Some(RadioRow::Facet { .. }));
     let inner = body_area(area);
@@ -503,12 +587,16 @@ fn draw_radio(
                 RadioRow::Facet { .. } => None,
             })
             .collect();
+        // Only the saved page asks what its stations are playing, so only it
+        // has a column for the answer — see `columns::stations`.
+        let now = matches!(view.scope, RadioScope::Favorites).then_some(now);
         render_station_table(
             frame,
             body,
             &stations,
             favorites,
             playing_url,
+            now,
             view.rows.sort,
             main_index,
             list_state,
@@ -521,28 +609,37 @@ fn draw_radio(
     // Countries and genres are their own two-column table, headed by what its
     // rows are — the tab above says which list you are on, not what the
     // number beside each row counts.
-    let label = match view.scope.tab() {
-        RadioTab::Genres => "Genre",
-        _ => "Country",
+    let countries = !matches!(view.scope.tab(), RadioTab::Genres);
+    let label = match countries {
+        true => "Country",
+        false => "Genre",
     };
-    let layout = Layout::resolve(&super::columns::facets(label), body.width as usize, 0);
+    let layout = Layout::resolve(
+        &super::columns::facets(label, countries),
+        body.width as usize,
+        0,
+    );
     let rows_area = layout.draw_header(frame, body, Some(view.rows.sort), mouse, hit);
     hit.main_list = rows_area;
+    let count = view.rows.len();
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    let hover = super::table::hovered_row(rows_area, list_state.offset(), count, mouse);
     let items: Vec<ListItem> = view
         .rows
         .rows()
         .enumerate()
-        .map(|(i, row)| match row {
-            RadioRow::Facet { label, count, .. } => {
-                facet_row(label, *count, &layout, i == main_index)
-            }
-            // Unreachable: `facets` is read off the first row, and the
-            // directory never mixes the two kinds in one answer.
-            RadioRow::Station(s) => facet_row(&s.name, 0, &layout, i == main_index),
+        .map(|(i, row)| {
+            let item = match row {
+                RadioRow::Facet { key, label, count } => {
+                    facet_row(key, label, *count, &layout, i == main_index)
+                }
+                // Unreachable: `facets` is read off the first row, and the
+                // directory never mixes the two kinds in one answer.
+                RadioRow::Station(s) => facet_row("", &s.name, 0, &layout, i == main_index),
+            };
+            super::table::hover_row(item, Some(i) == hover)
         })
         .collect();
-    let count = items.len();
-    super::clamp_offset(list_state, count, rows_area.height as usize);
     frame.render_stateful_widget(List::new(items), rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
@@ -569,10 +666,10 @@ const CARD_H: usize = CARD_ART_H as usize + 1;
 const MIN_CARD_TEXT_W: u16 = 24;
 /// The play control on a card, and on the header bands above it.
 const PLAY_PILL: &str = "▶ play";
-/// The shuffle control beside every ▶ play. The bare word, no glyph: the
-/// deck already names the mode in words, and the common shuffle glyphs are
-/// emoji- or ambiguous-width, which would drift the recorded hit rect.
-const SHUFFLE_PILL: &str = "shuffle";
+/// The shuffle control beside every ▶ play, wearing the same ▶: the dedicated
+/// shuffle glyphs are emoji- or ambiguous-width, which would drift the
+/// recorded hit rect away from what the terminal draws.
+const SHUFFLE_PILL: &str = "▶ shuffle";
 
 /// The playlist controls, beside ▶ play. `★`/`☆` rather than words, matching
 /// the mark a track row already carries for the same idea.
@@ -580,10 +677,15 @@ const SAVED_PILL: &str = "★ saved";
 const SAVE_PILL: &str = "☆ save";
 const EDIT_PILL: &str = "edit";
 
+/// The share control every header band carries, right of ▶ shuffle. It copies
+/// the link to the page itself, where a track row's `⧉` copies the link to one
+/// record on it — the same mark for the same idea at two scales.
+const SHARE_PILL: &str = "⧉ share";
+
 /// Narrowest text column that seats both card pills with their gap; below it
 /// the card keeps ▶ play alone.
 fn card_pills_min_w() -> usize {
-    super::table::width(PLAY_PILL) + 2 + super::table::width(SHUFFLE_PILL)
+    super::table::width(PLAY_PILL) + 1 + super::table::width(SHUFFLE_PILL)
 }
 
 /// The playlist-only controls a header band carries, settled before the draw
@@ -598,22 +700,31 @@ struct HeaderControls {
     /// Draw the edit control. Only a playlist you own takes it; Spotify
     /// refuses the change for any other.
     edit: bool,
+    /// Draw the share control. Off on a page with no link of its own to give —
+    /// see [`AppState::open_page_link`].
+    share: bool,
 }
 
 /// What the open page offers beyond playing itself.
 fn header_controls(st: &AppState) -> HeaderControls {
+    let share = st.open_page_link().is_some();
     let Some(id) = st.open_playlist_id() else {
-        return HeaderControls::default();
+        return HeaderControls {
+            share,
+            ..Default::default()
+        };
     };
     if st.owns_open_playlist() {
         return HeaderControls {
             save: None,
             edit: true,
+            share,
         };
     }
     HeaderControls {
         save: st.saved_playlists.get(id).copied(),
         edit: false,
+        share,
     }
 }
 
@@ -626,8 +737,8 @@ fn pill_segment(
     mouse: Option<Position>,
     label: &'static str,
 ) -> Rect {
-    spans.push(Span::raw("  "));
-    *x = x.saturating_add(2);
+    spans.push(Span::raw(" "));
+    *x = x.saturating_add(1);
     super::table::segment(
         spans,
         x,
@@ -646,8 +757,8 @@ fn save_segment(
     mouse: Option<Position>,
     saved: bool,
 ) -> Rect {
-    spans.push(Span::raw("  "));
-    *x = x.saturating_add(2);
+    spans.push(Span::raw(" "));
+    *x = x.saturating_add(1);
     let (label, style) = match saved {
         true => (SAVED_PILL, theme::accent()),
         false => (SAVE_PILL, theme::dim()),
@@ -664,8 +775,8 @@ fn shuffle_segment(
     area: Rect,
     mouse: Option<Position>,
 ) -> Rect {
-    spans.push(Span::raw("  "));
-    *x = x.saturating_add(2);
+    spans.push(Span::raw(" "));
+    *x = x.saturating_add(1);
     let rect = Rect {
         x: *x,
         y: area.y,
@@ -871,6 +982,9 @@ fn artist_band(
         vec![Span::styled(PLAY_PILL, theme::accent())],
     );
     hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
+    // Unconditional, unlike the list header's: an artist page is opened by id,
+    // so there is always a link to give.
+    hit.header_share_btn = pill_segment(&mut spans, &mut x, play_area, mouse, SHARE_PILL);
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
 
     let used = if stacked { ART_BAND_H } else { TEXT_BAND_H };
@@ -931,10 +1045,13 @@ fn artist_body(
         // to back and made the section label look like part of the table.
         plan.push(ArtistLine::Blank);
         plan.push(ArtistLine::TrackHeader);
+        // A blank under the column header too, the gap every other table on
+        // the browse screen keeps between its header and its rows.
+        plan.push(ArtistLine::Blank);
         plan.extend((0..split).map(ArtistLine::Track));
         plan.push(ArtistLine::Blank);
     }
-    let tracks_at = (split > 0).then_some(3usize);
+    let tracks_at = (split > 0).then_some(4usize);
     let cards_at = plan.len();
     // One group is no choice, so its strip would only say what the heading
     // above it already says.
@@ -1035,7 +1152,7 @@ fn artist_body(
             push(
                 &mut hit.card_shuffle,
                 CARD_PLAY_ROW,
-                (super::table::width(PLAY_PILL) + 2) as u16,
+                (super::table::width(PLAY_PILL) + 1) as u16,
                 super::table::width(SHUFFLE_PILL) as u16,
             );
         }
@@ -1056,18 +1173,24 @@ fn artist_body(
     if let Some(first) = tracks_at {
         let visible = (first.max(offset), (first + split).min(offset + height));
         if visible.1 > visible.0 {
+            let rows: Vec<&Track> = (visible.0 - first..visible.1 - first)
+                .map(|i| &v.top.items[v.top.display[i]])
+                .collect();
             track_cells(
                 &layout,
                 body,
                 body.y + (visible.0 - offset) as u16,
-                (visible.1 - visible.0) as u16,
+                &rows,
                 hit,
             );
+            let artist_x = layout
+                .cell(ColKey::Artist)
+                .map(|c| body.x.saturating_add(c.x as u16));
             // The column, then the row: both rects sit inside the track
             // block, so the row arithmetic is only safe once one of them has
             // claimed the pointer.
             hover_cell = mouse
-                .and_then(|m| hovered_cell(hit, m).map(|col| (m, col)))
+                .and_then(|m| hovered_cell(hit, m, artist_x).map(|col| (m, col)))
                 .map(|(m, col)| (offset + (m.y - body.y) as usize - first, col));
         }
     }
@@ -1078,7 +1201,7 @@ fn artist_body(
     // than a fixed paragraph above it, so it is drawn at whatever row the
     // scroll has put it on — and its hit rects follow it off screen the way
     // the album-group strip above does.
-    let header_at = tracks_at.map(|first| first - 1);
+    let header_at = tracks_at.map(|first| first - 2);
     let header_row = Rect {
         x: body.x,
         y: header_at.and_then(screen_y).unwrap_or(body.y),
@@ -1086,43 +1209,51 @@ fn artist_body(
         height: u16::from(header_at.and_then(screen_y).is_some()),
     };
     let header_line = layout.header_line(Some(v.top.sort), header_row, mouse, hit);
+    // The pointer lands on a planned line, and only a track line is a table
+    // row: a heading, a blank or a card is not something a wash would be about.
+    let hover = super::table::hovered_row(body, offset, plan.len(), mouse);
     let items: Vec<ListItem> = plan
         .iter()
-        .map(|line| match *line {
-            ArtistLine::Heading(text) => ListItem::new(Line::styled(
-                text.to_string(),
-                theme::text().add_modifier(Modifier::BOLD),
-            )),
-            ArtistLine::TrackHeader => ListItem::new(header_line.clone()),
-            ArtistLine::Track(i) => {
-                let ti = v.top.display[i];
-                let t = &v.top.items[ti];
-                track_row(
-                    t,
-                    &layout,
-                    track_no(t, ti, false),
-                    if Some(i) == playing {
-                        RowMark::Playing
-                    } else {
-                        RowMark::None
-                    },
-                    i == main_index,
-                    liked.get(&t.uri).copied(),
-                    hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
-                )
-            }
-            ArtistLine::Tabs => ListItem::new(Line::from(tab_spans.clone())),
-            ArtistLine::Card { album, row } => card_line(
-                &v.albums.items[v.albums.display[album]],
-                row,
-                indent as usize,
-                card_text_w,
-                split + album == main_index,
-                hover_album == Some(album),
-                hover_play == Some(album),
-                hover_shuffle == Some(album),
-            ),
-            ArtistLine::Blank => ListItem::new(Line::default()),
+        .enumerate()
+        .map(|(at, line)| {
+            let item = match *line {
+                ArtistLine::Heading(text) => ListItem::new(Line::styled(
+                    text.to_string(),
+                    theme::text().add_modifier(Modifier::BOLD),
+                )),
+                ArtistLine::TrackHeader => ListItem::new(header_line.clone()),
+                ArtistLine::Track(i) => {
+                    let ti = v.top.display[i];
+                    let t = &v.top.items[ti];
+                    track_row(
+                        t,
+                        &layout,
+                        track_no(t, ti, false),
+                        if Some(i) == playing {
+                            RowMark::Playing
+                        } else {
+                            RowMark::None
+                        },
+                        i == main_index,
+                        liked.get(&t.uri).copied(),
+                        hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
+                    )
+                }
+                ArtistLine::Tabs => ListItem::new(Line::from(tab_spans.clone())),
+                ArtistLine::Card { album, row } => card_line(
+                    &v.albums.items[v.albums.display[album]],
+                    row,
+                    indent as usize,
+                    card_text_w,
+                    split + album == main_index,
+                    hover_album == Some(album),
+                    hover_play == Some(album),
+                    hover_shuffle == Some(album),
+                ),
+                ArtistLine::Blank => ListItem::new(Line::default()),
+            };
+            let track = matches!(*line, ArtistLine::Track(_));
+            super::table::hover_row(item, track && Some(at) == hover)
         })
         .collect();
     frame.render_stateful_widget(List::new(items), body, list_state);
@@ -1207,7 +1338,7 @@ fn card_line(
             // thing selected.
             spans.push(Span::styled(PLAY_PILL, style));
             if text_w >= card_pills_min_w() {
-                spans.push(Span::raw("  "));
+                spans.push(Span::raw(" "));
                 let style = if shuffle_hover {
                     super::table::hover_style(theme::accent())
                 } else {
@@ -1262,11 +1393,19 @@ fn format_total_duration(ms: u64) -> String {
     }
 }
 
-/// Rows an album's sleeve spans in the header band, and the narrowest text
-/// column worth keeping it for. Wider than the bottom bar's thumbnail because
-/// this is the one view that is *about* a record rather than merely reporting
-/// which one is playing.
-const ART_H: u16 = 6;
+/// Rows a sleeve spans in a header band, and the narrowest text column worth
+/// keeping it for. Twenty cells wide, by [`super::table::art_w`].
+///
+/// Larger than every other block in the app — the bottom bar's thumbnail, the
+/// artist page's album cards — because these are the two views that are
+/// *about* a record or a performer rather than reporting which one is playing.
+/// The artist band draws its photo at the same size on purpose: the two
+/// mastheads are one shape, and a page whose portrait was half its neighbour's
+/// sleeve would read as a different design rather than as the same one.
+///
+/// The band keeps its sleeve at 16 rows and 63 cells, and sheds it below
+/// either — see `stacked`.
+const ART_H: u16 = 10;
 const ART_GAP: u16 = 3;
 const MIN_META_W: u16 = 40;
 /// Rows the band spends beside a sleeve: the sleeve itself, then a blank
@@ -1395,7 +1534,7 @@ fn header_band(
     let mut n = 1;
     if stacked && !list.header.subtitle.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::styled(list.header.subtitle.clone(), gray)),
+            Paragraph::new(Line::from(subtitle_spans(list, row(n), gray, mouse, hit))),
             row(n),
         );
         n += 1;
@@ -1436,6 +1575,10 @@ fn header_band(
         vec![Span::styled(PLAY_PILL, accent)],
     );
     hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
+    hit.header_share_btn = match controls.share {
+        true => pill_segment(&mut spans, &mut x, play_area, mouse, SHARE_PILL),
+        false => Rect::default(),
+    };
     hit.header_save_btn = match controls.save {
         Some(saved) => save_segment(&mut spans, &mut x, play_area, mouse, saved),
         None => Rect::default(),
@@ -1459,6 +1602,50 @@ fn header_band(
         height: inner.height.saturating_sub(used),
         ..inner
     }
+}
+
+/// A header band's subtitle row: the credited artists as links, then whatever
+/// else the subtitle says about the record.
+///
+/// A page with no credits — a playlist, Liked Songs — prints its subtitle
+/// whole and records nothing, so a click there reaches whatever is underneath
+/// rather than a target nothing on screen offered.
+///
+/// The year comes off the end of the subtitle the client built (see
+/// `Client::load_album_view`), so the two spellings of the same row cannot
+/// drift apart.
+fn subtitle_spans(
+    list: &crate::app::state::TrackList,
+    row: Rect,
+    style: Style,
+    mouse: Option<Position>,
+    hit: &mut HitAreas,
+) -> Vec<Span<'static>> {
+    let subtitle = super::table::fit(&list.header.subtitle, row.width as usize);
+    if list.header.credits.is_empty() {
+        return vec![Span::styled(subtitle.trim_end().to_string(), style)];
+    }
+    let (cell, runs) = super::table::credit_line(&list.header.credits, row.width as usize);
+    let cell = cell.trim_end();
+    let names = Rect {
+        width: super::table::width(cell) as u16,
+        height: 1,
+        ..row
+    }
+    .intersection(row);
+    let hovered = super::table::hovered_credit(names, &runs, mouse);
+    let mut spans = super::table::credit_spans(cell, &runs, style, hovered);
+    super::table::credit_links(names, &runs, &mut hit.header_artist_links);
+    // The rest of the subtitle, which is the year and the separator before it.
+    let rest = subtitle
+        .trim_end()
+        .strip_prefix(cell)
+        .unwrap_or_default()
+        .to_string();
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest, theme::dim()));
+    }
+    spans
 }
 
 /// Render a row of clickable tab segments and record their hit rects.
@@ -1865,18 +2052,45 @@ fn centered_line(frame: &mut Frame, inner: Rect, offset: i16, line: Line<'static
     frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), row);
 }
 
-use super::table::{ADD_W, LIKE_W, action_spans};
+use super::table::{ADD_W, LIKE_W, RowAction, SHARE_W, action_spans};
 
 /// Which clickable cell of a track row the mouse is over.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HoverCol {
     Like,
+    Share,
     Add,
-    Artist,
+    /// One credited artist, named by a column inside it — the pointer's own,
+    /// measured from the left edge of the Artist cell. A record credits
+    /// several and each leads somewhere else, so "the Artist column" does not
+    /// say which name to light.
+    Artist(u16),
     Album,
 }
 
+impl HoverCol {
+    /// The action-run control this is, if it is one of them. The two text
+    /// columns are drawn by this module and have no counterpart in the run.
+    fn action(self) -> Option<RowAction> {
+        match self {
+            HoverCol::Like => Some(RowAction::Like),
+            HoverCol::Share => Some(RowAction::Share),
+            HoverCol::Add => Some(RowAction::Add),
+            HoverCol::Artist(_) | HoverCol::Album => None,
+        }
+    }
+}
+
 use super::table::fit;
+
+/// Cells `text` actually prints in a `width`-wide cell.
+///
+/// What [`cell_spans`] lights, so a link's target covers the run the pointer
+/// lit and nothing else. A name too long for its column is truncated to fill
+/// it, so that one's target is the whole column.
+fn printed_w(text: &str, width: usize) -> u16 {
+    super::table::width(fit(text, width).trim_end()) as u16
+}
 
 /// A cell of `width` columns holding `text`, as spans, lit when `hovered`.
 ///
@@ -1896,6 +2110,28 @@ fn cell_spans(text: &str, width: usize, style: Style, hovered: bool) -> Vec<Span
         Span::styled(lit.to_string(), super::table::hover_style(style)),
         Span::raw(" ".repeat(pad)),
     ]
+}
+
+/// A credit line in a `width`-column cell, as spans, with the name the pointer
+/// is on lit.
+///
+/// [`cell_spans`] lights a whole cell, which is right where the cell is one
+/// link. A credit cell is several, so the light goes on the name `hover` names
+/// and the ones either side of it stay unlit — they lead somewhere else.
+fn credit_cell(
+    credits: &[Credit],
+    width: usize,
+    style: Style,
+    hover: Option<HoverCol>,
+) -> Vec<Span<'static>> {
+    let (cell, runs) = super::table::credit_line(credits, width);
+    let lit = match hover {
+        Some(HoverCol::Artist(dx)) => runs
+            .iter()
+            .position(|run| dx >= run.dx && dx < run.dx.saturating_add(run.width)),
+        _ => None,
+    };
+    super::table::credit_spans(&cell, &runs, style, lit)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1954,13 +2190,10 @@ fn track_row(
             spans.push(Span::styled(right(&no, cell.width), dim));
         }
         ColKey::Title => spans.push(Span::styled(fit(&t.name, cell.width), name_style)),
-        // Artist and album cells are clickable; hovering lights them.
-        ColKey::Artist => spans.extend(cell_spans(
-            &t.artists,
-            cell.width,
-            dim,
-            hover == Some(HoverCol::Artist),
-        )),
+        // Artist and album cells are clickable; hovering lights them. In the
+        // artist cell the light goes on one name of several — see
+        // [`credit_cell`].
+        ColKey::Artist => spans.extend(credit_cell(&t.credits, cell.width, dim, hover)),
         ColKey::Album => spans.extend(cell_spans(
             &t.album,
             cell.width,
@@ -1970,11 +2203,7 @@ fn track_row(
         ColKey::Year => spans.push(Span::styled(fit(&t.release_year, cell.width), dim)),
         ColKey::Actions => {
             star_at = Some(spans.len());
-            spans.extend(action_spans(
-                liked,
-                hover == Some(HoverCol::Like),
-                hover == Some(HoverCol::Add),
-            ));
+            spans.extend(action_spans(liked, hover.and_then(HoverCol::action)));
         }
         ColKey::Time => spans.push(Span::styled(
             right(&format_duration(t.duration_ms), cell.width),
@@ -2004,6 +2233,7 @@ fn album_row(
     playing: bool,
     selected: bool,
     hovered: bool,
+    hover: Option<HoverCol>,
 ) -> ListItem<'static> {
     let dim = theme::dim();
     let spans = row_spans(layout, |cell, spans| match cell.key {
@@ -2014,7 +2244,7 @@ fn album_row(
         // The name is the link, so it lights under the pointer — the same
         // affordance `track_row` gives the album cell of a track table.
         ColKey::Album => spans.extend(cell_spans(&a.name, cell.width, theme::text(), hovered)),
-        ColKey::Artist => spans.push(Span::styled(fit(&a.artists, cell.width), dim)),
+        ColKey::Artist => spans.extend(credit_cell(&a.credits, cell.width, dim, hover)),
         ColKey::Year => spans.push(Span::styled(fit(&a.release_year, cell.width), dim)),
         ColKey::Type => spans.push(Span::styled(fit(&a.album_type, cell.width), dim)),
         ColKey::Tracks => {
@@ -2113,23 +2343,62 @@ fn render_album_table(
         false => layout.draw_header(frame, inner, Some(albums.sort), mouse, hit),
     };
     hit.main_list = rows_area;
+    let count = albums.len();
+    super::clamp_offset(list_state, count, rows_area.height as usize);
 
     // The album name is a link here the same way the Album *column* is one in
-    // a track table: single click opens the album. The rect covers the name
-    // column only, clipped to the rows actually filled.
-    let filled_rows =
-        (albums.len().saturating_sub(list_state.offset()) as u16).min(rows_area.height);
+    // a track table: single click opens the album. The target is the name as
+    // printed on each row, clipped to the rows actually filled.
+    let filled_rows = (count.saturating_sub(list_state.offset()) as u16).min(rows_area.height);
     let name = layout.cell(ColKey::Album);
-    hit.main_album_col = Rect {
-        x: rows_area.x + name.map_or(0, |c| c.x) as u16,
-        y: rows_area.y,
-        width: layout.width_of(ColKey::Album) as u16,
-        height: filled_rows,
+    let name_w = layout.width_of(ColKey::Album);
+    hit.main_album_col = TextCol {
+        rect: Rect {
+            x: rows_area.x + name.map_or(0, |c| c.x) as u16,
+            y: rows_area.y,
+            width: name_w as u16,
+            height: filled_rows,
+        }
+        .intersection(rows_area),
+        widths: albums
+            .rows()
+            .skip(list_state.offset())
+            .take(filled_rows as usize)
+            .map(|a| printed_w(&a.name, name_w))
+            .collect(),
+    };
+    // Each credited artist is a link too, on the same terms the Artist column
+    // of a track table gives them.
+    let artist = layout.cell(ColKey::Artist);
+    let artist_w = layout.width_of(ColKey::Artist);
+    let artist_x = artist.map(|c| rows_area.x.saturating_add(c.x as u16));
+    for (row, a) in albums
+        .rows()
+        .skip(list_state.offset())
+        .take(filled_rows as usize)
+        .enumerate()
+    {
+        let cell = Rect {
+            x: artist_x.unwrap_or(rows_area.x),
+            y: rows_area.y.saturating_add(row as u16),
+            width: artist_w as u16,
+            height: 1,
+        }
+        .intersection(rows_area);
+        let (_, runs) = super::table::credit_line(&a.credits, artist_w);
+        super::table::credit_links(cell, &runs, &mut hit.album_artist_links);
     }
-    .intersection(rows_area);
-    let hover_row = mouse
-        .filter(|m| hit.main_album_col.contains(*m))
+    let hover_name = mouse
+        .filter(|m| hit.main_album_col.hit(*m))
         .map(|m| list_state.offset() + (m.y - rows_area.y) as usize);
+    let hover_artist = mouse
+        .filter(|m| hit.album_artist_links.iter().any(|(r, _)| r.contains(*m)))
+        .and_then(|m| {
+            let row = list_state.offset() + (m.y - rows_area.y) as usize;
+            let dx = m.x.saturating_sub(artist_x?);
+            Some((row, HoverCol::Artist(dx)))
+        });
+    let hover = super::table::hovered_row(rows_area, list_state.offset(), count, mouse);
 
     let items: Vec<ListItem> = albums
         .rows()
@@ -2137,11 +2406,19 @@ fn render_album_table(
         .map(|(i, a)| {
             let playing =
                 marks.context.as_deref() == Some(crate::app::state::album_key(&a.id).as_str());
-            album_row(a, &layout, playing, i == main_index, hover_row == Some(i))
+            super::table::hover_row(
+                album_row(
+                    a,
+                    &layout,
+                    playing,
+                    i == main_index,
+                    hover_name == Some(i),
+                    hover_artist.and_then(|(row, col)| (row == i).then_some(col)),
+                ),
+                Some(i) == hover,
+            )
         })
         .collect();
-    let count = items.len();
-    super::clamp_offset(list_state, count, rows_area.height as usize);
     frame.render_stateful_widget(List::new(items), rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
@@ -2173,14 +2450,25 @@ fn render_track_table(
     hit.main_list = rows_area;
     super::clamp_offset(list_state, tracks.len(), rows_area.height as usize);
 
-    // Clickable cells: the artist and album columns, clipped to actual rows.
-    let filled_rows =
-        (tracks.len().saturating_sub(list_state.offset()) as u16).min(rows_area.height);
-    track_cells(&layout, rows_area, rows_area.y, filled_rows, hit);
+    // Clickable cells: the `★ ⧉ +` run, each credited artist, and the album,
+    // clipped to the rows actually on screen. The rows come along whole, so
+    // each target is the name that row prints.
+    let visible: Vec<&Track> = tracks
+        .display
+        .iter()
+        .skip(list_state.offset())
+        .take(rows_area.height as usize)
+        .map(|&ti| &tracks.items[ti])
+        .collect();
+    track_cells(&layout, rows_area, rows_area.y, &visible, hit);
+    let artist_x = layout
+        .cell(ColKey::Artist)
+        .map(|c| rows_area.x.saturating_add(c.x as u16));
     let hover_cell: Option<(usize, HoverCol)> = mouse.and_then(|m| {
         let row = |y: u16| list_state.offset() + (y - rows_area.y) as usize;
-        hovered_cell(hit, m).map(|col| (row(m.y), col))
+        hovered_cell(hit, m, artist_x).map(|col| (row(m.y), col))
     });
+    let hover = super::table::hovered_row(rows_area, list_state.offset(), tracks.len(), mouse);
     // Row positions are in display order; the playing marker resolves by URI.
     let playing = marks.uri.as_deref().and_then(|uri| tracks.position_of(uri));
     let items: Vec<ListItem> = tracks
@@ -2194,14 +2482,17 @@ fn render_track_table(
             } else {
                 RowMark::None
             };
-            track_row(
-                t,
-                &layout,
-                track_no(t, ti, album),
-                mark,
-                i == main_index,
-                liked.get(&t.uri).copied(),
-                hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
+            super::table::hover_row(
+                track_row(
+                    t,
+                    &layout,
+                    track_no(t, ti, album),
+                    mark,
+                    i == main_index,
+                    liked.get(&t.uri).copied(),
+                    hover_cell.and_then(|(row, col)| (row == i).then_some(col)),
+                ),
+                Some(i) == hover,
             )
         })
         .collect();
@@ -2211,13 +2502,19 @@ fn render_track_table(
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
 
-/// Record the clickable columns of a track table: the `★ +` pair, the artist
-/// and the album, each clipped to the rows actually on screen.
+/// Record the clickable columns of a track table: the `★ ⧉ +` run, every
+/// credited artist, and the album, each clipped to the rows on screen.
+///
+/// `rows` is every row on screen, top row first. It gives the columns their
+/// height, the album column the width of each row's printed name, and the
+/// artist column one target per credit — so a target is the run the pointer
+/// lit rather than the padded cell around it, and a record with three artists
+/// leads to three pages.
 ///
 /// One definition for both places a track table is drawn — the browse pane and
 /// the artist page's top-tracks block — so the two cannot come to disagree
 /// about where a control is.
-fn track_cells(layout: &Layout, body: Rect, top: u16, rows: u16, hit: &mut HitAreas) {
+fn track_cells(layout: &Layout, body: Rect, top: u16, rows: &[&Track], hit: &mut HitAreas) {
     let col = |cell: Option<&Cell>, dx: usize, width: usize| {
         let Some(cell) = cell else {
             return Rect::default();
@@ -2226,33 +2523,52 @@ fn track_cells(layout: &Layout, body: Rect, top: u16, rows: u16, hit: &mut HitAr
             x: body.x.saturating_add((cell.x + dx) as u16),
             y: top,
             width: width as u16,
-            height: rows,
+            height: rows.len() as u16,
         }
         .intersection(body)
     };
     let actions = layout.cell(ColKey::Actions);
     hit.main_like_col = col(actions, 0, LIKE_W);
-    // Flush against the liked cell: each carries its own padding, so the two
-    // targets meet.
-    hit.main_add_col = col(actions, LIKE_W, ADD_W);
+    // Flush against each other: every cell carries its own padding, so the
+    // three targets meet.
+    hit.main_share_col = col(actions, LIKE_W, SHARE_W);
+    hit.main_add_col = col(actions, LIKE_W + SHARE_W, ADD_W);
     let artist = layout.cell(ColKey::Artist);
-    hit.main_artist_col = col(artist, 0, artist.map_or(0, |c| c.width));
+    let artist_w = artist.map_or(0, |c| c.width);
+    for (row, t) in rows.iter().enumerate() {
+        let cell = col(artist, 0, artist_w).intersection(Rect {
+            y: top.saturating_add(row as u16),
+            height: 1,
+            ..body
+        });
+        let (_, runs) = super::table::credit_line(&t.credits, artist_w);
+        super::table::credit_links(cell, &runs, &mut hit.main_artist_links);
+    }
     let album = layout.cell(ColKey::Album);
-    hit.main_album_col = col(album, 0, album.map_or(0, |c| c.width));
+    let album_w = album.map_or(0, |c| c.width);
+    hit.main_album_col = TextCol {
+        rect: col(album, 0, album_w),
+        widths: rows.iter().map(|t| printed_w(&t.album, album_w)).collect(),
+    };
 }
 
 /// Which clickable cell of a track table the pointer is inside.
-fn hovered_cell(hit: &HitAreas, m: Position) -> Option<HoverCol> {
+///
+/// `artist_x` is where the Artist cell starts on screen, so a hit on one of
+/// its names can be handed back as an offset the row renderer can find the run
+/// by — it draws its own runs and never sees the screen.
+fn hovered_cell(hit: &HitAreas, m: Position, artist_x: Option<u16>) -> Option<HoverCol> {
     if hit.main_like_col.contains(m) {
         Some(HoverCol::Like)
+    } else if hit.main_share_col.contains(m) {
+        Some(HoverCol::Share)
     } else if hit.main_add_col.contains(m) {
         Some(HoverCol::Add)
-    } else if hit.main_artist_col.contains(m) {
-        Some(HoverCol::Artist)
-    } else if hit.main_album_col.contains(m) {
+    } else if hit.main_album_col.hit(m) {
         Some(HoverCol::Album)
     } else {
-        None
+        let x = artist_x.filter(|_| hit.main_artist_links.iter().any(|(r, _)| r.contains(m)))?;
+        Some(HoverCol::Artist(m.x.saturating_sub(x)))
     }
 }
 
@@ -2459,6 +2775,7 @@ fn draw_search(
             &stations,
             favorites,
             playing_url,
+            None,
             results.stations.sort,
             main_index,
             list_state,
@@ -2507,13 +2824,20 @@ fn draw_search(
     let rows_area = layout.draw_header(frame, body, Some(sort), mouse, hit);
     hit.main_list = rows_area;
 
+    let count = match search_tab {
+        SearchTab::Artists => results.artists.len(),
+        _ => results.playlists.len(),
+    };
+    super::clamp_offset(list_state, count, rows_area.height as usize);
+    let hover = super::table::hovered_row(rows_area, list_state.offset(), count, mouse);
+    let wash = |i: usize, item| super::table::hover_row(item, Some(i) == hover);
     let items: Vec<ListItem> = match search_tab {
         SearchTab::Tracks | SearchTab::Albums | SearchTab::Stations => unreachable!(),
         SearchTab::Artists => results
             .artists
             .rows()
             .enumerate()
-            .map(|(i, a)| artist_row(a, &layout, i == main_index))
+            .map(|(i, a)| wash(i, artist_row(a, &layout, i == main_index)))
             .collect(),
         SearchTab::Playlists => results
             .playlists
@@ -2525,14 +2849,11 @@ fn draw_search(
             .map(|(i, p)| {
                 let playing = marks.context.as_deref()
                     == Some(crate::app::state::playlist_key(&p.id).as_str());
-                playlist_row(p, &layout, None, playing, i == main_index)
+                wash(i, playlist_row(p, &layout, None, playing, i == main_index))
             })
             .collect(),
     };
-    let count = items.len();
-    let list = List::new(items);
-    super::clamp_offset(list_state, count, rows_area.height as usize);
-    frame.render_stateful_widget(list, rows_area, list_state);
+    frame.render_stateful_widget(List::new(items), rows_area, list_state);
     super::table::draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
 }
 
@@ -2555,7 +2876,13 @@ mod tests {
             duration_ms: 83_000,
             track_number: 1,
             album_id: None,
-            artist_id: None,
+            credits: artists
+                .split(", ")
+                .map(|name| Credit {
+                    name: name.into(),
+                    id: Some(format!("id-{name}")),
+                })
+                .collect(),
             cover_url: None,
         }
     }
@@ -2565,6 +2892,16 @@ mod tests {
         let mut list = crate::app::state::TrackList::new("My List", "", None);
         list.append(tracks);
         st.main = MainView::Tracks(list);
+        st
+    }
+
+    /// A page that carries its identity, so the header can offer a link to it.
+    fn page_state(kind: crate::app::state::TrackListKind, cache_key: &str) -> AppState {
+        let mut st = tracks_state(vec![track("Alpha", "Ann")]);
+        if let MainView::Tracks(list) = &mut st.main {
+            list.kind = kind;
+            list.cache_key = Some(cache_key.into());
+        }
         st
     }
 
@@ -2634,6 +2971,10 @@ mod tests {
             list.kind = crate::app::state::TrackListKind::Album;
             list.header.name = "Dance In The Street".into();
             list.header.subtitle = "Donna The Buffalo · 2018".into();
+            list.header.credits = vec![Credit {
+                name: "Donna The Buffalo".into(),
+                id: Some("r1".into()),
+            }];
             list.header.cover_url = Some("https://i.scdn.co/image/abc".into());
         }
         st
@@ -2654,7 +2995,7 @@ mod tests {
                 list.header.cover_url = cover.map(Into::into);
             }
             let mut out = st;
-            let lines = render(&mut out, 90, 20);
+            let lines = render(&mut out, 90, 24);
             (lines, out)
         };
 
@@ -2667,24 +3008,24 @@ mod tests {
         let w = super::super::table::art_w(ART_H) as usize;
         assert!(with_art[4].chars().take(w).all(|c| c == '▀' || c == '♫'));
         assert!(with_art[5].contains("Donna The Buffalo · 2018"));
-        assert!(with_art[11].contains("Title"));
+        assert!(with_art[15].contains("Title"));
         // Without one it collapses onto three rows and loses the artwork.
         assert!(!no_art[4].chars().take(w).all(|c| c == '▀' || c == '♫'));
     }
 
     /// The album page is the one browse view that is *about* a record, so it
-    /// is the one that gets a sleeve. It is 6 rows and therefore 12 cells, and
+    /// is the one that gets a sleeve. It is 10 rows and therefore 20 cells, and
     /// the metadata stacks beside it rather than sharing a row with the count.
     #[test]
     fn an_album_page_draws_its_sleeve_beside_stacked_metadata() {
         let mut st = album_state();
-        let lines = render(&mut st, 90, 22);
+        let lines = render(&mut st, 90, 24);
         assert!(lines[PATH].contains("DANCE IN THE STREET"));
-        // Sleeve occupies the left 12 cells of the six band rows.
+        // Sleeve occupies the left 20 cells of the ten band rows.
         // No cover is decoded in the test, so this is the placeholder swatch:
         // half-blocks with a single ♫ in the middle.
         let w = super::super::table::art_w(ART_H) as usize;
-        for row in lines.iter().take(10).skip(4) {
+        for row in lines.iter().take(14).skip(4) {
             let sleeve: String = row.chars().take(w).collect();
             assert!(
                 sleeve.chars().all(|c| c == '▀' || c == '♫'),
@@ -2700,7 +3041,53 @@ mod tests {
         assert!(!st.hit.header_play_btn.is_empty());
         assert!(!st.hit.header_shuffle_btn.is_empty());
         // The table starts after the band and its spacer.
-        assert!(lines[11].contains("Title"));
+        assert!(lines[15].contains("Title"));
+    }
+
+    /// The masthead's credit line is a run of links, not one label: each name
+    /// is its own target, and the year after them is not a target at all.
+    #[test]
+    fn the_album_masthead_links_each_credited_artist() {
+        let mut st = album_state();
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.subtitle = "Donna The Buffalo, Jeb Puryear · 2018".into();
+            list.header.credits.push(Credit {
+                name: "Jeb Puryear".into(),
+                id: Some("r2".into()),
+            });
+        }
+        let lines = render(&mut st, 90, 24);
+        assert!(lines[5].contains("Donna The Buffalo, Jeb Puryear · 2018"));
+
+        let links = &st.hit.header_artist_links;
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].1.id.as_deref(), Some("r1"));
+        assert_eq!(links[1].1.id.as_deref(), Some("r2"));
+        assert_eq!(links[0].0.width, "Donna The Buffalo".len() as u16);
+        assert_eq!(links[1].0.width, "Jeb Puryear".len() as u16);
+        assert_eq!(links[0].0.y, 5, "not on the subtitle row");
+        assert_eq!(links[1].0.x, links[0].0.right() + 2);
+        // The year is past the last name, so nothing there opens a page.
+        let year = Position {
+            x: links[1].0.right() + 3,
+            y: 5,
+        };
+        assert!(!links.iter().any(|(rect, _)| rect.contains(year)));
+    }
+
+    /// A page with nobody credited — a playlist, Liked Songs — prints its
+    /// subtitle whole and records nothing, so a click there reaches the page
+    /// underneath rather than a target nothing offered.
+    #[test]
+    fn a_playlist_masthead_records_no_artist_links() {
+        let mut st = tracks_state(vec![track("Alpha", "Ann")]);
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.subtitle = "by dmills".into();
+            list.header.cover_url = Some("https://i.scdn.co/image/abc".into());
+        }
+        let lines = render(&mut st, 90, 24);
+        assert!(lines[5].contains("by dmills"));
+        assert!(st.hit.header_artist_links.is_empty());
     }
 
     /// Arrive at the state's page from Home, so its trail has a real ancestor
@@ -2897,21 +3284,17 @@ mod tests {
     }
 
     /// Nothing pushed means nothing to go back to — except on an album page,
-    /// which can always go *up* to the artist its tracks credit. An `up` and
+    /// which can always go *up* to the artist its header credits. An `up` and
     /// a `back` are the same shape in a trail, which is half the reason for
     /// drawing one: a single `← <name>` pill spells both and cannot say which
     /// it means.
     #[test]
     fn an_album_page_with_no_history_offers_its_artist() {
         let mut st = album_state();
-        if let MainView::Tracks(list) = &mut st.main {
-            for t in &mut list.items {
-                t.artist_id = Some("r1".into());
-            }
-        }
         let lines = render(&mut st, 90, 22);
+        // Capped at `ANCESTOR_W`, which is what every ancestor crumb gets.
         assert!(
-            lines[PATH].contains("DONNA  ›  DANCE IN THE STREET"),
+            lines[PATH].contains("DONNA THE BUF…  ›  DANCE IN THE STREET"),
             "{:?}",
             lines[PATH]
         );
@@ -2919,13 +3302,16 @@ mod tests {
             st.hit.crumbs[0].1,
             CrumbTarget::Artist {
                 id: "r1".into(),
-                name: "Donna".into()
+                name: "Donna The Buffalo".into()
             }
         );
 
         // Without an artist id there is nowhere to go, so the page stands
         // alone: one crumb, its own name, and nothing to click.
         let mut st = album_state();
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.credits[0].id = None;
+        }
         let lines = render(&mut st, 90, 22);
         assert!(st.hit.crumbs.is_empty());
         assert!(
@@ -3262,7 +3648,7 @@ mod tests {
         assert!(lines[7].contains("Title"));
         assert!(lines[7].contains("Artist"));
         assert!(lines[7].contains("Album"));
-        // Time and the `★ +` pair head themselves.
+        // Time and the `★ ⧉ +` run head themselves.
         assert!(!lines[7].contains("Time"));
         assert!(lines[9].contains("Alpha"));
         // No frame, so rows start at column 0.
@@ -3392,26 +3778,121 @@ mod tests {
         terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        for rect in [st.hit.main_artist_col, st.hit.main_album_col] {
-            assert!(!rect.is_empty());
-            // Clipped to the two filled rows, inside the list area.
-            assert_eq!(rect.height, 2);
-            assert!(st.hit.main_list.contains(Position {
-                x: rect.x,
-                y: rect.y
-            }));
+        let col = &st.hit.main_album_col;
+        assert!(!col.rect.is_empty());
+        // Clipped to the two filled rows, inside the list area.
+        assert_eq!(col.rect.height, 2);
+        assert!(st.hit.main_list.contains(Position {
+            x: col.rect.x,
+            y: col.rect.y
+        }));
+        // One artist per row, each on the row it belongs to.
+        assert_eq!(st.hit.main_artist_links.len(), 2);
+        for (i, (rect, credit)) in st.hit.main_artist_links.iter().enumerate() {
+            assert_eq!(rect.y, st.hit.main_list.y + i as u16);
+            assert_eq!(credit.id.as_deref(), Some(["id-Ann", "id-Bob"][i]));
         }
-        // The recorded columns line up with the rendered cells.
+
+        // The recorded targets line up with the rendered cells.
         let text_at = |rect: Rect, w: usize| -> String {
             (rect.x..rect.x + w as u16)
                 .filter_map(|x| buffer.cell(Position { x, y: rect.y }).map(|c| c.symbol()))
                 .collect()
         };
-        assert_eq!(text_at(st.hit.main_artist_col, 3), "Ann");
-        assert_eq!(text_at(st.hit.main_album_col, 5), "Album");
+        assert_eq!(text_at(st.hit.main_artist_links[0].0, 3), "Ann");
+        assert_eq!(text_at(st.hit.main_album_col.rect, 5), "Album");
     }
 
-    /// Every row wears the pair, and the star reads its state as colour: the
+    /// The target is the name as printed, not the column it is padded out to:
+    /// the pill lights the text alone, and a click in the empty tail of a
+    /// short name would open a page nothing on screen offered.
+    #[test]
+    fn a_link_column_takes_clicks_on_its_text_and_not_its_padding() {
+        let mut st = tracks_state(vec![track("Alpha", "Ann"), track("Beta", "Bob")]);
+        render(&mut st, 90, 14);
+
+        let col = &st.hit.main_album_col;
+        let printed = "Album Name".len() as u16;
+        assert!(
+            col.rect.width > printed,
+            "the column is not padded, so this proves nothing"
+        );
+        assert_eq!(col.widths, vec![printed, printed]);
+        let at = |dx: u16| Position {
+            x: col.rect.x + dx,
+            y: col.rect.y,
+        };
+        assert!(col.hit(at(0)), "the first cell of the name misses");
+        assert!(col.hit(at(printed - 1)), "the last cell of the name misses");
+        assert!(!col.hit(at(printed)), "the padding after the name hits");
+        assert!(!col.hit(at(col.rect.width - 1)), "the far edge hits");
+
+        // The artist column is padded the same way, and its target is the name
+        // rather than the cell — it is recorded as the name and nothing else.
+        let (rect, _) = st.hit.main_artist_links[0];
+        assert_eq!(rect.width, "Ann".len() as u16);
+    }
+
+    /// A record credited to several artists prints one line and records one
+    /// target per name, each covering that name and neither of its neighbours.
+    #[test]
+    fn every_credited_artist_is_its_own_target() {
+        let mut st = tracks_state(vec![track("Clarity", "Zedd, Alessia Cara")]);
+        render(&mut st, 110, 14);
+
+        let links = &st.hit.main_artist_links;
+        assert_eq!(links.len(), 2, "one target per name");
+        assert_eq!(links[0].1.name, "Zedd");
+        assert_eq!(links[1].1.name, "Alessia Cara");
+        assert_eq!(links[0].0.width, "Zedd".len() as u16);
+        assert_eq!(links[1].0.width, "Alessia Cara".len() as u16);
+        assert_eq!(
+            links[1].0.x,
+            links[0].0.right() + 2,
+            "the `, ` between them belongs to neither"
+        );
+    }
+
+    /// A name Spotify identified by name only is drawn and inert, the way a
+    /// station's country is when the directory gave no code.
+    #[test]
+    fn a_credit_without_an_id_is_printed_but_not_a_target() {
+        let mut anonymous = track("Clarity", "Zedd");
+        anonymous.credits[0].id = None;
+        let mut st = tracks_state(vec![anonymous]);
+        let lines = render(&mut st, 110, 14);
+
+        assert!(
+            lines.iter().any(|l| l.contains("Zedd")),
+            "the name went missing"
+        );
+        assert!(st.hit.main_artist_links.is_empty());
+    }
+
+    /// A row with nothing in the cell prints nothing, so there is nothing to
+    /// click — the whole padded column used to open an album the row had not
+    /// got.
+    #[test]
+    fn an_empty_cell_is_no_target_at_all() {
+        let mut blank = track("Alpha", "Ann");
+        blank.album = String::new();
+        let mut st = tracks_state(vec![blank]);
+        render(&mut st, 90, 14);
+
+        let col = &st.hit.main_album_col;
+        assert_eq!(col.widths, vec![0]);
+        for dx in 0..col.rect.width {
+            assert!(
+                !col.hit(Position {
+                    x: col.rect.x + dx,
+                    y: col.rect.y
+                }),
+                "an empty cell took a click at {dx}"
+            );
+        }
+    }
+
+    /// Every row wears the run, and the star reads its state as colour: the
     /// accent when saved, dim when not. The glyph itself never changes, so a
     /// row that is still being checked looks like one that came back unsaved
     /// rather than like a third thing.
@@ -3447,15 +3928,61 @@ mod tests {
         assert_eq!(star(2).fg, theme::DIM);
     }
 
-    /// Hovering either control lights that control alone — its whole padded
+    /// A page you can link to offers the control, right of ▶ shuffle and left
+    /// of the playlist controls after it.
+    #[test]
+    fn a_page_with_a_link_offers_the_share_control() {
+        use crate::app::state::TrackListKind;
+        for (kind, key) in [
+            (TrackListKind::Playlist, "playlist:p1"),
+            (TrackListKind::Album, "album:a1"),
+        ] {
+            let mut st = page_state(kind, key);
+            let lines = render(&mut st, 90, 14);
+            assert!(lines[5].contains("⧉ share"), "{kind:?} {:?}", lines[5]);
+            assert!(!st.hit.header_share_btn.is_empty(), "{kind:?}");
+            assert!(
+                st.hit.header_share_btn.x > st.hit.header_shuffle_btn.right(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The artist page carries it too: an artist page is opened by id, so there
+    /// is always a link.
+    #[test]
+    fn the_artist_page_offers_the_share_control() {
+        let mut st = artist_state();
+        let lines = render(&mut st, 90, 20);
+        assert!(lines.iter().any(|l| l.contains("⧉ share")), "{lines:#?}");
+        assert!(!st.hit.header_share_btn.is_empty());
+        assert!(st.hit.header_share_btn.x > st.hit.header_shuffle_btn.right());
+    }
+
+    /// Liked Songs has no link that means the same thing to whoever opens it,
+    /// so it is offered no control rather than one that shares the wrong page.
+    #[test]
+    fn liked_songs_offers_no_share_control() {
+        let mut st = page_state(crate::app::state::TrackListKind::LikedSongs, "liked");
+        let lines = render(&mut st, 90, 14);
+        assert!(!lines[5].contains("share"), "{:?}", lines[5]);
+        assert!(st.hit.header_share_btn.is_empty());
+        assert!(!st.hit.header_shuffle_btn.is_empty(), "shuffle went too");
+    }
+
+    /// Hovering any one control lights that control alone — its whole padded
     /// cell, so the lit run says how big the target is.
     #[test]
     fn hovering_lights_one_control_of_the_pair() {
         let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
-        // Draw once to find out where the pair landed.
+        // Draw once to find out where the run landed.
         render(&mut st, 90, 12);
-        let (like, add) = (st.hit.main_like_col, st.hit.main_add_col);
-        assert!(!like.is_empty() && !add.is_empty());
+        let (like, share, add) = (
+            st.hit.main_like_col,
+            st.hit.main_share_col,
+            st.hit.main_add_col,
+        );
+        assert!(!like.is_empty() && !share.is_empty() && !add.is_empty());
 
         let bg_at = |st: &mut AppState, x: u16, y: u16| {
             let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
@@ -3474,17 +4001,121 @@ mod tests {
         for x in add.x..add.right() {
             assert_eq!(bg_at(&mut st, x, add.y), theme::DIM, "the + drew no pill");
         }
-        for x in like.x..like.right() {
+        for x in like.x..share.right() {
             assert_ne!(
                 bg_at(&mut st, x, like.y),
                 theme::DIM,
-                "hovering the + lit the ★ too"
+                "hovering the + lit a neighbour too"
+            );
+        }
+
+        // The control between them lights alone in the same way.
+        st.mouse_pos = Some(Position {
+            x: share.x,
+            y: share.y,
+        });
+        for x in share.x..share.right() {
+            assert_eq!(bg_at(&mut st, x, share.y), theme::DIM, "the ⧉ drew no pill");
+        }
+        for x in [like.x, add.x] {
+            assert_ne!(
+                bg_at(&mut st, x, like.y),
+                theme::DIM,
+                "hovering the ⧉ lit a neighbour too"
             );
         }
     }
 
-    /// Each control is a padded click target of its own, the two flush against
-    /// each other, at the end of the row before the time.
+    /// The row under the pointer wears a faint wash across its whole width,
+    /// and its neighbours stay as the terminal left them. The wash says which
+    /// row a click will land on, which no single lit cell can.
+    #[test]
+    fn hovering_washes_the_whole_row_and_only_that_row() {
+        use ratatui::style::Color;
+        let mut st = tracks_state(vec![
+            track("Alpha", "A"),
+            track("Beta", "B"),
+            track("Gamma", "C"),
+        ]);
+        render(&mut st, 90, 12);
+        let rows = st.hit.main_list;
+        let second = rows.y + 1;
+        st.mouse_pos = Some(Position {
+            x: rows.x + 4,
+            y: second,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let bg = |x: u16, y: u16| buffer.cell(Position { x, y }).unwrap().bg;
+
+        for x in rows.x..rows.right() {
+            assert_eq!(bg(x, second), theme::FIELD, "the row is not washed at {x}");
+            assert_eq!(bg(x, second - 1), Color::Reset, "the row above is washed");
+            assert_eq!(bg(x, second + 1), Color::Reset, "the row below is washed");
+        }
+        // The gutter belongs to the scrollbar, not to the row.
+        assert_eq!(bg(rows.right(), second), Color::Reset);
+    }
+
+    /// The wash sits behind the row rather than replacing what the row already
+    /// lights: a control under the pointer keeps its own pill on top of it.
+    #[test]
+    fn a_washed_row_keeps_its_hovered_control_lit() {
+        let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
+        render(&mut st, 90, 12);
+        let add = st.hit.main_add_col;
+        st.mouse_pos = Some(Position { x: add.x, y: add.y });
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        terminal.draw(|f| screen(&mut st, f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let bg = |x: u16| buffer.cell(Position { x, y: add.y }).unwrap().bg;
+
+        for x in add.x..add.right() {
+            assert_eq!(bg(x), theme::DIM, "the wash swallowed the + pill");
+        }
+        assert_eq!(bg(add.x - 1), theme::FIELD, "the row is not washed");
+    }
+
+    /// The artist page's list is not all rows. Only a top track is a table
+    /// row; a heading, the column header and the blanks around it are not.
+    #[test]
+    fn only_the_artist_pages_track_lines_wash() {
+        let mut st = artist_state();
+        render(&mut st, 90, 32);
+        let body = st.hit.main_list;
+
+        let bg_of = |st: &mut AppState, line: u16| {
+            st.mouse_pos = Some(Position {
+                x: body.x + 4,
+                y: body.y + line,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(90, 32)).unwrap();
+            terminal.draw(|f| screen(st, f)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .cell(Position {
+                    x: body.x + 4,
+                    y: body.y + line,
+                })
+                .unwrap()
+                .bg
+        };
+
+        // Heading, blank, column header, blank, then the one top track. The
+        // header lights its own sort label under the pointer, so what is
+        // checked is that none of them takes the row wash.
+        for line in 0..4 {
+            assert_ne!(bg_of(&mut st, line), theme::FIELD, "line {line} washed");
+        }
+        assert_eq!(bg_of(&mut st, 4), theme::FIELD, "the track did not wash");
+    }
+
+    /// Each control is a padded click target of its own, the three flush
+    /// against each other, at the end of the row before the time.
     #[test]
     fn the_pair_records_two_adjacent_clickable_rects() {
         let mut st = tracks_state(vec![track("Alpha", "A"), track("Beta", "B")]);
@@ -3493,15 +4124,20 @@ mod tests {
         terminal.draw(|f| screen(&mut st, f)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        let (like, add) = (st.hit.main_like_col, st.hit.main_add_col);
-        for col in [like, add] {
+        let (like, share, add) = (
+            st.hit.main_like_col,
+            st.hit.main_share_col,
+            st.hit.main_add_col,
+        );
+        for col in [like, share, add] {
             assert_eq!(col.width, 3, "the control lost its padding");
             assert_eq!(col.height, 2, "the column outran the filled rows");
             assert!(st.hit.main_list.contains(Position { x: col.x, y: col.y }));
         }
         // Flush, in the order the deck wears them: no cell between them
         // belongs to neither control.
-        assert_eq!(add.x, like.right());
+        assert_eq!(share.x, like.right());
+        assert_eq!(add.x, share.right());
         let symbol = |x: u16| {
             buffer
                 .cell(Position { x, y: like.y })
@@ -3511,9 +4147,10 @@ mod tests {
         };
         // Each mark is centred in its own cell.
         assert_eq!(symbol(like.x + 1), super::super::table::LIKED_MARK);
+        assert_eq!(symbol(share.x + 1), super::super::table::SHARE_MARK);
         assert_eq!(symbol(add.x + 1), super::super::table::ADD_MARK);
-        // And the pair comes after the data columns it follows.
-        assert!(like.x > st.hit.main_album_col.right());
+        // And the run comes after the data columns it follows.
+        assert!(like.x > st.hit.main_album_col.rect.right());
     }
 
     /// The pair is the last thing a narrowing pane gives up: the year, the
@@ -3747,6 +4384,10 @@ mod tests {
                 id: "a1".into(),
                 name: "Black Holes".into(),
                 artists: "Muse".into(),
+                credits: vec![Credit {
+                    name: "Muse".into(),
+                    id: Some("r1".into()),
+                }],
                 release_year: "2006".into(),
                 album_type: "album".into(),
                 album_group: "album".into(),
@@ -3836,6 +4477,7 @@ mod tests {
             is_playing: true,
             started_at: std::time::Instant::now(),
             title: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            channels: Default::default(),
             volume_percent: 50,
             matched: Default::default(),
             failure: None,
@@ -3844,6 +4486,96 @@ mod tests {
         });
         let playing = render(&mut st, 90, 18).join("\n");
         assert!(playing.contains("♫ Radio Paradise"), "{playing}");
+    }
+
+    /// The saved page, with what each station is announcing.
+    fn saved_state(stations: Vec<crate::app::state::Station>) -> AppState {
+        use crate::app::state::{RadioRow, RadioScope, RadioView};
+
+        let mut st = AppState::new();
+        st.spotify = crate::app::state::SpotifyState::Ready;
+        let mut view = RadioView::new(RadioScope::Favorites, 0);
+        view.loading = false;
+        view.rows = stations
+            .iter()
+            .cloned()
+            .map(RadioRow::Station)
+            .collect::<Vec<_>>()
+            .into();
+        st.radio_favorites = stations;
+        st.main = MainView::Radio(view);
+        st
+    }
+
+    #[test]
+    fn the_saved_page_says_what_each_station_is_playing() {
+        use crate::app::state::{NowStatus, StationNow};
+
+        let mut st = saved_state(vec![
+            test_station("st1", "Radio Paradise"),
+            test_station("st2", "Silent FM"),
+        ]);
+        st.radio_now.insert(
+            "st1".into(),
+            StationNow::new(NowStatus::Title("Muse - Hysteria".into())),
+        );
+        st.radio_now
+            .insert("st2".into(), StationNow::new(NowStatus::Unreachable));
+
+        let lines = render(&mut st, 120, 18);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Now Playing"), "{joined}");
+        let paradise = lines.iter().find(|l| l.contains("Radio Paradise")).unwrap();
+        assert!(paradise.contains("Muse - Hysteria"), "{paradise:?}");
+        let silent = lines.iter().find(|l| l.contains("Silent FM")).unwrap();
+        assert!(silent.contains("—"), "{silent:?}");
+    }
+
+    /// The station on the deck reads what the deck reads. Anything else would
+    /// mean a second connection to a stream this machine already holds open.
+    #[test]
+    fn the_playing_station_reads_its_own_announcement() {
+        let station = test_station("st1", "Radio Paradise");
+        let mut st = saved_state(vec![station.clone()]);
+        st.radio = Some(crate::app::state::RadioPlayback {
+            station,
+            is_playing: true,
+            started_at: std::time::Instant::now(),
+            title: std::sync::Arc::new(parking_lot::Mutex::new(Some(
+                "Alela Diane - Take Us Back".into(),
+            ))),
+            channels: Default::default(),
+            volume_percent: 50,
+            matched: Default::default(),
+            failure: None,
+            seek_attempt: 0,
+            tune_seq: 0,
+        });
+
+        let joined = render(&mut st, 120, 18).join("\n");
+        assert!(joined.contains("Alela Diane - Take Us Back"), "{joined}");
+    }
+
+    /// The column costs one connection per row, so it must not reach a page
+    /// that is up to `radio::api::STATION_LIMIT` rows deep.
+    #[test]
+    fn only_the_saved_page_carries_the_now_playing_column() {
+        use crate::app::state::{RadioScope, RadioView};
+
+        let mut st = saved_state(vec![test_station("st1", "Radio Paradise")]);
+        if let MainView::Radio(view) = &mut st.main {
+            let rows = view.rows.clone();
+            *view = RadioView::new(RadioScope::Popular, 0);
+            view.loading = false;
+            view.rows = rows;
+        }
+        let joined = render(&mut st, 120, 18).join("\n");
+        assert!(!joined.contains("Now Playing"), "{joined}");
+
+        let mut st = search_state();
+        st.search_tab = SearchTab::Stations;
+        let joined = render(&mut st, 120, 18).join("\n");
+        assert!(!joined.contains("Now Playing"), "{joined}");
     }
 
     /// A directory that has not answered yet is not a directory that answered
@@ -3926,6 +4658,12 @@ mod tests {
         assert!(lines[7].contains("Year"));
         assert!(lines[9].contains("Black Holes"));
         assert!(lines[9].contains("2006"));
+        // The Artist cell is a link here too, one target per credited name.
+        assert_eq!(st.hit.album_artist_links.len(), 1);
+        let (rect, credit) = &st.hit.album_artist_links[0];
+        assert_eq!(credit.id.as_deref(), Some("r1"));
+        assert_eq!(rect.width, "Muse".len() as u16);
+        assert_eq!(rect.y, 9, "not on the row that credits it");
     }
 
     /// Every table heads its columns, spaces the header off its rows, and
@@ -4014,24 +4752,33 @@ mod tests {
         let mut st = search_state();
         st.search_tab = SearchTab::Albums;
         let lines = render(&mut st, 90, 16);
-        let col = st.hit.main_album_col;
-        assert!(!col.is_empty());
+        let col = st.hit.main_album_col.clone();
+        assert!(!col.rect.is_empty());
         // Covers the name column, past the marker gutter every table carries.
         assert_eq!(
-            col.x,
+            col.rect.x,
             st.hit.main_list.x + crate::ui::columns::PREFIX_W as u16
         );
-        assert_eq!(col.y, st.hit.main_list.y);
+        assert_eq!(col.rect.y, st.hit.main_list.y);
         let layout = Layout::resolve(&crate::ui::columns::albums(), 90 - GUTTER as usize, 0);
-        assert_eq!(col.width, layout.width_of(ColKey::Album) as u16);
+        assert_eq!(col.rect.width, layout.width_of(ColKey::Album) as u16);
         // Clipped to the one row that actually has an album on it.
-        assert_eq!(col.height, 1);
-        let name: String = lines[col.y as usize]
+        assert_eq!(col.rect.height, 1);
+        let name: String = lines[col.rect.y as usize]
             .chars()
-            .skip(col.x as usize)
-            .take(col.width as usize)
+            .skip(col.rect.x as usize)
+            .take(col.rect.width as usize)
             .collect();
         assert!(name.starts_with("Black Holes"), "{name:?}");
+        // And the click stops with the name, not with the column.
+        let at = |dx: u16| Position {
+            x: col.rect.x + dx,
+            y: col.rect.y,
+        };
+        let printed = "Black Holes".len() as u16;
+        assert_eq!(col.widths, vec![printed]);
+        assert!(col.hit(at(printed - 1)));
+        assert!(!col.hit(at(printed)), "the padding after the name hits");
     }
 
     #[test]
@@ -4063,6 +4810,10 @@ mod tests {
             id: format!("id-{name}"),
             name: name.into(),
             artists: "Muse".into(),
+            credits: vec![Credit {
+                name: "Muse".into(),
+                id: Some("r1".into()),
+            }],
             release_year: year.into(),
             album_type: group.into(),
             album_group: group.into(),
@@ -4102,12 +4853,12 @@ mod tests {
     #[test]
     fn artist_page_stacks_a_portrait_band_over_tracks_then_cards() {
         let mut st = artist_state();
-        let lines = render(&mut st, 90, 26);
+        let lines = render(&mut st, 90, 30);
         assert!(lines[PATH].contains("MUSE"));
-        // The photo occupies the left 12 cells of the six band rows (a
+        // The photo occupies the left 20 cells of the ten band rows (a
         // placeholder swatch here: nothing is decoded in the test).
         let w = super::super::table::art_w(ART_H) as usize;
-        for row in lines.iter().take(10).skip(4) {
+        for row in lines.iter().take(14).skip(4) {
             let block: String = row.chars().take(w).collect();
             assert!(
                 block.chars().all(|c| c == '▀' || c == '♫'),
@@ -4128,18 +4879,31 @@ mod tests {
         // Body: the two sections, in order. Both headings keep a blank row
         // under them, and this catalogue is one group deep, so the album
         // strip stays away — see `the_album_strip_names_only_the_groups_the_artist_has`.
-        assert!(lines[11].contains("Top Tracks"));
-        assert!(lines[12].trim().is_empty());
-        assert!(lines[13].contains("Title"));
-        assert!(lines[14].contains("Uprising"));
-        assert!(lines[16].contains("Albums"));
-        assert!(lines[17].trim().is_empty());
-        assert!(lines[18].contains("Black Holes"));
-        assert!(lines[19].contains("2006 · 12 tracks"));
-        assert!(lines[20].contains("▶ play"));
-        assert!(lines[20].contains("shuffle"));
+        assert!(lines[15].contains("Top Tracks"));
+        assert!(lines[16].trim().is_empty());
+        assert!(lines[17].contains("Title"));
+        assert!(lines[18].trim().is_empty());
+        assert!(lines[19].contains("Uprising"));
+        assert!(lines[21].contains("Albums"));
+        assert!(lines[22].trim().is_empty());
+        assert!(lines[23].contains("Black Holes"));
+        assert!(lines[24].contains("2006 · 12 tracks"));
+        assert!(lines[25].contains("▶ play"));
+        assert!(lines[25].contains("shuffle"));
         assert_eq!(st.hit.card_play.len(), 1);
         assert_eq!(st.hit.card_shuffle.len(), 1);
+    }
+
+    /// The top tracks read as a table: a blank under the heading, the column
+    /// header, then the blank every other table on the browse screen keeps
+    /// between its header and its rows.
+    #[test]
+    fn the_top_tracks_header_keeps_a_blank_above_the_rows() {
+        let mut st = artist_state();
+        let lines = render(&mut st, 90, 32);
+        assert!(lines[17].contains("Title"), "{:?}", lines[17]);
+        assert!(lines[18].trim().is_empty(), "{:?}", lines[18]);
+        assert!(lines[19].contains("Uprising"), "{:?}", lines[19]);
     }
 
     /// A pane too narrow to seat both pills keeps ▶ play and drops shuffle —
@@ -4164,11 +4928,14 @@ mod tests {
         ]);
         render(&mut st, 90, 32);
         let rows: Vec<Option<usize>> = st.hit.main_lines.clone();
-        // Heading, blank, column header, one track, blank, heading, blank,
-        // then the cards: four lines each plus a blank.
-        assert_eq!(&rows[..7], &[None, None, None, Some(0), None, None, None]);
-        assert_eq!(&rows[7..12], &[Some(1), Some(1), Some(1), Some(1), None]);
-        assert_eq!(&rows[12..17], &[Some(2), Some(2), Some(2), Some(2), None]);
+        // Heading, blank, column header, blank, one track, blank, heading,
+        // blank, then the cards: four lines each plus a blank.
+        assert_eq!(
+            &rows[..8],
+            &[None, None, None, None, Some(0), None, None, None]
+        );
+        assert_eq!(&rows[8..13], &[Some(1), Some(1), Some(1), Some(1), None]);
+        assert_eq!(&rows[13..18], &[Some(2), Some(2), Some(2), Some(2), None]);
         assert_eq!(st.hit.album_names.len(), 2);
         assert_eq!(st.hit.card_play.len(), 2);
         assert_eq!(st.hit.card_shuffle.len(), 2);
@@ -4186,16 +4953,16 @@ mod tests {
             grouped_item("Live At Rome", "2013", None, "appears_on"),
         ]);
         let lines = render(&mut st, 90, 32);
-        assert!(lines[16].contains("Albums"));
-        assert!(lines[17].trim().is_empty());
-        let strip = &lines[18];
+        assert!(lines[21].contains("Albums"));
+        assert!(lines[22].trim().is_empty());
+        let strip = &lines[23];
         assert!(strip.contains("Albums"), "{strip:?}");
         assert!(strip.contains("Singles"), "{strip:?}");
         assert!(strip.contains("Appears On"), "{strip:?}");
         assert!(!strip.contains("Compilations"), "{strip:?}");
-        assert!(lines[19].trim().is_empty());
+        assert!(lines[24].trim().is_empty());
         // Only the open group's cards, one blank row below the strip.
-        assert!(lines[20].contains("Origin Of Symmetry"));
+        assert!(lines[25].contains("Origin Of Symmetry"));
         assert!(!lines.iter().any(|l| l.contains("Hysteria")));
         assert_eq!(st.hit.card_play.len(), 1);
         assert_eq!(st.hit.card_shuffle.len(), 1);

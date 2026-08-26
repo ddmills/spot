@@ -223,6 +223,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         },
         pb.shuffle,
         queue.as_ref(),
+        // No list under the name here, so no fold marker: from the bar the
+        // name opens the player.
+        None,
         mouse,
         hit,
     );
@@ -285,8 +288,9 @@ fn row_at(area: Rect, n: u16) -> Rect {
 }
 
 /// The message row, right-aligned against the edge. Shared so the two decks
-/// cannot drift on where the app says things.
-fn draw_toast(frame: &mut Frame, row: Rect, toast: Option<&str>) {
+/// and the fallback row [`super::draw`] falls back to cannot drift on where the
+/// app says things.
+pub(super) fn draw_toast(frame: &mut Frame, row: Rect, toast: Option<&str>) {
     let Some(msg) = toast else { return };
     if row.width <= TOAST_MIN_W {
         return;
@@ -315,7 +319,17 @@ mod tests {
     use super::super::table::VOL_TRACK_W;
     use super::*;
     use crate::app::queue::Queue;
-    use crate::app::state::{Playback, Track};
+    use crate::app::state::{Credit, HitAreas, Playback, Track};
+
+    /// The whole credit run the metadata row recorded. The fixture credits one
+    /// artist, so this is that name's rect.
+    fn artist_rect(hit: &HitAreas) -> Rect {
+        hit.now_artist_links
+            .iter()
+            .map(|(rect, _)| *rect)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or_default()
+    }
 
     /// Bar height under test: the rule, the deck, and the trailing blank —
     /// what `super::super::BAR_H` gives it on the browse screen.
@@ -346,7 +360,10 @@ mod tests {
             duration_ms: 225_500,
             track_number: 1,
             album_id: Some("alb1".into()),
-            artist_id: Some("art1".into()),
+            credits: vec![Credit {
+                name: "Artist Name".into(),
+                id: Some("art1".into()),
+            }],
             cover_url: None,
         }];
         tracks.extend((1..24).map(|i| Track {
@@ -358,7 +375,10 @@ mod tests {
             duration_ms: 60_000,
             track_number: i + 1,
             album_id: None,
-            artist_id: None,
+            credits: vec![Credit {
+                name: "Someone".into(),
+                id: None,
+            }],
             cover_url: None,
         }));
         state.queue = Some(Queue::new(tracks, 0, "My Mix"));
@@ -527,7 +547,7 @@ mod tests {
         let mut state = playing_state();
         let lines = render(&mut state, 100, BAR_H);
         for (rect, text) in [
-            (state.hit.now_artist, "Artist Name"),
+            (artist_rect(&state.hit), "Artist Name"),
             (state.hit.now_album, "Album Name"),
         ] {
             assert_eq!(rect.y as usize, META_ROW);
@@ -545,11 +565,14 @@ mod tests {
         // playing row, so the row is where the ids have to be missing.
         let mut state = playing_state();
         let mut track = state.queue.as_ref().unwrap().current().unwrap().clone();
-        track.artist_id = None;
+        track.credits = vec![Credit {
+            name: "Artist Name".into(),
+            id: None,
+        }];
         track.album_id = None;
         state.queue = Some(Queue::new(vec![track], 0, "My Mix"));
         render(&mut state, 100, BAR_H);
-        assert!(state.hit.now_artist.is_empty());
+        assert!(state.hit.now_artist_links.is_empty());
         assert!(state.hit.now_album.is_empty());
     }
 
