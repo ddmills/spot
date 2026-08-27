@@ -1,6 +1,6 @@
 [package]
 name = "spot"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 # ratatui 0.30 sets the real floor; the librespot crates need 1.85, as does
 # edition 2024 itself.
