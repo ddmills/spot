@@ -94,6 +94,30 @@ type TrackCache = HashMap<String, CachedTracks>;
 /// a clock: matching what a station announces against Spotify.
 const RADIO_TICK: Duration = Duration::from_secs(3);
 
+/// How long a Spotify load may stay silent before it counts as stalled.
+///
+/// librespot's loader has no timeout of its own, and a fetch that never
+/// answers leaves its player parked in `Loading` with no event to say so, so
+/// this is the only thing that ends the wait. Generous, because the wait it is
+/// bounding is a legitimate one on a slow link: a track that takes ten seconds
+/// to start is unpleasant, and cutting it off would be worse.
+const LOAD_STALL_AFTER: Duration = Duration::from_secs(20);
+
+/// How recently PCM must have arrived for a load to count as landed.
+///
+/// Wider than the window the status word turns on (see
+/// [`crate::ui::play_state`]), because this is asked once every
+/// [`RADIO_TICK`]: a narrower one could fall between two ticks under a track
+/// that is playing perfectly well.
+const LOAD_HEARD_WITHIN: Duration = Duration::from_secs(2);
+
+/// How many tracks in a row may fail to load before the queue stops walking.
+///
+/// A region-locked or delisted run would otherwise be stepped through as fast
+/// as the failures arrive, and the queue would be at its end before the toast
+/// had finished drawing.
+const UNAVAILABLE_STREAK_CAP: u8 = 3;
+
 /// How many stations a seek tries before it gives up.
 ///
 /// Kept small because the cost is time, not requests: a station that will not
@@ -125,6 +149,15 @@ const NOW_TTL: Duration = Duration::from_secs(60);
 /// several of them volunteer-run, so the sweep walks the page rather than
 /// arriving at every station on it at the same moment.
 const NOW_CONCURRENCY: usize = 4;
+
+/// How often the station on the deck is asked what it is playing while its
+/// stream is stood down for a record off its own list.
+///
+/// The decoder is not reading announcements for us then, so this is the only
+/// thing keeping the station's list growing. Tighter than [`NOW_TTL`] and well
+/// under the length of a record, so nothing the station plays goes unlogged —
+/// and it is one station rather than a page of them.
+const OFF_AIR_PROBE_EVERY: Duration = Duration::from_secs(30);
 
 /// Write the cached playlist contents to disk, quietly.
 ///
@@ -312,6 +345,11 @@ pub struct Client {
     /// CDN stays warm across track changes.
     http: reqwest::Client,
     covers: Arc<Mutex<CoverCache>>,
+    /// The expanded view's covers, which hold the same URLs as [`Self::covers`]
+    /// at a much larger size and so cannot share it. One entry: re-expanding
+    /// the sleeve you just closed is instant, and a screen-sized cover is not
+    /// worth keeping past that.
+    zoom_covers: Arc<Mutex<CoverCache>>,
     /// The playing track we last asked the saved-check about, so loading the
     /// same track twice does not ask twice. It is asked once per track and
     /// the answer only changes when we change it.
@@ -327,6 +365,14 @@ pub struct Client {
     /// is on. Cleared when the station changes or stops, so the same string
     /// announced by a different station is asked about again.
     radio_probe: Option<String>,
+    /// When the station on the deck was last asked what it is playing, while
+    /// its stream is stood down.
+    ///
+    /// Stamped *before* the request goes out, for the reason
+    /// [`Self::radio_probe`] is: a slow probe must not queue a second behind
+    /// it. Cleared the moment the station is back on air, so standing down
+    /// again asks at once rather than waiting out a stale stamp.
+    off_air_probe: Option<Instant>,
     /// Which tune-in the deck is on, counted up on every station started.
     ///
     /// A tune-in reports its failure over the command channel, so a slow one
@@ -343,6 +389,80 @@ pub struct Client {
     /// Fired once both engines are silent, so the quit path can wait for it.
     /// Taken on use — a shutdown happens once and ends the loop.
     shutdown_ack: Option<oneshot::Sender<()>>,
+    /// The load asked for and not heard yet, watched by
+    /// [`Self::check_spotify_stream`]. `None` once audio arrives.
+    spotify_load: Option<LoadAttempt>,
+    /// Tracks that failed to load since the last one that played, counted so a
+    /// run of them cannot walk the whole queue. See [`UNAVAILABLE_STREAK_CAP`].
+    unavailable_streak: u8,
+    /// Whether the load that is on the deck failed.
+    ///
+    /// librespot leaves its player parked in `Loading` after a failed load, and
+    /// a park has nothing to resume: `play` on one is silently dropped, which
+    /// is a `▶ play` that does nothing at all. A load is the only command that
+    /// gets out of it, so this says which of the two the pill means.
+    spotify_wedged: bool,
+}
+
+/// A `player.load` that has been asked for and has not made sound yet.
+///
+/// The Spotify twin of the radio engine's `ended` generation: librespot's load
+/// is fire-and-forget and its failure is either one event spot must not miss
+/// or no event at all, so the only way to know a load did not land is to time
+/// it. See [`stall_action`].
+struct LoadAttempt {
+    uri: String,
+    /// When the load was asked for, moved forward by a retry.
+    at: Instant,
+    retried: bool,
+}
+
+/// What [`Self::check_spotify_stream`] should do about a load in flight.
+///
+/// Split out as a pure function for the reason `play_state::status` is: the
+/// rules are what is worth testing, and they need neither a player nor a
+/// device to state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stall {
+    /// Still inside the window a slow link is allowed.
+    Wait,
+    /// Not a stall: the audio landed, or something else owns the output now.
+    Clear,
+    /// Silent past the window, and not tried again yet.
+    Retry,
+    /// Silent past the window twice.
+    GiveUp,
+}
+
+/// Whether a load that has not made sound yet is merely slow or is stuck.
+///
+/// `fresh` is the same question the status word turns on — see
+/// [`crate::ui::play_state`] — so the watchdog and the corner of the screen
+/// cannot come to disagree about whether audio is arriving.
+fn stall_action(
+    att: &LoadAttempt,
+    playing: bool,
+    on_air: bool,
+    fresh: bool,
+    now: Instant,
+) -> Stall {
+    // A station is on air, or the user paused. Neither is a load that failed,
+    // and both are already owned elsewhere: `yield_to_radio` pauses Spotify
+    // under a broadcast, and a pause is a pause.
+    if on_air || !playing {
+        return Stall::Clear;
+    }
+    if fresh {
+        return Stall::Clear;
+    }
+    if now.saturating_duration_since(att.at) < LOAD_STALL_AFTER {
+        return Stall::Wait;
+    }
+    if att.retried {
+        Stall::GiveUp
+    } else {
+        Stall::Retry
+    }
 }
 
 impl Client {
@@ -381,11 +501,16 @@ impl Client {
             radio_player: RadioPlayer::new(audio_tap),
             http,
             covers: Arc::new(Mutex::new(CoverCache::default())),
+            zoom_covers: Arc::new(Mutex::new(CoverCache::with_capacity(1))),
             liked_probe: None,
             membership_probe: HashSet::new(),
             radio_probe: None,
+            off_air_probe: None,
             tune_seq: 0,
             shutdown_ack: Some(shutdown_ack),
+            spotify_load: None,
+            unavailable_streak: 0,
+            spotify_wedged: false,
         };
         (client, shutdown_done)
     }
@@ -415,7 +540,9 @@ impl Client {
                     None => break,
                 },
                 _ = tick.tick() => {
+                    self.check_spotify_stream();
                     self.check_radio_stream();
+                    self.probe_off_air_station();
                     self.resolve_radio_track();
                     self.refresh_station_now();
                 }
@@ -449,14 +576,21 @@ impl Client {
             // pressing play on something that is not playing plainly means
             // "try again". Checked before the toggle, or the deck would flip
             // to claiming it was on.
-            PlayPause if self.state.read().radio.as_ref().is_some_and(|r| r.failed()) => {
+            PlayPause
+                if self
+                    .state
+                    .read()
+                    .radio
+                    .as_ref()
+                    .is_some_and(|r| r.failed() && !r.off_air) =>
+            {
                 let Some(station) = self.state.read().radio.as_ref().map(|r| r.station.clone())
                 else {
                     return Ok(());
                 };
                 self.play_station(station, 0);
             }
-            PlayPause if self.radio_live() => {
+            PlayPause if self.station_on_air() => {
                 let toggled = {
                     let mut st = self.state.write();
                     st.radio.as_mut().map(|r| {
@@ -475,6 +609,11 @@ impl Client {
                     None => self.stop_radio(),
                 }
             }
+            // `▶ play` over a load that failed. librespot's player is parked in
+            // `Loading` and drops a `play` sent to a park, so the pill would do
+            // nothing at all; a load is what gets out of it. The same rule the
+            // arm above follows for a station that would not connect.
+            PlayPause if self.spotify_wedged => self.load_current(),
             PlayPause => {
                 let mut st = self.state.write();
                 let AppState {
@@ -500,22 +639,31 @@ impl Client {
                     pb.is_playing = !pb.is_playing;
                 }
             }
-            VolumeRel(delta) if self.radio_live() => {
+            VolumeRel(delta) if self.station_on_air() => {
                 let current = self.playback_volume();
                 self.set_radio_volume((i16::from(current) + i16::from(delta)).clamp(0, 100) as u8);
             }
-            SetVolume(pct) if self.radio_live() => self.set_radio_volume(pct.min(100)),
+            SetVolume(pct) if self.station_on_air() => self.set_radio_volume(pct.min(100)),
             // A broadcast has no position to seek to and no queue to shuffle,
             // so these have nothing to do while a station is on. The key
             // handler already turns them into a toast, but it is not the only
             // way in: a mouse click, a media key, or a hit rect left over from
             // the Spotify deck all arrive here directly.
             SeekRel(_) | SeekTo(_) | ToggleShuffle | JumpTo(_) | TrackEnded
-                if self.radio_live() => {}
+                if self.station_on_air() => {}
             // Previous and next mean the station either side of this one, not
             // the track: see [`Self::radio_back`].
-            Prev if self.radio_live() => self.radio_back(),
-            Next if self.radio_live() => self.radio_forward(),
+            Prev if self.station_on_air() => self.radio_back(),
+            Next if self.station_on_air() => self.radio_forward(),
+            // The last record of a station's list is followed by the station:
+            // there is nothing else after it, and the broadcast has been
+            // playing all along. The deck's forward control says `live ▸▸`
+            // over this arm — see `ui::play_state::played_out`.
+            Next | TrackEnded if self.played_out_station().is_some() => {
+                if let Some(station) = self.played_out_station() {
+                    self.play_station(station, 0);
+                }
+            }
             Next => {
                 if self.advance_queue() {
                     self.load_current();
@@ -535,6 +683,7 @@ impl Client {
                     self.load_current();
                 }
             }
+            TrackUnavailable { uri } => self.track_unavailable(&uri),
             PreloadNext => self.preload_next(),
             JumpTo(i) => {
                 let jumped = {
@@ -589,6 +738,7 @@ impl Client {
                 loading,
                 shuffle,
             } => self.play(tracks, start, name, key, loading, shuffle),
+            PlayHeard { row } => self.play_heard(row),
             PlayFetched {
                 source,
                 name,
@@ -640,6 +790,7 @@ impl Client {
                 cover_url,
             } => self.load_album_view(id, name, credits, year, cover_url, false),
             LoadViewCover { cover_url } => self.load_view_cover(cover_url),
+            LoadZoomCover { cover_url } => self.fetch_cover(cover_url, CoverSlot::Zoom),
             LoadPlayingCover { cover_url } => {
                 // Same URL as what is already up means the same record: two
                 // tracks off one album change the title and not the sleeve, and
@@ -1009,7 +1160,15 @@ impl Client {
             // Every deck checks radio before Spotify, so a station left set
             // keeps drawing over the track that is starting. `yield_to_spotify`
             // stops the engine itself on the play path.
-            st.radio = None;
+            //
+            // A station standing down for a record off its own list is the one
+            // exception: the page is still the station's and the deck is what
+            // carries the way back on air. Every other Spotify play path
+            // reaches here through `yield_to_spotify`, which drops the deck and
+            // `off_air` with it, so nothing else can take this branch.
+            if st.radio.as_ref().is_none_or(|r| !r.off_air) {
+                st.radio = None;
+            }
             // The status word tells "playing" from "still fetching" by whether
             // samples are arriving, and the old track's are about to stop.
             st.audio_tap.clear();
@@ -1024,6 +1183,16 @@ impl Client {
                 return;
             }
         }
+        // librespot's load is fire-and-forget and a load that never lands
+        // reports nothing at all, so the ask is timed from here. See
+        // [`Self::check_spotify_stream`].
+        self.spotify_load = Some(LoadAttempt {
+            uri: track.uri.clone(),
+            at: Instant::now(),
+            retried: false,
+        });
+        // A load is the one command that gets librespot out of a failed park.
+        self.spotify_wedged = false;
 
         // The deck draws a liked mark for the playing track, which is not
         // necessarily in any loaded list, so its saved state is asked for on
@@ -1330,7 +1499,13 @@ impl Client {
             );
             playback.seek_attempt = attempt;
             playback.tune_seq = tune_seq;
+            // Before the deck, so a station standing down for one of its own
+            // records gives the parked queue back on its way past.
+            st.unpark_queue();
             st.radio = Some(playback);
+            // A station you come back to opens on what it is playing now,
+            // which is what the listener tuned in for.
+            st.heard_to_newest();
             // Whatever the last station was announcing is not this station's
             // business. Without this, moving to a station that happens to be
             // playing the same record would find the probe already set and
@@ -1429,7 +1604,13 @@ impl Client {
 
     fn stop_radio(&self) {
         self.radio_player.stop();
-        self.state.write().radio = None;
+        let mut st = self.state.write();
+        // Before the deck goes: while a record off its list was playing, the
+        // queue held that list, and everything downstream of here — the player
+        // screen, `resume_spotify` — reads the queue for what was playing
+        // before the station.
+        st.unpark_queue();
+        st.radio = None;
     }
 
     /// The radio deck's `◂◂ previous`: back to the last thing you were
@@ -1645,6 +1826,137 @@ impl Client {
         st.toast(told);
     }
 
+    /// librespot could not load a track.
+    ///
+    /// This is the only report of a failed load there is, and librespot leaves
+    /// its own player parked in `Loading` when it fires: without an answer here
+    /// the deck claims to play over silence until spot is restarted.
+    ///
+    /// The uri is checked against the queue's current row because the same
+    /// event fires for a failed *preload*, and stepping the queue on one of
+    /// those would skip the track that is playing perfectly well.
+    fn track_unavailable(&mut self, uri: &str) {
+        // Off air the failed load is the record chosen off the station's list,
+        // so it is answered like any other rather than ignored as noise from
+        // an engine that is not playing.
+        if self.station_on_air() {
+            return;
+        }
+        let current = {
+            let st = self.state.read();
+            st.queue
+                .as_ref()
+                .and_then(|q| q.current())
+                .map(|t| t.uri.clone())
+        };
+        if current.as_deref() != Some(uri) {
+            log::warn!("preloaded track {uri} is unavailable");
+            return;
+        }
+        self.spotify_load = None;
+        self.unavailable_streak = self.unavailable_streak.saturating_add(1);
+        log::warn!(
+            "track {uri} is unavailable ({} in a row)",
+            self.unavailable_streak
+        );
+
+        // A delisted or region-locked run would otherwise be walked as fast as
+        // the failures arrive, and the queue would be at its end before the
+        // toast had finished drawing.
+        if self.unavailable_streak >= UNAVAILABLE_STREAK_CAP {
+            self.spotify_wedged = true;
+            self.stop_playback("these tracks are not available to play");
+            return;
+        }
+        self.state
+            .write()
+            .toast("that track is not available; skipping");
+        if self.advance_queue() {
+            self.load_current();
+        } else {
+            self.stop_playback("that track is not available");
+        }
+    }
+
+    /// Notice a load that was asked for and never made a sound.
+    ///
+    /// The Spotify twin of [`Self::check_radio_stream`], and needed for the
+    /// same reason: librespot's loader has no timeout, so a fetch that never
+    /// answers leaves its player in `Loading` with no event to say so. Nothing
+    /// else in the app sees that — the progress bar runs off a local clock, so
+    /// it walks the whole track under a deck that says it is playing.
+    ///
+    /// One retry before giving up, because most of these are a transient
+    /// session or CDN hiccup rather than a track that cannot be played.
+    fn check_spotify_stream(&mut self) {
+        let Some(att) = self.spotify_load.as_ref() else {
+            return;
+        };
+        let (playing, fresh) = {
+            let st = self.state.read();
+            (
+                st.playback.as_ref().is_some_and(|pb| pb.is_playing),
+                st.audio_tap.is_fresh(LOAD_HEARD_WITHIN),
+            )
+        };
+        match stall_action(att, playing, self.station_on_air(), fresh, Instant::now()) {
+            Stall::Wait => {}
+            Stall::Clear => {
+                // Audio arrived, so whatever failed before this did not.
+                if fresh {
+                    self.unavailable_streak = 0;
+                    self.spotify_wedged = false;
+                }
+                self.spotify_load = None;
+            }
+            Stall::Retry => {
+                let uri = att.uri.clone();
+                log::warn!("no audio {LOAD_STALL_AFTER:?} after loading {uri}; asking again");
+                let loaded = match (self.player(), SpotifyUri::from_uri(&uri)) {
+                    (Some(player), Ok(parsed)) => {
+                        player.load(parsed, true, 0);
+                        true
+                    }
+                    _ => false,
+                };
+                if !loaded {
+                    self.spotify_wedged = true;
+                    self.stop_playback("that track would not start");
+                    self.spotify_load = None;
+                    return;
+                }
+                self.state.write().toast("still loading; trying again");
+                if let Some(att) = self.spotify_load.as_mut() {
+                    att.at = Instant::now();
+                    att.retried = true;
+                }
+            }
+            Stall::GiveUp => {
+                log::warn!("giving up on {}: no audio after a retry", att.uri);
+                if self.player().is_some_and(|p| p.is_invalid()) {
+                    log::error!("the librespot player thread is gone; restart spot");
+                }
+                self.spotify_wedged = true;
+                self.stop_playback("that track would not play");
+                self.spotify_load = None;
+            }
+        }
+    }
+
+    /// Take back the claim that Spotify is playing.
+    ///
+    /// The deck reads "playing" off this flag alone and its progress runs off a
+    /// local clock, so a transport left claiming to play over a dead load walks
+    /// the bar to the end of a track that never started. Clearing it is what
+    /// puts the corner back to a resting `STREAMING` and stops the bar.
+    fn stop_playback(&self, told: &str) {
+        let mut st = self.state.write();
+        if let Some(pb) = st.playback.as_mut() {
+            pb.is_playing = false;
+        }
+        st.toast(told);
+    }
+
     /// Notice a station that connected and then stopped sending.
     ///
     /// A broadcast has no length to reach, so nothing else in the app sees one
@@ -1665,7 +1977,9 @@ impl Client {
             .read()
             .radio
             .as_ref()
-            .filter(|r| !r.failed())
+            // Off air the stream was stopped on purpose, so its ending says
+            // nothing about the station and must not walk a seek chain.
+            .filter(|r| !r.failed() && !r.off_air)
             .map(|r| {
                 (
                     r.station.clone(),
@@ -1714,11 +2028,11 @@ impl Client {
     /// reacted to there. [`Self::radio_probe`] is what stops the three-second
     /// tick re-asking the same question for the length of a record.
     fn resolve_radio_track(&mut self) {
-        // Nothing to look a record up in. The deck then draws the station's
-        // own words, exactly as it does for an announcement that parses into
-        // no track at all.
-        let Some(api) = self.api.clone() else { return };
-
+        // Off air this reads what [`Self::probe_off_air_station`] last asked
+        // the station, so the list goes on growing while a record off it
+        // plays. Both readings arrive through `now_title` and are logged the
+        // same way; nothing below here needs to know which it got.
+        //
         // Scoped: parking_lot's lock is not reentrant and the arms below take
         // it for writing.
         let announced = self.state.read().radio.as_ref().and_then(|r| r.now_title());
@@ -1741,10 +2055,26 @@ impl Client {
         self.radio_probe = Some(raw.clone());
 
         let station = {
-            let st = self.state.read();
+            let mut st = self.state.write();
             let Some(r) = st.radio.as_ref() else { return };
-            r.station.clone()
+            let station = r.station.clone();
+            // A record the station's newest row already carries: going back on
+            // air re-announces whatever is still playing, and that is the row
+            // the list already has rather than a second one.
+            if st.adopt_newest_heard(&station.uuid, &raw) {
+                return;
+            }
+            // Logged before the account is asked for: without one there is no
+            // lookup to run, but there is still a record the station played,
+            // and radio is the half of spot that works signed out.
+            st.push_heard(raw.clone());
+            station
         };
+
+        // Nothing to look a record up in. The row then carries the station's
+        // own words, exactly as the deck does for an announcement that parses
+        // into no track at all.
+        let Some(api) = self.api.clone() else { return };
 
         let Some(want) = crate::radio::track::parse(&raw, &station.name) else {
             // Not a track: a promo, a jingle, the station's own ident. The row
@@ -1756,8 +2086,12 @@ impl Client {
             return;
         };
 
-        if let Some(r) = self.state.write().radio.as_mut() {
-            r.matched = state::RadioMatch::Searching;
+        {
+            let mut st = self.state.write();
+            if let Some(r) = st.radio.as_mut() {
+                r.matched = state::RadioMatch::Searching;
+            }
+            st.set_heard_searching(&station.uuid, &raw);
         }
 
         let state = self.state.clone();
@@ -1772,25 +2106,30 @@ impl Client {
 
             let uri = {
                 let mut st = state.write();
-                let Some(r) = st.radio.as_mut() else { return };
-                // Two ways this answer can be stale and one check for both: the
-                // user changes station, or the station moves on while the
-                // lookup runs. A uuid alone only catches the first.
-                let current = r.now_title();
-                if r.station.uuid != uuid || current.as_deref() != Some(raw.as_str()) {
-                    return;
+                let matched = match found {
+                    Some(track) => state::RadioMatch::Matched(Box::new(track)),
+                    None => state::RadioMatch::Unmatched,
+                };
+                let uri = matched.track().map(|t| t.uri.clone());
+                // The row is settled whether or not the deck still is: a record
+                // that ended while its lookup ran is still the record that
+                // played, and a row left saying `Searching` for ever is worse
+                // than one that fills in late.
+                st.set_heard_match(&uuid, &raw, matched.clone());
+
+                // Two ways this answer can be stale for the *deck* and one
+                // check for both: the user changes station, or the station
+                // moves on while the lookup runs. A uuid alone only catches
+                // the first.
+                if let Some(r) = st
+                    .radio
+                    .as_mut()
+                    .filter(|r| r.station.uuid == uuid)
+                    .filter(|r| r.now_title().as_deref() == Some(raw.as_str()))
+                {
+                    r.matched = matched;
                 }
-                match found {
-                    Some(track) => {
-                        let uri = track.uri.clone();
-                        r.matched = state::RadioMatch::Matched(Box::new(track));
-                        Some(uri)
-                    }
-                    None => {
-                        r.matched = state::RadioMatch::Unmatched;
-                        None
-                    }
-                }
+                uri
             };
 
             // The deck draws a `★` for the matched track, which is in no loaded
@@ -1853,6 +2192,66 @@ impl Client {
                     }
                 })
                 .await;
+        });
+    }
+
+    /// Ask the station what it is playing, while a record off its list is.
+    ///
+    /// Standing the stream down for one of a station's own records takes the
+    /// decoder away, and with it the announcements the station's list is built
+    /// from — so the list would stop growing exactly where the listener is
+    /// still looking at it. This reads the same `StreamTitle` the decoder
+    /// would have, over one short request that decodes nothing: the same probe
+    /// the saved page's `Now Playing` column is filled from.
+    ///
+    /// What it reads goes to `RadioPlayback::probed`, which `now_title` falls
+    /// back to, so [`Self::resolve_radio_track`] logs it exactly as it logs a
+    /// decoded one.
+    fn probe_off_air_station(&mut self) {
+        let station = {
+            let st = self.state.read();
+            st.radio
+                .as_ref()
+                .filter(|r| r.off_air)
+                .map(|r| (r.station.uuid.clone(), r.station.url.clone()))
+        };
+        let Some((uuid, url)) = station else {
+            self.off_air_probe = None;
+            return;
+        };
+        if !self
+            .off_air_probe
+            .is_none_or(|at| at.elapsed() >= OFF_AIR_PROBE_EVERY)
+        {
+            return;
+        }
+        self.off_air_probe = Some(Instant::now());
+
+        let http = self.http.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let read = match crate::radio::now::probe(&http, &url).await {
+                Ok(title) => title,
+                // A request that failed says nothing about the station, so what
+                // it last said stands rather than being thrown away over one
+                // bad minute.
+                Err(e) => return log::debug!("no announcement from {url}: {e:#}"),
+            };
+            // Reached and announcing nothing clears the reading: without that
+            // the newest row would go on saying `live` for a record that
+            // finished while nobody was listening.
+            let mut st = state.write();
+            // The deck may have gone back on air, or moved to another station,
+            // while this was out. Either way the answer is about a station
+            // this is no longer for — and writing it would put a stale title
+            // under a live decoder.
+            if let Some(r) = st
+                .radio
+                .as_mut()
+                .filter(|r| r.off_air && r.station.uuid == uuid)
+            {
+                r.probed = read;
+            }
         });
     }
 
@@ -1948,6 +2347,75 @@ impl Client {
         self.radio_player.is_live() || self.state.read().radio.is_some()
     }
 
+    /// Whether the deck is a station whose stream has stood down for a record
+    /// off its own list.
+    fn off_air(&self) -> bool {
+        self.state.read().radio.as_ref().is_some_and(|r| r.off_air)
+    }
+
+    /// The station to go back on air to when its list is played out.
+    ///
+    /// The queue repeats, so the end of a list has to be asked about before
+    /// stepping rather than discovered by a step that failed: `advance` would
+    /// wrap to the first record and play the list round again, which is not
+    /// what forward means when the thing after the last record is the station
+    /// still broadcasting.
+    fn played_out_station(&self) -> Option<state::Station> {
+        let st = self.state.read();
+        let r = st.radio.as_ref().filter(|r| r.off_air)?;
+        let q = st.queue.as_ref()?;
+        (q.index() + 1 >= q.len()).then(|| r.station.clone())
+    }
+
+    /// Enter on a row of a station's list.
+    ///
+    /// The station's records become the play order and the queue you already
+    /// had is parked, so everything downstream — pause, seek, previous, next,
+    /// end-of-track — is the ordinary Spotify path with no second play engine
+    /// behind it. What is *not* ordinary is that the deck survives: the page
+    /// is still the station's, and `live` is the way back to its broadcast.
+    fn play_heard(&mut self, row: usize) {
+        let queue = {
+            let st = self.state.read();
+            let Some(r) = st.radio.as_ref() else { return };
+            let Some(start) = st.heard_play_position(row) else {
+                return;
+            };
+            let tracks = st.heard_tracks();
+            if tracks.is_empty() {
+                return;
+            }
+            Queue::new(tracks, start, format!("earlier on {}", r.station.name))
+        };
+
+        // The engine, not `yield_to_spotify`: that goes through `stop_radio`,
+        // which drops the deck. Here the deck is the page you are still on.
+        self.radio_player.stop();
+
+        {
+            let mut st = self.state.write();
+            st.park_queue();
+            if let Some(r) = st.radio.as_mut() {
+                r.off_air = true;
+                r.is_playing = true;
+            }
+            st.set_queue(Some(queue));
+        }
+        self.load_current();
+    }
+
+    /// A station is on air: the deck is up and the broadcast, not a record off
+    /// its list, is what you hear.
+    ///
+    /// The question every transport arm asks. Off air the record is an
+    /// ordinary Spotify track in an ordinary queue, so pause, seek, previous,
+    /// next and end-of-track all belong to the Spotify arms rather than to the
+    /// station ones — which is the whole point of parking the queue instead of
+    /// building a second play path.
+    fn station_on_air(&self) -> bool {
+        self.radio_live() && !self.off_air()
+    }
+
     /// Pause Spotify if a station owns the device.
     ///
     /// The backstop under every "pause first" in this file. Those all fire
@@ -1961,7 +2429,12 @@ impl Client {
         // silences the engine for the seconds the next one takes to connect,
         // and that is exactly the window in which a librespot load landing
         // late would start playing under a deck that says a station is on.
-        if !self.radio_live() {
+        //
+        // Off air is the one deck that must *not* yield. Its stream is stopped
+        // on purpose and the record librespot has just started is the one the
+        // listener picked off the station's own list — pausing it here left
+        // the player silent with nothing on screen to say why.
+        if !self.station_on_air() {
             return;
         }
         log::warn!("Spotify started under a live station; pausing it");
@@ -2477,7 +2950,7 @@ impl Client {
             },
         };
         let mut st = self.state.write();
-        crate::event::navigate(&mut st, opened, &self.tx);
+        crate::event::navigate_from_link(&mut st, opened, &self.tx);
     }
 
     fn link_failed(&self, kind: &str, e: anyhow::Error) {
@@ -2883,16 +3356,20 @@ impl Client {
         let Some(url) = url.filter(|u| crate::cover::is_spotify_cdn(u)) else {
             return install(&self.state, None);
         };
-        if let Some(hit) = self.covers.lock().get(&url) {
+        let covers = match slot {
+            CoverSlot::Zoom => &self.zoom_covers,
+            _ => &self.covers,
+        };
+        if let Some(hit) = covers.lock().get(&url) {
             return install(&self.state, Some(hit));
         }
         // Clear the slot while the fetch is in flight, so the block shows its
         // placeholder rather than the previous record's sleeve.
         install(&self.state, None);
 
-        let (http, state, covers) = (self.http.clone(), self.state.clone(), self.covers.clone());
+        let (http, state, covers) = (self.http.clone(), self.state.clone(), covers.clone());
         tokio::spawn(async move {
-            match crate::cover::load(&http, &url).await {
+            match crate::cover::load_at(&http, &url, slot.px()).await {
                 Ok(cover) => {
                     let cover = Arc::new(cover);
                     covers.lock().insert(url, Arc::clone(&cover));
@@ -2907,16 +3384,30 @@ impl Client {
 
 /// Which decoded cover a fetch is filling.
 ///
-/// The two are separate because they are different records whenever you browse
-/// one album while another plays — and because only [`CoverSlot::Playing`] may
-/// repaint the UI's accent and the visualizer's ramp.
+/// The first two are separate because they are different records whenever you
+/// browse one album while another plays — and because only
+/// [`CoverSlot::Playing`] may repaint the UI's accent and the visualizer's
+/// ramp. [`CoverSlot::Zoom`] is separate again because it is the same picture
+/// at a different size.
 #[derive(Clone, Copy)]
 enum CoverSlot {
     Playing,
     View,
+    /// The expanded art view's own copy. See `AppState::zoom_cover`.
+    Zoom,
 }
 
 impl CoverSlot {
+    /// The square this slot decodes to. The layout's blocks are small enough
+    /// that [`crate::cover::COVER_PX`] is a real downscale for them; a block
+    /// filling the terminal is not.
+    const fn px(self) -> usize {
+        match self {
+            CoverSlot::Zoom => crate::cover::ZOOM_PX,
+            _ => crate::cover::COVER_PX,
+        }
+    }
+
     /// Claim this slot for a new fetch and return the generation that owns it.
     fn bump(self, st: &mut AppState) -> u64 {
         match self {
@@ -2927,6 +3418,10 @@ impl CoverSlot {
             CoverSlot::View => {
                 st.view_cover_generation += 1;
                 st.view_cover_generation
+            }
+            CoverSlot::Zoom => {
+                st.zoom_cover_generation += 1;
+                st.zoom_cover_generation
             }
         }
     }
@@ -2943,6 +3438,11 @@ impl CoverSlot {
             }
             CoverSlot::View if st.view_cover_generation == generation => {
                 st.view_cover = cover;
+            }
+            // No accent here, unlike `Playing`: the expanded view is the same
+            // record at a different size, and the colours are already on it.
+            CoverSlot::Zoom if st.zoom_cover_generation == generation => {
+                st.zoom_cover = cover;
             }
             _ => {}
         }
@@ -3237,6 +3737,68 @@ mod tests {
         assert_eq!(raw_to_pct(u16::MAX), 100);
         // Out-of-range input is clamped rather than wrapped.
         assert_eq!(pct_to_raw(200), u16::MAX);
+    }
+
+    fn asked(secs: u64, retried: bool) -> (LoadAttempt, Instant) {
+        let now = Instant::now();
+        let att = LoadAttempt {
+            uri: "spotify:track:x".into(),
+            at: now - Duration::from_secs(secs),
+            retried,
+        };
+        (att, now)
+    }
+
+    /// A slow link is allowed its wait. The window is the whole difference
+    /// between a track that is taking its time and one that will never start,
+    /// so nothing inside it may be read as a failure.
+    #[test]
+    fn a_load_still_inside_the_window_is_left_alone() {
+        let (att, now) = asked(LOAD_STALL_AFTER.as_secs() - 1, false);
+        assert_eq!(stall_action(&att, true, false, false, now), Stall::Wait);
+    }
+
+    /// Audio arriving is the end of the watch, whatever the clock says: it is
+    /// the same question the status word turns on, so the two cannot disagree
+    /// about whether the load landed.
+    #[test]
+    fn audio_arriving_ends_the_watch() {
+        let (att, now) = asked(LOAD_STALL_AFTER.as_secs() * 3, false);
+        assert_eq!(stall_action(&att, true, false, true, now), Stall::Clear);
+    }
+
+    /// A station is on air, or the user paused. Neither is a load that failed,
+    /// and reading either as one would toast over a deck that is doing exactly
+    /// what it was asked to.
+    ///
+    /// A station standing down for a record off its own list is neither: the
+    /// deck is up but the record is what should be making sound, so silence
+    /// there is a stall like any other.
+    #[test]
+    fn a_paused_or_yielded_transport_is_not_a_stall() {
+        let (att, now) = asked(LOAD_STALL_AFTER.as_secs() * 3, false);
+        assert_eq!(stall_action(&att, false, false, false, now), Stall::Clear);
+        assert_eq!(stall_action(&att, true, true, false, now), Stall::Clear);
+        assert_eq!(stall_action(&att, true, false, false, now), Stall::Retry);
+    }
+
+    /// Silence past the window is asked again once — most of these are a
+    /// transient session or CDN hiccup — and only then given up on.
+    #[test]
+    fn a_silent_load_is_retried_once_then_dropped() {
+        let (att, now) = asked(LOAD_STALL_AFTER.as_secs() + 1, false);
+        assert_eq!(stall_action(&att, true, false, false, now), Stall::Retry);
+
+        let (att, now) = asked(LOAD_STALL_AFTER.as_secs() + 1, true);
+        assert_eq!(stall_action(&att, true, false, false, now), Stall::GiveUp);
+    }
+
+    /// A retry restarts the window rather than giving up at once — the clock
+    /// the second attempt is judged by is its own.
+    #[test]
+    fn a_retry_gets_the_whole_window_again() {
+        let (att, now) = asked(LOAD_STALL_AFTER.as_secs() - 1, true);
+        assert_eq!(stall_action(&att, true, false, false, now), Stall::Wait);
     }
 
     /// The guard that keeps the three-second tick from re-asking Spotify the

@@ -261,6 +261,18 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // offer is state the split borrow below gives up.
     let steps = play_state::radio_steps(state);
     let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
+    // What the station's list has played and which row is on, read here for
+    // the same reason: the split borrow below gives the deck up, and both
+    // answers are about the deck.
+    let heard = state.heard().to_vec();
+    let heard_playing = heard_playing(state);
+    let heard_live = heard_live(state);
+    // And where forward leads, which is the station itself once its list is
+    // played out.
+    let ahead = match play_state::played_out(state) {
+        true => deck::Forward::Live,
+        false => deck::Forward::Next,
+    };
 
     // Split borrows: queue/playback are read while list state, hit areas
     // and the visualizer's smoothing state are written.
@@ -271,6 +283,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         queue,
         queue_index,
         queue_list,
+        heard_index,
+        heard_list,
         queue_folded,
         hit,
         viz,
@@ -322,9 +336,34 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // the cover would have had, which is the one place the radio player looks
     // better than the Spotify one.
     if let Some(r) = radio.as_ref() {
+        // Off air the deck is about a record from this station's own list, and
+        // that record is an ordinary queue track: it has a sleeve's worth of
+        // detail, a duration to scrub and a transport that means the list. So
+        // the three bands above the station row are the Spotify ones, and only
+        // the two below stay the station's.
+        let record = match r.off_air {
+            true => playback
+                .as_ref()
+                .zip(queue.as_ref().and_then(|q| q.current())),
+            false => None,
+        };
         if rows.header > 0 {
-            let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
-            deck::radio_masthead(frame, header_area, r, like, spotify_ready, mouse, hit);
+            match record {
+                Some((pb, track)) => deck::masthead(
+                    frame,
+                    header_area,
+                    track,
+                    pb.volume_percent,
+                    liked.get(&track.uri).copied(),
+                    spotify_ready,
+                    mouse,
+                    hit,
+                ),
+                None => {
+                    let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
+                    deck::radio_masthead(frame, header_area, r, like, spotify_ready, mouse, hit);
+                }
+            }
             hit.now_playing = Rect {
                 height: header_area.height.min(deck::MASTHEAD_H),
                 ..header_area
@@ -350,29 +389,25 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }
         if rows.progress > 0 {
             let pad = if rows.art > 0 { 1 } else { PROGRESS_PAD };
-            deck::radio_status(
-                frame,
-                Rect {
-                    y: progress_area.y + pad,
-                    height: 1,
-                    ..progress_area
-                },
-                r,
-                hit,
-            );
+            let bar = Rect {
+                y: progress_area.y + pad,
+                height: 1,
+                ..progress_area
+            };
+            match record {
+                Some((pb, track)) => deck::progress(frame, bar, pb, track.duration_ms, hit),
+                None => deck::radio_status(frame, bar, r, hit),
+            }
         }
         if rows.transport > 0 {
-            deck::radio_transport(
-                frame,
-                Rect {
-                    height: 1,
-                    ..transport_area
-                },
-                play,
-                steps,
-                mouse,
-                hit,
-            );
+            let row = Rect {
+                height: 1,
+                ..transport_area
+            };
+            match record {
+                Some(_) => deck::transport(frame, row, play, ahead, mouse, hit),
+                None => deck::radio_transport(frame, row, play, steps, mouse, hit),
+            }
         }
         if rows.list_head > 0 {
             let saved = radio_favorites.iter().any(|f| f.uuid == r.station.uuid);
@@ -384,8 +419,24 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 },
                 r,
                 saved,
+                Some(folded),
                 mouse,
                 hit,
+            );
+        }
+        if !folded {
+            draw_heard(
+                frame,
+                queue_area,
+                queue_head,
+                &heard,
+                heard_playing,
+                heard_live,
+                *heard_index,
+                heard_list,
+                hit,
+                liked,
+                mouse,
             );
         }
         return;
@@ -476,6 +527,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 ..transport_area
             },
             play,
+            deck::Forward::Next,
             mouse,
             hit,
         );
@@ -821,36 +873,89 @@ fn draw_scope(
     }
 }
 
+/// One row of the player's list, whichever of its two lists is on screen: the
+/// queue spot owns, or what the station on the deck has played.
+///
+/// A queue row always carries a record. A station's row may carry only what
+/// the station said — an ident, a promo, a title Spotify could not place — and
+/// those rows still belong in the list, because they are still what was
+/// played.
+struct ListRow<'a> {
+    track: Option<&'a Track>,
+    /// The station's own words, for a row with no record behind it. Empty on a
+    /// queue row.
+    words: &'a str,
+    playing: bool,
+    /// When the row was heard. [`None`] on a queue row, which is a play order
+    /// rather than a history and has no answer to give.
+    since: Option<Since>,
+}
+
+/// What a station's list says in its last cell.
+#[derive(Clone, Copy)]
+enum Since {
+    /// The record the station is announcing now.
+    Live,
+    /// When the station announced it.
+    Ago(Instant),
+}
+
+impl ListRow<'_> {
+    fn title(&self) -> &str {
+        self.track.map_or(self.words, |t| t.name.as_str())
+    }
+}
+
+/// How long ago, in one cell's worth of words.
+///
+/// Minutes up to the hour, then hours up to the day, then days: a row that old
+/// is being read for where it sits in an evening rather than for its clock.
+/// Nothing here is wider than [`AGO_W`](super::columns::AGO_W), the `23h ago` the hours run up to.
+fn ago(at: Instant) -> String {
+    let secs = at.elapsed().as_secs();
+    match secs {
+        s if s < 60 => "<1m ago".to_string(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn draw_queue(
+fn draw_list(
     frame: &mut Frame,
     area: Rect,
     // The blank row of the band above, which the column header takes.
     header: Rect,
-    queue: Option<&Queue>,
-    queue_index: usize,
-    queue_list: &mut ratatui::widgets::ListState,
+    rows: &[ListRow],
+    // The columns this list declares. The two lists share every column but the
+    // last, and share this renderer so they cannot drift on the rest.
+    cols: &[super::columns::Column],
+    selected: usize,
+    list_state: &mut ratatui::widgets::ListState,
     hit: &mut crate::app::state::HitAreas,
     liked: &std::collections::HashMap<String, bool>,
     mouse: Option<Position>,
+    empty: &str,
 ) {
     if area.height == 0 {
         return;
     }
-    let Some(q) = queue.filter(|q| !q.is_empty()) else {
+    if rows.is_empty() {
+        hit.player_queue = Rect::default();
         let row = Rect {
             y: area.y + area.height / 2,
             height: 1,
             ..area
         };
         frame.render_widget(
-            Paragraph::new("no queue — play something to fill this")
+            Paragraph::new(empty.to_string())
                 .alignment(ratatui::layout::Alignment::Center)
                 .style(theme::dim()),
             row,
         );
         return;
-    };
+    }
 
     // The name and count head the list from the band above, so the rows start
     // at the top of this one. Its right edge is the scrollbar's gutter.
@@ -858,11 +963,7 @@ fn draw_queue(
         width: area.width.saturating_sub(GUTTER),
         ..area
     };
-    let layout = Layout::resolve(
-        &super::columns::queue(q.len()),
-        rows_area.width as usize,
-        q.len(),
-    );
+    let layout = Layout::resolve(cols, rows_area.width as usize, rows.len());
     // The band above owns both the header's row and the blank under it, so
     // every row of this band carries a track.
     if header.height > 0 {
@@ -874,17 +975,12 @@ fn draw_queue(
         frame.render_widget(Paragraph::new(line), row);
     }
     hit.player_queue = rows_area;
-    super::clamp_offset(queue_list, q.len(), rows_area.height as usize);
-
-    // The playing marker is the queue's own index — spot owns the play
-    // order, so no URI has to be matched, and a track that appears twice
-    // marks only the row that is actually on.
-    let playing = Some(q.index());
+    super::clamp_offset(list_state, rows.len(), rows_area.height as usize);
 
     // The pair's click targets, clipped to the rows actually filled. The same
     // shape the browse table builds, for the same reason: the row comes from
     // the pointer's y, the control from its x.
-    let filled_rows = (q.len().saturating_sub(queue_list.offset()) as u16).min(rows_area.height);
+    let filled_rows = (rows.len().saturating_sub(list_state.offset()) as u16).min(rows_area.height);
     let cell_col = |off: usize, width: usize| {
         Rect {
             x: rows_area.x.saturating_add(off as u16),
@@ -904,13 +1000,15 @@ fn draw_queue(
     let artist = layout.cell(ColKey::Artist);
     let artist_w = artist.map_or(0, |c| c.width);
     let artist_x = artist.map(|c| rows_area.x.saturating_add(c.x as u16));
-    for (row, t) in q
-        .rows()
+    for (row, entry) in rows
         .iter()
-        .skip(queue_list.offset())
+        .skip(list_state.offset())
         .take(filled_rows as usize)
         .enumerate()
     {
+        // A row with no record credits nobody, so it records no link and a
+        // click on that blank cell falls through to selecting the row.
+        let Some(t) = entry.track else { continue };
         let cell = Rect {
             x: artist_x.unwrap_or(rows_area.x),
             y: rows_area.y.saturating_add(row as u16),
@@ -922,7 +1020,7 @@ fn draw_queue(
         credit_links(cell, &runs, &mut hit.queue_artist_links);
     }
     let hover_cell: Option<(usize, RowAction)> = mouse.and_then(|m| {
-        let row = |y: u16| queue_list.offset() + (y - rows_area.y) as usize;
+        let row = |y: u16| list_state.offset() + (y - rows_area.y) as usize;
         if hit.queue_like_col.contains(m) {
             Some((row(m.y), RowAction::Like))
         } else if hit.queue_share_col.contains(m) {
@@ -938,74 +1036,105 @@ fn draw_queue(
     let hover_artist: Option<(usize, u16)> = mouse
         .filter(|m| hit.queue_artist_links.iter().any(|(r, _)| r.contains(*m)))
         .and_then(|m| {
-            let row = queue_list.offset() + (m.y - rows_area.y) as usize;
+            let row = list_state.offset() + (m.y - rows_area.y) as usize;
             Some((row, m.x.saturating_sub(artist_x?)))
         });
-    let hovered = hovered_row(rows_area, queue_list.offset(), q.len(), mouse);
+    let hovered = hovered_row(rows_area, list_state.offset(), rows.len(), mouse);
 
     let accent_bold = theme::accent().add_modifier(Modifier::BOLD);
-    let items: Vec<ListItem> = q
-        .rows()
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            // Three weights, so the playing row stands out: the title at TEXT,
-            // everything supporting it at DIM, and the playing row in accent.
+        .map(|(i, entry)| {
+            let playing = entry.playing;
+            // Four weights: the title at TEXT, everything supporting it at
+            // DIM, the playing row in accent — and a row Spotify could not
+            // place at DIM as well, because the station's own words are a
+            // report rather than a record you can act on.
             // `Style::default()` here would leak the raw terminal foreground,
             // the one unthemed colour in the view.
-            let name_style = if Some(i) == playing {
-                accent_bold
-            } else {
-                theme::text()
+            let name_style = match (playing, entry.track.is_some()) {
+                (true, _) => accent_bold,
+                (false, true) => theme::text(),
+                (false, false) => theme::dim(),
             };
             let hover = hover_cell.and_then(|(row, col)| (row == i).then_some(col));
-            let saved = liked.get(&t.uri).copied();
+            let saved = entry.track.and_then(|t| liked.get(&t.uri).copied());
             // Where the star lands, so the selection restyle below can put its
             // accent back.
             let mut star_at = None;
+            let blank = |cell: &super::columns::Cell| Span::raw(" ".repeat(cell.width));
             let spans = row_spans(&layout, |cell, spans| match cell.key {
-                ColKey::Mark => spans.push(match Some(i) == playing {
+                ColKey::Mark => spans.push(match playing {
                     true => Span::styled("▶ ", accent_bold),
-                    false => Span::raw(" ".repeat(cell.width)),
+                    false => blank(cell),
                 }),
-                // Display position, not `Track::track_number`: the queue is a
-                // permutation, so the number follows the rows on screen.
+                // Display position, not `Track::track_number`: both of the
+                // player's lists are orders in their own right, so the number
+                // follows the rows on screen.
                 ColKey::No => spans.push(Span::styled(
                     right(&(i + 1).to_string(), cell.width),
-                    match Some(i) == playing {
+                    match playing {
                         true => accent_bold,
                         false => theme::dim(),
                     },
                 )),
-                ColKey::Title => spans.push(Span::styled(fit(&t.name, cell.width), name_style)),
-                ColKey::Artist => {
-                    let (line, runs) = credit_line(&t.credits, cell.width);
-                    let lit = hover_artist
-                        .filter(|(row, _)| *row == i)
-                        .and_then(|(_, dx)| {
-                            runs.iter().position(|run| {
-                                dx >= run.dx && dx < run.dx.saturating_add(run.width)
-                            })
-                        });
-                    spans.extend(credit_spans(&line, &runs, theme::dim(), lit));
+                ColKey::Title => {
+                    spans.push(Span::styled(fit(entry.title(), cell.width), name_style))
                 }
-                ColKey::Actions => {
-                    star_at = Some(spans.len());
-                    spans.extend(action_spans(saved, hover));
-                }
+                ColKey::Artist => match entry.track {
+                    Some(t) => {
+                        let (line, runs) = credit_line(&t.credits, cell.width);
+                        let lit = hover_artist
+                            .filter(|(row, _)| *row == i)
+                            .and_then(|(_, dx)| {
+                                runs.iter().position(|run| {
+                                    dx >= run.dx && dx < run.dx.saturating_add(run.width)
+                                })
+                            });
+                        spans.extend(credit_spans(&line, &runs, theme::dim(), lit));
+                    }
+                    None => spans.push(blank(cell)),
+                },
+                ColKey::Actions => match entry.track {
+                    Some(_) => {
+                        star_at = Some(spans.len());
+                        spans.extend(action_spans(saved, hover));
+                    }
+                    // No record, nothing to save, share or file: the controls
+                    // are not drawn rather than drawn dead.
+                    None => spans.push(blank(cell)),
+                },
                 ColKey::Time => spans.push(Span::styled(
-                    right(&format_duration(t.duration_ms), cell.width),
+                    match entry.track {
+                        Some(t) => right(&format_duration(t.duration_ms), cell.width),
+                        None => " ".repeat(cell.width),
+                    },
                     theme::dim(),
                 )),
-                _ => spans.push(Span::raw(" ".repeat(cell.width))),
+                // Unlike its neighbours this reads on a row with no record:
+                // when the station played something is known whether or not
+                // Spotify could say what it was.
+                ColKey::Ago => spans.push(Span::styled(
+                    match entry.since {
+                        Some(Since::Live) => right("live", cell.width),
+                        Some(Since::Ago(at)) => right(&ago(at), cell.width),
+                        None => " ".repeat(cell.width),
+                    },
+                    match playing {
+                        true => accent_bold,
+                        false => theme::dim(),
+                    },
+                )),
+                _ => spans.push(blank(cell)),
             });
             let mut line = Line::from(spans);
-            if i == queue_index {
+            if i == selected {
                 apply_selection(&mut line);
                 // Selection restyles every span, which would leave a row that
                 // is *also* playing with nothing but the `▶` to say so. Put
                 // the marker and its number back in accent.
-                if Some(i) == playing {
+                if playing {
                     for span in line.spans.iter_mut().take(2) {
                         span.style = accent_bold;
                     }
@@ -1022,8 +1151,135 @@ fn draw_queue(
         })
         .collect();
     let count = items.len();
-    frame.render_stateful_widget(List::new(items), rows_area, queue_list);
-    draw_scrollbar(frame, scroll_col(rows_area), count, queue_list.offset());
+    frame.render_stateful_widget(List::new(items), rows_area, list_state);
+    draw_scrollbar(frame, scroll_col(rows_area), count, list_state.offset());
+}
+
+/// The queue, through the list both of the player's lists are drawn by.
+#[allow(clippy::too_many_arguments)]
+fn draw_queue(
+    frame: &mut Frame,
+    area: Rect,
+    header: Rect,
+    queue: Option<&Queue>,
+    queue_index: usize,
+    queue_list: &mut ratatui::widgets::ListState,
+    hit: &mut crate::app::state::HitAreas,
+    liked: &std::collections::HashMap<String, bool>,
+    mouse: Option<Position>,
+) {
+    // The playing marker is the queue's own index — spot owns the play order,
+    // so no URI has to be matched, and a track that appears twice marks only
+    // the row that is actually on.
+    let playing = queue.map(Queue::index);
+    let rows: Vec<ListRow> = queue.filter(|q| !q.is_empty()).map_or_else(Vec::new, |q| {
+        q.rows()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ListRow {
+                track: Some(t),
+                words: "",
+                playing: Some(i) == playing,
+                since: None,
+            })
+            .collect()
+    });
+    draw_list(
+        frame,
+        area,
+        header,
+        &rows,
+        &super::columns::queue(rows.len()),
+        queue_index,
+        queue_list,
+        hit,
+        liked,
+        mouse,
+        "no queue — play something to fill this",
+    );
+}
+
+/// Which row of the station's list is playing, when one is.
+///
+/// Off air it is the queue's own position among the records this station
+/// played — derived rather than remembered, so it follows a next, a previous
+/// and a jump with nothing to keep in step. On air it is the newest row, and
+/// only while the station is still announcing it.
+fn heard_playing(state: &AppState) -> Option<usize> {
+    if !state.radio.as_ref()?.off_air {
+        return heard_live(state);
+    }
+    let position = state.queue.as_ref()?.index();
+    state
+        .heard()
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.track().is_some())
+        .nth(position)
+        .map(|(row, _)| row)
+}
+
+/// Which row of the station's list the station is announcing right now.
+///
+/// The newest row, while the station is still saying it is on that record —
+/// read off the decoder on air, and off a probe while the stream is stood
+/// down. It is the row the `Ago` column reads `live` on.
+///
+/// Off air this is deliberately not the row the `▶` marks: the station is on
+/// one record and you are hearing another, and the two cells say so.
+fn heard_live(state: &AppState) -> Option<usize> {
+    let radio = state.radio.as_ref()?;
+    let heard = state.heard();
+    let last = heard.len().checked_sub(1)?;
+    let announced = radio.now_title()?;
+    (heard[last].announced == announced).then_some(last)
+}
+
+/// What the station on the deck has played, oldest first.
+///
+/// The record playing is marked the way the queue's is: off air it is the
+/// queue's own position among the records this station played, and on air it
+/// is the newest row, which is what the station is announcing now.
+#[allow(clippy::too_many_arguments)]
+fn draw_heard(
+    frame: &mut Frame,
+    area: Rect,
+    header: Rect,
+    heard: &[crate::app::state::Heard],
+    playing: Option<usize>,
+    live: Option<usize>,
+    index: usize,
+    list: &mut ratatui::widgets::ListState,
+    hit: &mut crate::app::state::HitAreas,
+    liked: &std::collections::HashMap<String, bool>,
+    mouse: Option<Position>,
+) {
+    let rows: Vec<ListRow> = heard
+        .iter()
+        .enumerate()
+        .map(|(i, h)| ListRow {
+            track: h.track(),
+            words: &h.announced,
+            playing: Some(i) == playing,
+            since: Some(match Some(i) == live {
+                true => Since::Live,
+                false => Since::Ago(h.at),
+            }),
+        })
+        .collect();
+    draw_list(
+        frame,
+        area,
+        header,
+        &rows,
+        &super::columns::heard(rows.len()),
+        index,
+        list,
+        hit,
+        liked,
+        mouse,
+        "nothing yet — what this station plays appears here",
+    );
 }
 
 #[cfg(test)]
@@ -1355,7 +1611,7 @@ mod tests {
         let mut st = playing_state();
         let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
-        let (art, field) = (st.hit.art, st.hit.viz);
+        let (art, field) = (st.hit.art_rect(), st.hit.viz);
         assert_eq!(field.y, BRAND_H + VIZ_TOP);
         assert_eq!(field.bottom(), BRAND_H + VIZ_BOTTOM + 1);
         assert_eq!(field.y, art.y, "field and sleeve are out of line");
@@ -1399,7 +1655,7 @@ mod tests {
         assert_eq!(col(meta, 'B'), col(title, 'A'), "{meta:?} / {title:?}");
         // Row 2 separates the masthead from the block; the art starts on row 3.
         assert!(lines[2].trim().is_empty(), "{:?}", lines[2]);
-        assert_eq!(st.hit.art.y, BRAND_H + HEADER_H);
+        assert_eq!(st.hit.art_rect().y, BRAND_H + HEADER_H);
     }
 
     #[test]
@@ -1662,7 +1918,7 @@ mod tests {
         let inner_w = width - 2 * PANE_INSET;
 
         for (name, r) in [
-            ("art", st.hit.art),
+            ("art", st.hit.art_rect()),
             ("viz", st.hit.viz),
             ("gauge", st.hit.gauge),
             ("next", st.hit.next_btn),
@@ -1670,7 +1926,8 @@ mod tests {
             assert!(!r.is_empty(), "{name} was not drawn");
         }
         assert_eq!(
-            st.hit.art.x, PANE_INSET,
+            st.hit.art_rect().x,
+            PANE_INSET,
             "the block does not start at the screen margin"
         );
         // The progress bar and the queue are what have to grow — the sleeve is
@@ -1940,7 +2197,7 @@ mod tests {
         const BAR: u16 = BLOCK + ART_TALL_H + ART_PROGRESS_H - 1;
         for (rect, y) in [
             (st.hit.volume_slider, 1),
-            (st.hit.art, BLOCK),
+            (st.hit.art_rect(), BLOCK),
             (st.hit.viz, BLOCK),
             (st.hit.gauge, BAR),
             (st.hit.prev_btn, BAR + 1),
@@ -1958,7 +2215,7 @@ mod tests {
         assert_eq!(st.hit.now_playing.height, 2);
         assert_eq!(
             st.hit.viz.bottom(),
-            st.hit.art.bottom(),
+            st.hit.art_rect().bottom(),
             "field and sleeve are out of line"
         );
     }
@@ -2175,7 +2432,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let art = st.hit.art;
+        let art = st.hit.art_rect();
         assert!(!art.is_empty());
         for y in art.y..art.bottom() {
             for x in art.x..art.right() {
@@ -2193,7 +2450,7 @@ mod tests {
     fn art_top_and_bottom_pixels_land_in_one_cell() {
         let mut st = playing_state();
         render(&mut st, 80, TALL_H);
-        let art = st.hit.art;
+        let art = st.hit.art_rect();
 
         // Put the colour change on an *odd* pixel row, so one cell straddles
         // it: an even row would leave both halves of every cell the same
@@ -2233,7 +2490,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let art = st.hit.art;
+        let art = st.hit.art_rect();
         let fg_at = |frac: u16| {
             buffer
                 .cell(Position {
@@ -2260,7 +2517,7 @@ mod tests {
         for (w, h) in [(80u16, 26u16), (94, 36), (100, 30)] {
             let mut st = playing_state();
             render(&mut st, w, h);
-            let art = st.hit.art;
+            let art = st.hit.art_rect();
             assert!(!art.is_empty(), "{w}x{h}: no art");
             assert_eq!(art.width, 2 * art.height, "{w}x{h}: {art:?}");
         }
@@ -2275,7 +2532,7 @@ mod tests {
             let mut st = playing_state();
             st.cover = Some(std::sync::Arc::clone(&cover));
             render(&mut st, w, h);
-            st.hit.art
+            st.hit.art_rect()
         };
         let small = rect_at(55, 24);
         let large = rect_at(120, 40);
@@ -2294,7 +2551,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
         terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        let art = st.hit.art;
+        let art = st.hit.art_rect();
         let mut note = 0;
         for y in art.y..art.bottom() {
             for x in art.x..art.right() {
@@ -2320,7 +2577,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
             terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
             let buffer = terminal.backend().buffer().clone();
-            let art = st.hit.art;
+            let art = st.hit.art_rect();
             (art.y..art.bottom())
                 .flat_map(|y| (art.x..art.right()).map(move |x| Position { x, y }))
                 .map(|p| buffer.cell(p).unwrap().bg)
@@ -2374,7 +2631,7 @@ mod tests {
     fn a_narrow_pane_drops_art_before_the_visualizer() {
         let mut st = playing_state();
         render(&mut st, 44, 30);
-        assert!(st.hit.art.is_empty(), "{:?}", st.hit.art);
+        assert!(st.hit.art_rect().is_empty(), "{:?}", st.hit.art_rect());
         assert!(!st.hit.viz.is_empty(), "the visualizer went first");
         assert_eq!(st.hit.viz.x, PANE_INSET);
     }
@@ -2383,7 +2640,7 @@ mod tests {
     fn a_short_pane_drops_art() {
         let mut st = playing_state();
         render(&mut st, 100, 17);
-        assert!(st.hit.art.is_empty(), "{:?}", st.hit.art);
+        assert!(st.hit.art_rect().is_empty(), "{:?}", st.hit.art_rect());
         assert!(!st.hit.viz.is_empty());
     }
 
@@ -2518,5 +2775,290 @@ mod tests {
                 b.used
             );
         }
+    }
+
+    /// A station on the deck with three records behind it: two Spotify placed,
+    /// and one it could only name.
+    fn radio_state() -> AppState {
+        use crate::app::state::{Heard, RadioMatch, RadioPlayback, Station};
+
+        let mut st = AppState::new();
+        st.show_player = true;
+        let station = Station {
+            uuid: "s1".into(),
+            name: "Groove Salad".into(),
+            url: "http://stream/s1".into(),
+            homepage: String::new(),
+            tags: "ambient".into(),
+            country: "Nowhere".into(),
+            countrycode: "US".into(),
+            language: "english".into(),
+            codec: "MP3".into(),
+            bitrate: 128,
+            votes: 1,
+            hls: false,
+        };
+        let title = std::sync::Arc::new(parking_lot::Mutex::new(Some("Cyd - Gamma".to_string())));
+        st.radio = Some(RadioPlayback::new(station, 40, title, Default::default()));
+        // Stamped back from now, so the `Ago` column reads the same on every
+        // run rather than three readings of `<1m ago`.
+        let heard_at = |mins: u64| Instant::now() - Duration::from_secs(mins * 60);
+        let placed = |artists: &str, name: &str, mins: u64| Heard {
+            announced: format!("{artists} - {name}"),
+            matched: RadioMatch::Matched(Box::new(track(name, artists))),
+            at: heard_at(mins),
+        };
+        st.radio_heard.insert(
+            "s1".into(),
+            vec![
+                placed("Ann", "Alpha", 42),
+                Heard {
+                    announced: "Groove Salad - commercial free".into(),
+                    matched: RadioMatch::Unmatched,
+                    at: heard_at(38),
+                },
+                placed("Cyd", "Gamma", 4),
+            ],
+        );
+        st.audio_tap.push(&[0.0; 2048], 1.0);
+        st
+    }
+
+    /// The rows of whichever table the player drew, without the blanks around
+    /// it. Found by the number column, which every row of both tables carries.
+    fn list_rows(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start_matches(['▶', ' ']);
+                t.starts_with(|c: char| c.is_ascii_digit()) && t.contains("  ")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The station's list is the player's list while a station is on: oldest
+    /// at the top, and the record being announced marked the way the queue
+    /// marks the track that is playing.
+    #[test]
+    fn the_player_lists_what_the_station_played() {
+        let mut st = radio_state();
+        let lines = render(&mut st, 90, 30);
+        let joined = lines.join("\n");
+
+        assert!(
+            joined.contains("▾ Groove Salad"),
+            "the station heads its list: {joined}"
+        );
+        let rows = list_rows(&lines);
+        assert_eq!(rows.len(), 3, "{joined}");
+        assert!(
+            rows[0].contains("Alpha") && rows[0].contains("Ann"),
+            "{rows:?}"
+        );
+        assert!(rows[2].contains("Gamma"), "{rows:?}");
+        assert!(
+            rows[2].trim_start().starts_with('▶'),
+            "the record on air is marked: {rows:?}"
+        );
+        assert!(!rows[0].trim_start().starts_with('▶'), "{rows:?}");
+    }
+
+    /// A row Spotify could not place still says what the station said, and
+    /// wears none of the controls that would lead nowhere.
+    #[test]
+    fn a_row_with_no_record_shows_the_stations_own_words() {
+        let mut st = radio_state();
+        let lines = render(&mut st, 90, 30);
+        let rows = list_rows(&lines);
+        let row = &rows[1];
+        assert!(row.contains("Groove Salad - commercial"), "{rows:?}");
+        assert!(!row.contains(super::super::table::LIKED_MARK), "{row:?}");
+        assert!(!row.contains("1:23"), "no duration to report: {row:?}");
+        // But when it was played is known whether or not Spotify could say
+        // what it was, so that cell still reads.
+        assert!(row.contains("38m ago"), "{row:?}");
+    }
+
+    /// The last cell says when the station played each record, and says `live`
+    /// for the one it is playing now — which is the same row the `▶` marks, so
+    /// the two always agree.
+    #[test]
+    fn the_list_says_how_long_ago_each_record_was_played() {
+        let mut st = radio_state();
+        let rows = list_rows(&render(&mut st, 90, 30));
+        assert!(rows[0].contains("42m ago"), "{rows:?}");
+        assert!(rows[1].contains("38m ago"), "{rows:?}");
+        assert!(rows[2].contains("live"), "{rows:?}");
+        assert!(rows[2].trim_start().starts_with('▶'), "{rows:?}");
+    }
+
+    /// Stand the stream down for a record off the station's list, the way
+    /// `Client::play_heard` does — the stop that takes the decoder away nulls
+    /// the title it was writing, so the deck knows nothing until a probe says
+    /// otherwise.
+    fn stand_down(st: &mut AppState) {
+        let r = st.radio.as_mut().unwrap();
+        *r.title.lock() = None;
+        r.off_air = true;
+        st.park_queue();
+        st.playback = Some(Playback::started(50, false));
+        st.set_queue(Some(Queue::new(
+            st.heard_tracks(),
+            0,
+            "earlier on Groove Salad",
+        )));
+    }
+
+    /// Off air the station goes on playing without us, and a probe is what
+    /// says so. Until one has answered nothing is live; once one has, the
+    /// newest row says so — while `▶` stays on the record you are hearing,
+    /// because the two cells are about different things.
+    #[test]
+    fn a_probe_is_what_says_what_the_station_is_on_off_air() {
+        let mut st = radio_state();
+        stand_down(&mut st);
+
+        let rows = list_rows(&render(&mut st, 90, 30));
+        assert!(
+            !rows.iter().any(|r| r.contains("live")),
+            "nothing asked yet: {rows:?}"
+        );
+        assert!(rows[2].contains("4m ago"), "{rows:?}");
+
+        st.radio.as_mut().unwrap().probed = Some("Cyd - Gamma".into());
+        let rows = list_rows(&render(&mut st, 90, 30));
+        assert!(rows[2].contains("live"), "{rows:?}");
+        assert!(
+            rows[0].trim_start().starts_with('▶'),
+            "the marker stays on what you are hearing: {rows:?}"
+        );
+        assert!(!rows[2].trim_start().starts_with('▶'), "{rows:?}");
+    }
+
+    /// The reading is the first thing a tight row gives up — before the artist,
+    /// which is what tells two records of the same name apart.
+    #[test]
+    fn a_tight_row_drops_the_reading_before_the_artist() {
+        let mut st = radio_state();
+        let at = |st: &mut AppState, width: u16| list_rows(&render(st, width, 30)).join("\n");
+
+        let wide = at(&mut st, 90);
+        assert!(wide.contains("42m ago") && wide.contains("Ann"), "{wide:?}");
+
+        let tight = at(&mut st, 58);
+        assert!(!tight.contains("42m ago"), "{tight:?}");
+        assert!(tight.contains("Ann"), "the artist outlives it: {tight:?}");
+    }
+
+    /// A station that has said nothing yet says so, rather than leaving the
+    /// band under the deck blank.
+    #[test]
+    fn a_station_with_nothing_yet_says_so() {
+        let mut st = radio_state();
+        st.radio_heard.clear();
+        let joined = render(&mut st, 90, 30).join("\n");
+        assert!(
+            joined.contains("what this station plays appears here"),
+            "{joined}"
+        );
+    }
+
+    /// The station names its own list, so clicking the name folds that list
+    /// away and back — the same control the queue name is in the other deck.
+    #[test]
+    fn the_station_name_folds_its_list_away() {
+        let mut st = radio_state();
+        render(&mut st, 90, 30);
+        assert!(!st.hit.queue_name.is_empty(), "the name is a control");
+
+        st.queue_folded = true;
+        let lines = render(&mut st, 90, 30);
+        let joined = lines.join("\n");
+        assert!(joined.contains("▸ Groove Salad"), "{joined}");
+        assert!(list_rows(&lines).is_empty(), "{joined}");
+        assert!(
+            !joined.contains("Title"),
+            "no header over no rows: {joined}"
+        );
+        assert!(
+            !st.hit.queue_name.is_empty(),
+            "and the way back is still there"
+        );
+    }
+
+    /// The station's list is the queue's table with one column more, and
+    /// nothing else about it moved: the two share a renderer and every column
+    /// but the last, which is what keeps them from drifting into two spellings
+    /// of the same row.
+    #[test]
+    fn the_stations_list_is_the_queues_table_and_one_column_more() {
+        let head = |st: &mut AppState| {
+            render(st, 90, 30)
+                .into_iter()
+                .find(|l| l.contains("Title") && l.contains("Artist"))
+                .unwrap_or_default()
+        };
+        // The headings in order. The two lists carry the same ones, but not at
+        // the same offsets — the extra column takes its ten cells out of the
+        // flexible ones beside it.
+        let headings = |line: String| {
+            line.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let mut queue = headings(head(&mut playing_state()));
+        let station = headings(head(&mut radio_state()));
+        assert_eq!(queue, ["#", "Title", "Artist"]);
+        queue.push("Ago".to_string());
+        assert_eq!(station, queue);
+    }
+
+    /// Off air the deck is the record's, the way back is on the station row,
+    /// and the list marks the row that is playing rather than the newest.
+    #[test]
+    fn a_record_off_the_list_takes_the_deck_and_offers_the_way_back() {
+        let mut st = radio_state();
+        stand_down(&mut st);
+
+        let lines = render(&mut st, 90, 30);
+        let joined = lines.join("\n");
+        assert!(joined.contains("◂ live"), "{joined}");
+        assert!(
+            joined.contains("Groove Salad"),
+            "the station row stays: {joined}"
+        );
+        assert!(
+            !joined.contains("LIVE ━"),
+            "no stream meter off air: {joined}"
+        );
+
+        let rows = list_rows(&lines);
+        assert!(rows[0].trim_start().starts_with('▶'), "{rows:?}");
+        assert!(!rows[2].trim_start().starts_with('▶'), "{rows:?}");
+    }
+
+    /// Forward walks the station's records and then hands you back to the
+    /// station: the queue repeats, so the last record must say where it
+    /// really leads rather than offering a lap of the same list.
+    #[test]
+    fn forward_says_live_on_the_last_record_of_the_list() {
+        let mut st = radio_state();
+        stand_down(&mut st);
+
+        let joined = render(&mut st, 90, 30).join("\n");
+        assert!(
+            joined.contains("next ▸▸"),
+            "one record still ahead: {joined}"
+        );
+
+        st.queue.as_mut().unwrap().advance();
+        let lines = render(&mut st, 90, 30);
+        let joined = lines.join("\n");
+        assert!(joined.contains("live ▸▸"), "{joined}");
+        assert!(!joined.contains("next ▸▸"), "{joined}");
+        // And the marker moved with it, onto the last row Spotify could place.
+        let rows = list_rows(&lines);
+        assert!(rows[2].trim_start().starts_with('▶'), "{rows:?}");
     }
 }

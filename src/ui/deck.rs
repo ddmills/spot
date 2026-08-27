@@ -29,7 +29,9 @@ use super::table::{
 };
 use super::theme;
 use crate::app::queue::Queue;
-use crate::app::state::{Credit, HitAreas, Playback, RadioPlayback, Track, format_duration};
+use crate::app::state::{
+    ArtHit, ArtSource, Credit, HitAreas, Playback, RadioPlayback, Track, format_duration,
+};
 use crate::cover::Cover;
 
 /// Rows [`masthead`] occupies: the title, and the metadata under it.
@@ -55,6 +57,33 @@ const NEXT_LABEL: &str = "next ▸▸";
 /// to step forward to. The same seven cells as [`NEXT_LABEL`], so the two
 /// never move the row between them.
 const SEEK_LABEL: &str = "seek ▸▸";
+/// The forward control where the thing after this record is the station that
+/// played it. The same seven cells again, so the row does not shift as the
+/// list is walked to its end.
+const LIVE_FORWARD_LABEL: &str = "live ▸▸";
+
+/// Where the Spotify transport's forward control leads.
+///
+/// The row is otherwise the same wherever it is drawn, so this is the one
+/// thing about it a caller decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Forward {
+    /// The next record of the queue.
+    #[default]
+    Next,
+    /// The broadcast of the station this record came off, because the record
+    /// is the last of that station's list and nothing else follows it.
+    Live,
+}
+
+impl Forward {
+    fn label(self) -> &'static str {
+        match self {
+            Forward::Next => NEXT_LABEL,
+            Forward::Live => LIVE_FORWARD_LABEL,
+        }
+    }
+}
 
 /// The liked control at the right end of the title row, in both states.
 /// Unpadded, like every other control on the deck — the hover pill covers the
@@ -188,9 +217,13 @@ pub fn no_playback_hint(frame: &mut Frame, area: Rect, spotify_ready: bool) {
 ///
 /// The block is square on screen (see [`art_w`]), so its width follows from
 /// the rows it is given rather than being passed in. Returns the rect it
-/// painted so the caller can lay out beside it, and records it as `hit.art`
-/// — a region, not a control: the sleeve is deliberately inert, and the album
-/// is opened from its name on the row below.
+/// painted so the caller can lay out beside it, and records it in
+/// `hit.art_blocks`: clicking a sleeve fills the screen with it.
+///
+/// Deliberately not a link to the album — the sleeve is the biggest, most
+/// inviting thing on the screen, so an album opened from it would be the one
+/// control nothing labels. The album's name on the row below does that job and
+/// says so; this only ever shows you the picture you clicked, larger.
 pub fn sleeve(
     frame: &mut Frame,
     area: Rect,
@@ -206,7 +239,11 @@ pub fn sleeve(
     // placeholder, and it does not reshuffle between tracks of one sleeve.
     let seed = track.album_id.as_deref().unwrap_or(track.name.as_str());
     draw_art(frame, art, cover, seed);
-    hit.art = art;
+    hit.art_blocks.push(ArtHit {
+        rect: art,
+        source: ArtSource::Playing,
+        seed: seed.to_string(),
+    });
     art
 }
 
@@ -645,6 +682,10 @@ pub fn radio_transport(
 /// is playing, and Spotify is where that one is kept. This one is a station,
 /// kept in a file of spot's own because the directory has no account to keep it
 /// in. The two sit on different rows and say different words.
+/// The control back to the broadcast, drawn while a record off the station's
+/// own list is playing instead of it.
+const LIVE_LABEL: &str = "◂ live";
+
 fn save_label(saved: bool) -> String {
     let mark = super::table::LIKED_MARK;
     if saved {
@@ -657,9 +698,13 @@ fn save_label(saved: bool) -> String {
 /// The radio deck's bottom row: the station itself — what it is called, where
 /// it broadcasts from, how it sounds, and whether you have kept it.
 ///
-/// Shuffle is not here, and neither is a queue name: there is one stream and no
-/// order to put it in. The row carries controls instead, rather than spending
-/// its width restating what the masthead already says.
+/// Shuffle is not here: there is one stream and no order to put it in. The row
+/// carries controls instead, rather than spending its width restating what the
+/// masthead already says.
+///
+/// The station is what its list is called, so the name heads that list the way
+/// a queue name heads the queue — marker and all, and clicking it folds the
+/// list away and back.
 ///
 /// The name is white and the rest grey, so the row reads as one fact with its
 /// footnotes rather than as three of equal weight. The country is a link into
@@ -669,45 +714,59 @@ fn save_label(saved: bool) -> String {
 /// here: they are what the masthead falls back to (see [`station_subtitle`]),
 /// and this row is about the station, not its programming.
 ///
-/// Records `hit.save_station_btn` and `hit.station_country`, and clears the two
-/// Spotify-deck controls that share the row so a click cannot land on last
-/// frame's rects.
+/// Records `hit.save_station_btn`, `hit.station_country` and `hit.queue_name`,
+/// and clears the one Spotify-deck control that shares the row so a click
+/// cannot land on last frame's rect.
 pub fn radio_station_row(
     frame: &mut Frame,
     row: Rect,
     radio: &RadioPlayback,
     saved: bool,
+    // Whether the list under this row is folded away, or [`None`] where the
+    // row is drawn with no list under it at all — the bottom bar, where the
+    // same click opens the player instead.
+    folded: Option<bool>,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
     hit.shuffle_btn = Rect::default();
-    hit.queue_name = Rect::default();
     if row.width == 0 {
         return;
     }
     let s = &radio.station;
 
-    // The control first, so the text is what gives way on a tight row rather
-    // than the one thing here you can press. `right_row` drops it whole below
+    // The controls first, so the text is what gives way on a tight row rather
+    // than the things here you can press. `right_row` drops each whole below
     // its own width, which leaves the row a plain readout rather than half a
     // button.
-    hit.save_station_btn = right_row(
-        frame,
-        row,
-        mouse,
-        vec![vec![Span::styled(
-            save_label(saved),
-            if saved { theme::accent() } else { theme::dim() },
-        )]],
-    )[0];
+    //
+    // `live` only where the stream has stood down for a record off the
+    // station's list: on air it would name the state you are already in.
+    let mut groups = Vec::new();
+    if radio.off_air {
+        groups.push(vec![Span::styled(LIVE_LABEL, theme::accent())]);
+    }
+    groups.push(vec![Span::styled(
+        save_label(saved),
+        if saved { theme::accent() } else { theme::dim() },
+    )]);
+    let rects = right_row(frame, row, mouse, groups);
+    let (live_btn, save_btn) = match radio.off_air {
+        true => (rects[0], rects[1]),
+        false => (Rect::default(), rects[0]),
+    };
+    hit.radio_live_btn = live_btn;
+    hit.save_station_btn = save_btn;
 
-    // One cell of daylight between the text and the control, as on the
+    // One cell of daylight between the text and the controls, as on the
     // masthead.
+    let controls_w = [live_btn, save_btn]
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.width + 1)
+        .sum::<u16>();
     let left = Rect {
-        width: match hit.save_station_btn.is_empty() {
-            true => row.width,
-            false => row.width.saturating_sub(hit.save_station_btn.width + 1),
-        },
+        width: row.width.saturating_sub(controls_w),
         ..row
     };
     if left.width == 0 {
@@ -717,20 +776,25 @@ pub fn radio_station_row(
     let dim = theme::dim();
     let mut spans = Vec::new();
     let mut x = left.x;
-    // `link` with nothing to click: it draws the run and advances `x` the way
-    // every other segment on the deck does, and hands back an empty rect that
-    // can never be hit. There is no page for one station, so the name is the
-    // row's subject rather than its control.
-    let name = clip(&s.name, left);
+    // The station names its own list, so the marker rides with the name and
+    // the pair is the fold control — the same click, in the same place, as the
+    // queue name in the Spotify player. In the bottom bar the same rect is
+    // what opens the player, which is where that list is drawn.
+    let mark = match folded {
+        Some(true) => "▸ ",
+        Some(false) => "▾ ",
+        None => "",
+    };
+    let name = clip(&format!("{mark}{}", s.name), left);
     if sep(&mut spans, &mut x, &name, left) {
-        link(
+        hit.queue_name = link(
             &mut spans,
             &mut x,
             left,
             mouse,
             name,
             theme::bright().add_modifier(Modifier::BOLD),
-            false,
+            true,
         );
     }
     let country = clip(&s.country, left);
@@ -832,6 +896,7 @@ pub fn transport(
     frame: &mut Frame,
     row: Rect,
     play: PlayState,
+    forward: Forward,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) {
@@ -848,7 +913,8 @@ pub fn transport(
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), row);
 
-    let edges = (width(PREV_LABEL) + width(NEXT_LABEL)) as u16;
+    let ahead = forward.label();
+    let edges = (width(PREV_LABEL) + width(ahead)) as u16;
 
     // Centred on the row rather than between the two buttons: they are of
     // different widths, and a pill centred between them would not line up with
@@ -871,12 +937,7 @@ pub fn transport(
     if row.width < edges + 1 {
         return;
     }
-    hit.next_btn = right_row(
-        frame,
-        row,
-        mouse,
-        vec![vec![Span::styled(NEXT_LABEL, button)]],
-    )[0];
+    hit.next_btn = right_row(frame, row, mouse, vec![vec![Span::styled(ahead, button)]])[0];
 }
 
 /// One row: the playing queue's name and length on the left, the shuffle
@@ -904,6 +965,12 @@ pub fn context_row(
 ) {
     let dim = theme::dim();
     let accent = theme::accent();
+
+    // The station row's own controls share this row in the other deck, so a
+    // click cannot be allowed to land on last frame's rects — the mirror of
+    // what `radio_station_row` clears on its way in.
+    hit.save_station_btn = Rect::default();
+    hit.radio_live_btn = Rect::default();
 
     // The control first: the name is what gets truncated if the row is tight.
     hit.shuffle_btn = right_row(
@@ -1298,7 +1365,7 @@ mod tests {
     #[test]
     fn the_transport_pushes_its_buttons_to_the_edges() {
         let (lines, hit, buffer) = render(60, 1, |f, a, h| {
-            transport(f, a, PlayState::Playing, None, h)
+            transport(f, a, PlayState::Playing, Forward::Next, None, h)
         });
         assert!(lines[0].contains("◂◂ previous") && lines[0].contains("next ▸▸"));
         assert_eq!(hit.prev_btn.x, 0);
@@ -1325,7 +1392,7 @@ mod tests {
     #[test]
     fn the_pill_goes_away_while_a_play_is_in_flight() {
         let (lines, hit, _) = render(60, 1, |f, a, h| {
-            transport(f, a, PlayState::Loading, None, h)
+            transport(f, a, PlayState::Loading, Forward::Next, None, h)
         });
         assert!(!lines[0].contains("play"), "{:?}", lines[0]);
         assert!(!lines[0].contains("pause"), "{:?}", lines[0]);
@@ -1459,7 +1526,7 @@ mod tests {
     #[test]
     fn a_narrow_transport_keeps_previous_alone() {
         let (lines, hit, _) = render(18, 1, |f, a, h| {
-            transport(f, a, PlayState::Playing, None, h)
+            transport(f, a, PlayState::Playing, Forward::Next, None, h)
         });
         assert!(lines[0].contains("◂◂ previous"), "{:?}", lines[0]);
         assert!(!lines[0].contains("next"), "{:?}", lines[0]);
@@ -1500,9 +1567,9 @@ mod tests {
         let (_, hit, buffer) = render(40, 7, |f, a, h| {
             sleeve(f, a, &t, None, h);
         });
-        assert_eq!((hit.art.width, hit.art.height), (art_w(7), 7));
-        for y in hit.art.y..hit.art.bottom() {
-            for x in hit.art.x..hit.art.right() {
+        assert_eq!((hit.art_rect().width, hit.art_rect().height), (art_w(7), 7));
+        for y in hit.art_rect().y..hit.art_rect().bottom() {
+            for x in hit.art_rect().x..hit.art_rect().right() {
                 let cell = buffer.cell(Position { x, y }).unwrap();
                 assert!(matches!(cell.fg, Color::Rgb(..)), "no fg at {x},{y}");
                 assert!(matches!(cell.bg, Color::Rgb(..)), "no bg at {x},{y}");
@@ -1520,7 +1587,14 @@ mod tests {
                 let a = Rect { width, ..a };
                 masthead(f, a, &t, 56, Some(true), false, None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, DURATION, h);
-                transport(f, Rect { height: 1, ..a }, PlayState::Playing, None, h);
+                transport(
+                    f,
+                    Rect { height: 1, ..a },
+                    PlayState::Playing,
+                    Forward::Next,
+                    None,
+                    h,
+                );
                 context_row(f, Rect { height: 1, ..a }, false, Some(&q), None, None, h);
             });
         }
@@ -1656,9 +1730,11 @@ mod tests {
     #[test]
     fn the_station_row_names_the_station_its_country_and_its_format() {
         let r = radio("Adroit Jazz");
-        let (lines, hit, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (lines, hit, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         assert!(
-            lines[0].starts_with("Adroit Jazz · Germany · MP3 128k"),
+            lines[0].starts_with("▾ Adroit Jazz · Germany · MP3 128k"),
             "{:?}",
             lines[0]
         );
@@ -1678,16 +1754,19 @@ mod tests {
         };
         assert_eq!(at(hit.station_country), "Germany");
         assert!(hit.save_station_btn.right() == 80);
-        // The deck's other controls do not belong on a radio row, and a rect
-        // left over from the Spotify deck would still be hittable.
-        assert!(hit.shuffle_btn.is_empty() && hit.queue_name.is_empty());
+        // The station names its own list, so the name is the fold control the
+        // queue name is in the other deck — marker included.
+        assert_eq!(at(hit.queue_name), "▾ Adroit Jazz");
+        // Shuffle does not belong on a radio row, and a rect left over from
+        // the Spotify deck would still be hittable.
+        assert!(hit.shuffle_btn.is_empty());
 
         // A record on the masthead changes nothing here.
         let mut playing = radio("Adroit Jazz");
         *playing.title.lock() = Some("Peter Appleyard - Frenesi".into());
         playing.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
         let (named, _, _) = render(80, 1, |f, a, h| {
-            radio_station_row(f, a, &playing, false, None, h)
+            radio_station_row(f, a, &playing, false, Some(false), None, h)
         });
         assert_eq!(named[0], lines[0]);
     }
@@ -1698,7 +1777,9 @@ mod tests {
     #[test]
     fn the_station_row_says_how_the_live_stream_is_mixed() {
         let r = radio("Adroit Jazz");
-        let (quiet, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (quiet, _, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         assert!(
             !quiet[0].contains("stereo") && !quiet[0].contains("mono"),
             "{:?}",
@@ -1706,20 +1787,26 @@ mod tests {
         );
 
         r.channels.store(2, std::sync::atomic::Ordering::Relaxed);
-        let (lines, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (lines, _, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         assert!(
-            lines[0].starts_with("Adroit Jazz · Germany · MP3 128k · stereo"),
+            lines[0].starts_with("▾ Adroit Jazz · Germany · MP3 128k · stereo"),
             "{:?}",
             lines[0]
         );
 
         r.channels.store(1, std::sync::atomic::Ordering::Relaxed);
-        let (mono, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (mono, _, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         assert!(mono[0].contains("MP3 128k · mono"), "{:?}", mono[0]);
 
         // The narrow row drops it before it drops the name, the country or the
         // format, which is what `sep` is for.
-        let (tight, _, _) = render(34, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (tight, _, _) = render(34, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         assert!(tight[0].contains("Adroit Jazz"), "{:?}", tight[0]);
         assert!(!tight[0].contains("mono"), "{:?}", tight[0]);
     }
@@ -1730,10 +1817,12 @@ mod tests {
     #[test]
     fn the_save_control_says_which_way_it_would_go_without_moving() {
         let r = radio("Adroit Jazz");
-        let (saved_lines, saved_hit, saved_buf) =
-            render(80, 1, |f, a, h| radio_station_row(f, a, &r, true, None, h));
-        let (plain_lines, plain_hit, plain_buf) =
-            render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (saved_lines, saved_hit, saved_buf) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, true, Some(false), None, h)
+        });
+        let (plain_lines, plain_hit, plain_buf) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         let mark = super::super::table::LIKED_MARK;
         assert!(
             saved_lines[0].contains(&format!("{mark} saved")),
@@ -1761,7 +1850,9 @@ mod tests {
     fn a_country_with_no_code_is_drawn_but_leads_nowhere() {
         let mut r = radio("Adroit Jazz");
         r.station.countrycode = String::new();
-        let (lines, hit, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (lines, hit, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         assert!(lines[0].contains("Germany"), "{:?}", lines[0]);
         assert!(hit.station_country.is_empty());
     }
@@ -1773,9 +1864,11 @@ mod tests {
         let mut r = radio("Adroit Jazz");
         r.station.codec = "UNKNOWN".into();
         r.station.bitrate = 0;
-        let (lines, _, _) = render(80, 1, |f, a, h| radio_station_row(f, a, &r, false, None, h));
+        let (lines, _, _) = render(80, 1, |f, a, h| {
+            radio_station_row(f, a, &r, false, Some(false), None, h)
+        });
         let text = lines[0].split('★').next().unwrap().trim_end();
-        assert_eq!(text, "Adroit Jazz · Germany", "{:?}", lines[0]);
+        assert_eq!(text, "▾ Adroit Jazz · Germany", "{:?}", lines[0]);
     }
 
     #[test]
@@ -1815,7 +1908,15 @@ mod tests {
                             None,
                             h,
                         );
-                        radio_station_row(f, Rect { height: 1, ..a }, r, saved, None, h);
+                        radio_station_row(
+                            f,
+                            Rect { height: 1, ..a },
+                            r,
+                            saved,
+                            Some(false),
+                            None,
+                            h,
+                        );
                     });
                 }
             }

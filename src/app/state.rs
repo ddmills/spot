@@ -977,6 +977,23 @@ pub struct RadioPlayback {
     /// uuid alone does not catch it: retrying a station that failed puts the
     /// same uuid on the deck the old failure names.
     pub tune_seq: u64,
+    /// A record from this station's own list is playing through Spotify, so
+    /// the stream is stopped and the deck draws the record rather than the
+    /// broadcast. The deck's `live` control puts the stream back.
+    ///
+    /// The deck is kept rather than cleared because the page is still the
+    /// station's: its list is what the record is playing from, and the way
+    /// back on air is a control on that page.
+    pub off_air: bool,
+    /// What a probe read off the station while its stream was stood down.
+    ///
+    /// A plain field rather than something behind the title's lock, for the
+    /// same reason [`Self::matched`] is one: the decoder thread owns `title`
+    /// and writes nothing else, while this is written by the client task under
+    /// the state lock like everything else. Off air the decoder is stopped, so
+    /// this is the only thing that knows what the station is playing — see
+    /// `Client::probe_off_air_station`.
+    pub probed: Option<String>,
 }
 
 impl Track {
@@ -1039,6 +1056,74 @@ pub enum RadioMatch {
     Matched(Box<Track>),
 }
 
+impl RadioMatch {
+    /// The Spotify record behind an announcement, when the lookup found one.
+    ///
+    /// One resolution for the deck and for a row of a station's list, so the
+    /// two cannot come to disagree about what counts as a match.
+    pub fn track(&self) -> Option<&Track> {
+        match self {
+            RadioMatch::Matched(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Records kept per station. A long evening on one station, past which the
+/// oldest rows go: the list is a memory of what you heard, not a log.
+pub const HEARD_MAX: usize = 200;
+
+/// One record a station announced, and what Spotify made of it.
+///
+/// Every announcement makes one of these, whether Spotify identified it or
+/// not: a row that carries only the station's own words still says what was
+/// played at that moment, which is the whole point of keeping the list.
+#[derive(Debug, Clone)]
+pub struct Heard {
+    pub announced: String,
+    pub matched: RadioMatch,
+    /// When the station announced this record, which is what the list's `Ago`
+    /// column counts from.
+    pub at: Instant,
+}
+
+impl Heard {
+    pub fn new(announced: String) -> Self {
+        Self {
+            announced,
+            matched: RadioMatch::None,
+            at: Instant::now(),
+        }
+    }
+
+    /// The Spotify record behind the announcement, if one was found.
+    pub fn track(&self) -> Option<&Track> {
+        self.matched.track()
+    }
+}
+
+/// The selection and scroll of whichever list the player screen is drawing.
+pub struct PlayerList<'a> {
+    pub len: usize,
+    /// The list's height from the last frame, which is what a half-page step
+    /// and a scroll clamp are measured in.
+    pub height: u16,
+    pub index: &'a mut usize,
+    pub list: &'a mut ListState,
+}
+
+/// The queue put aside while a record off a station's list plays.
+///
+/// Playing something a station played must not cost the play order you
+/// already had, so the queue is parked whole — the selection and the scroll
+/// with it, since the player screen is what you come back to.
+#[derive(Debug, Clone)]
+pub struct ParkedQueue {
+    pub queue: Queue,
+    pub index: usize,
+    pub offset: usize,
+}
+
 /// What a station nobody is listening to is announcing.
 ///
 /// A state machine for the same reason [`RadioMatch`] is one: "we have not
@@ -1093,6 +1178,8 @@ impl RadioPlayback {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         }
     }
 
@@ -1102,8 +1189,13 @@ impl RadioPlayback {
     }
 
     /// The announced track, if there is one worth drawing.
+    ///
+    /// The decoder's reading first and a probe's second: on air the two never
+    /// disagree, because the probe only runs while the stream is stood down
+    /// and the stop that stands it down nulls the decoder's lock on its way
+    /// past.
     pub fn now_title(&self) -> Option<String> {
-        self.title.lock().clone()
+        self.title.lock().clone().or_else(|| self.probed.clone())
     }
 
     /// How the stream is mixed, once the decoder has identified it.
@@ -1692,6 +1784,44 @@ impl TextCol {
     }
 }
 
+/// Which store the expanded view reads its picture back out of.
+///
+/// A click records where the art came from rather than the picture, so a cover
+/// that decodes after the block is expanded still lands in it, and a block
+/// expanded while its fetch is in flight fills in under the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtSource {
+    /// The playing record's sleeve, out of [`AppState::cover`]: the one store
+    /// not keyed by URL, and the one whose subject changes under the view.
+    Playing,
+    /// A page's own art, by the URL it decodes from — a browsed sleeve out of
+    /// [`AppState::view_cover`], or a portrait or album card out of
+    /// [`AppState::page_art`]. `None` where the page named no image at all,
+    /// which is the placeholder at any size.
+    Page(Option<String>),
+}
+
+/// A cover-art block as drawn, and where to find its picture again.
+#[derive(Debug, Clone)]
+pub struct ArtHit {
+    pub rect: Rect,
+    pub source: ArtSource,
+    /// The seed the block was painted with, so an expanded placeholder keeps
+    /// the swatch of the one that was clicked. See `ui::table::draw_art`.
+    pub seed: String,
+}
+
+/// A cover-art block expanded to the screen.
+///
+/// The whole sleeve, as large as the terminal can seat it square: the shorter
+/// side decides, so it is never cropped and there is nothing to scroll. See
+/// `ui::art_zoom`.
+#[derive(Debug, Clone)]
+pub struct ArtZoom {
+    pub source: ArtSource,
+    pub seed: String,
+}
+
 /// Screen regions recorded during draw, used to resolve mouse events.
 /// Reset at the start of every frame; a region not drawn that frame stays
 /// zero-sized and can never be hit.
@@ -1869,6 +1999,10 @@ pub struct HitAreas {
     /// it is playing. Always drawn while a station is on — unlike the liked
     /// control, the answer is in a file of spot's own and is never unknown.
     pub save_station_btn: Rect,
+    /// The deck's way back to the broadcast, beside the save control. Drawn
+    /// only while the stream has stood down for a record off the station's
+    /// own list; empty every other frame.
+    pub radio_live_btn: Rect,
     /// Volume slider track only; click position maps linearly to percent.
     pub volume_slider: Rect,
     /// The playing queue's name on the deck's context row. From the bottom
@@ -1890,15 +2024,31 @@ pub struct HitAreas {
     /// whole band is live, not just the lit bars — it is the biggest target
     /// on the screen and nothing else is drawn there.
     pub viz: Rect,
-    /// The cover-art block, in whichever view drew it. Deliberately *not* a
-    /// click target: the sleeve is the biggest, most inviting thing on the
-    /// screen, so an album opened from it would be the one control nothing
-    /// labels. The album's name on the row below does that job, and says so.
-    /// Recorded because the layout is worth being able to find.
-    pub art: Rect,
+    /// Every cover-art block the frame painted, in draw order, each clipped to
+    /// what is on screen. Clicking one fills the screen with it.
+    ///
+    /// The seed and the source ride along rather than the picture itself:
+    /// `HitAreas` is rebuilt every frame, and the expanded view has to outlive
+    /// that and survive a cover decoding after the click that opened it. The
+    /// strings are the same per-frame cost [`Self::main_artist_links`] already
+    /// pays.
+    pub art_blocks: Vec<ArtHit>,
 }
 
 impl HitAreas {
+    /// The art block under `at`, if the frame drew one there.
+    pub fn art_at(&self, at: Position) -> Option<&ArtHit> {
+        self.art_blocks.iter().find(|a| a.rect.contains(at))
+    }
+
+    /// The first art block the frame recorded. Every view that draws a sleeve
+    /// draws one, so this is the sleeve; the artist page's album cards are the
+    /// only surface that records more.
+    #[cfg(test)]
+    pub fn art_rect(&self) -> Rect {
+        self.art_blocks.first().map_or(Rect::default(), |a| a.rect)
+    }
+
     /// The main-pane row on content line `line`, if any.
     ///
     /// Without a line model a row is a line, so the answer is the line itself;
@@ -1999,6 +2149,20 @@ pub struct AppState {
     /// `Client::refresh_station_now` — and bounded by the size of
     /// [`Self::radio_favorites`], so nothing evicts from it.
     pub radio_now: HashMap<String, StationNow>,
+    /// What each station announced this session, oldest first, keyed by
+    /// [`Station::uuid`].
+    ///
+    /// Here rather than on [`RadioPlayback`] because the deck is dropped every
+    /// time you change station, and a station you come back to must still know
+    /// what it played. Bounded per station by [`HEARD_MAX`].
+    pub radio_heard: HashMap<String, Vec<Heard>>,
+    /// The player screen's selection and scroll in the station's list.
+    ///
+    /// Apart from [`Self::queue_index`] and [`Self::queue_list`] because both
+    /// lists are alive at once: while a record off a station's list plays, the
+    /// queue holds that list and the screen still draws this one.
+    pub heard_index: usize,
+    pub heard_list: ListState,
     /// What you were listening to before the current station, oldest first.
     ///
     /// Read only while a station is live: the radio deck's `◂◂ previous` walks
@@ -2071,6 +2235,9 @@ pub struct AppState {
     pub queue: Option<Queue>,
     pub queue_index: usize,
     pub queue_list: ListState,
+    /// The queue set aside while a record off a station's list plays, put back
+    /// when the station goes on air again or the deck is dropped.
+    pub parked: Option<ParkedQueue>,
     /// Whether the player's queue is folded away, leaving the deck above it
     /// with the pane to itself. Toggled by clicking the queue's name in the
     /// player, which is the one place the fold can be seen and undone.
@@ -2130,6 +2297,21 @@ pub struct AppState {
     pub loading: bool,
     pub toast: Option<(String, Instant)>,
     pub show_help: bool,
+    /// The cover-art block filling the screen, if one is expanded. See
+    /// [`ArtZoom`].
+    pub art_zoom: Option<ArtZoom>,
+    /// The expanded view's own copy of the cover it is showing, decoded at
+    /// [`crate::cover::ZOOM_PX`] rather than the grid the layout's blocks are
+    /// happy with.
+    ///
+    /// A slot of its own, not an entry in [`Self::page_art`]: it holds the same
+    /// URL at a different resolution, and one screen-sized cover is worth more
+    /// than the eviction it would cause. Dropped when the view closes.
+    pub zoom_cover: Option<Arc<crate::cover::Cover>>,
+    /// Guards [`Self::zoom_cover`] the way [`Self::cover_generation`] guards
+    /// the playing sleeve: expanding a second block while the first is still
+    /// in flight must settle on the second.
+    pub zoom_cover_generation: u64,
     /// How far the app has got towards replacing itself. `None` on almost
     /// every run: the startup check only fills it when GitHub has something
     /// newer than this build.
@@ -2158,6 +2340,9 @@ impl AppState {
             radio: None,
             radio_favorites: Vec::new(),
             radio_now: HashMap::new(),
+            radio_heard: HashMap::new(),
+            heard_index: 0,
+            heard_list: ListState::default(),
             listen_back: Vec::new(),
             listen_forward: Vec::new(),
             playlists: Vec::new(),
@@ -2190,6 +2375,7 @@ impl AppState {
             queue: None,
             queue_index: 0,
             queue_list: ListState::default(),
+            parked: None,
             queue_folded: false,
             queue_generation: 0,
             last_queue_click: None,
@@ -2205,6 +2391,9 @@ impl AppState {
             loading: false,
             toast: None,
             show_help: false,
+            art_zoom: None,
+            zoom_cover: None,
+            zoom_cover_generation: 0,
             update: None,
             should_quit: false,
             restart_request: false,
@@ -2213,6 +2402,51 @@ impl AppState {
 
     /// The Home rows that exist right now.
     ///
+    /// The picture behind an [`ArtSource`], out of whichever store holds it.
+    ///
+    /// [`Self::zoom_cover`] is asked first, so the expanded view sharpens the
+    /// moment its own decode lands and shows the layout's own small cover until
+    /// then.
+    ///
+    /// A page's cover is matched on the URL it decoded from rather than taken
+    /// from the slot: `pop_view` restores a header without issuing a fetch, so
+    /// a cover can outlive the page it belongs to, and the URL is what says the
+    /// two are about the same record. A mismatch resolves to nothing, which
+    /// draws the placeholder — what the block shows while any fetch is in
+    /// flight anyway.
+    pub fn art_cover(&self, source: &ArtSource) -> Option<Arc<crate::cover::Cover>> {
+        let sharp = |url: &str| self.zoom_cover.as_ref().filter(|c| c.url == url).cloned();
+        match source {
+            ArtSource::Playing => {
+                let playing = self.cover.as_ref()?;
+                sharp(&playing.url).or_else(|| Some(Arc::clone(playing)))
+            }
+            ArtSource::Page(url) => {
+                let url = url.as_deref()?;
+                sharp(url).or_else(|| {
+                    self.view_cover
+                        .as_ref()
+                        .filter(|c| c.url == url)
+                        .cloned()
+                        .or_else(|| self.page_art.get(url))
+                })
+            }
+        }
+    }
+
+    /// The URL the expanded view should decode at [`crate::cover::ZOOM_PX`] for
+    /// `source`, if there is one to ask for.
+    ///
+    /// `None` where the block is a placeholder, or where the playing sleeve has
+    /// not decoded yet and the URL it came from is not ours to know — there is
+    /// nothing for a sharper copy to be sharper than.
+    pub fn art_zoom_url(&self, source: &ArtSource) -> Option<String> {
+        match source {
+            ArtSource::Playing => self.cover.as_ref().map(|c| c.url.clone()),
+            ArtSource::Page(url) => url.clone(),
+        }
+    }
+
     /// The library rows are there only while Spotify can play; the Spotify row
     /// is there only while it cannot. Radio is always there — it is the half
     /// of the app that needs no account.
@@ -2443,6 +2677,204 @@ impl AppState {
         self.queue.as_ref().map_or(0, |q| q.len())
     }
 
+    /// What the station on the deck has played, oldest first.
+    pub fn heard(&self) -> &[Heard] {
+        self.radio
+            .as_ref()
+            .and_then(|r| self.radio_heard.get(&r.station.uuid))
+            .map_or(&[], |rows| rows.as_slice())
+    }
+
+    /// The record on one row of the station's list.
+    pub fn heard_track(&self, row: usize) -> Option<&Track> {
+        self.heard().get(row)?.track()
+    }
+
+    /// Every record of the station's list Spotify identified, in list order.
+    ///
+    /// The play order a row's Enter installs, and the order the `▶` marker is
+    /// read back through, so both come from one definition.
+    pub fn heard_tracks(&self) -> Vec<Track> {
+        self.heard()
+            .iter()
+            .filter_map(|h| h.track().cloned())
+            .collect()
+    }
+
+    /// Where a row of the station's list sits among the records that can be
+    /// played, or [`None`] for a row Spotify has nothing for.
+    pub fn heard_play_position(&self, row: usize) -> Option<usize> {
+        self.heard_track(row)?;
+        Some(
+            self.heard()[..row]
+                .iter()
+                .filter(|h| h.track().is_some())
+                .count(),
+        )
+    }
+
+    /// Note what the station just announced.
+    ///
+    /// The trim and the tail-follow are done together because both move the
+    /// scroll offset, and neither is right without the other: a trim that left
+    /// the offset alone would slide the rows under the reader, and a follow
+    /// that ran before the trim would aim at a row about to be dropped.
+    pub fn push_heard(&mut self, announced: String) {
+        let Some(uuid) = self.radio.as_ref().map(|r| r.station.uuid.clone()) else {
+            return;
+        };
+        let height = self.hit.player_queue.height as usize;
+        let offset = self.heard_list.offset();
+        let was_at_bottom = height == 0 || offset + height >= self.heard().len();
+
+        let rows = self.radio_heard.entry(uuid).or_default();
+        rows.push(Heard::new(announced));
+        let dropped = rows.len().saturating_sub(HEARD_MAX);
+        if dropped > 0 {
+            rows.drain(..dropped);
+        }
+        let len = rows.len();
+
+        self.heard_index = self.heard_index.saturating_sub(dropped).min(len - 1);
+        let offset = offset.saturating_sub(dropped);
+        *self.heard_list.offset_mut() = match was_at_bottom && height > 0 {
+            true => len.saturating_sub(height),
+            false => offset,
+        };
+    }
+
+    /// Take an announcement the station's newest row already carries.
+    ///
+    /// Tuning a station in starts its deck blank and forgets what was last
+    /// announced, so a station still playing the record it was playing when
+    /// you left it announces that record again. Without this the list would
+    /// grow a second row for it every time you went back on air, and the
+    /// lookup would be spent a second time on an answer already in hand.
+    pub fn adopt_newest_heard(&mut self, uuid: &str, announced: &str) -> bool {
+        let Some(matched) = self
+            .radio_heard
+            .get(uuid)
+            .and_then(|rows| rows.last())
+            .filter(|row| row.announced == announced)
+            .map(|row| row.matched.clone())
+        else {
+            return false;
+        };
+        if let Some(r) = self.radio.as_mut() {
+            r.matched = matched;
+        }
+        true
+    }
+
+    /// Note that a search is out for the row an announcement made.
+    ///
+    /// Separate from [`Self::set_heard_match`], which only settles a row that
+    /// is already searching: this is the one write that starts it.
+    pub fn set_heard_searching(&mut self, uuid: &str, announced: &str) {
+        if let Some(row) = self
+            .radio_heard
+            .get_mut(uuid)
+            .and_then(|rows| rows.iter_mut().rev().find(|h| h.announced == announced))
+        {
+            row.matched = RadioMatch::Searching;
+        }
+    }
+
+    /// Write what Spotify made of an announcement into the row it was for.
+    ///
+    /// Found from the back rather than by a remembered index, so a trim
+    /// between the question and the answer cannot make it write the wrong row.
+    /// The `Searching` guard is what stops an answer for the first `A` of an
+    /// `A → B → A` run landing on the second.
+    pub fn set_heard_match(&mut self, uuid: &str, announced: &str, matched: RadioMatch) {
+        let Some(rows) = self.radio_heard.get_mut(uuid) else {
+            return;
+        };
+        if let Some(row) = rows
+            .iter_mut()
+            .rev()
+            .find(|h| h.announced == announced && matches!(h.matched, RadioMatch::Searching))
+        {
+            row.matched = matched;
+        }
+    }
+
+    /// Put the station's list at its newest row.
+    ///
+    /// What a tune-in opens on: the record on air is the one the listener came
+    /// for, and the tail-follow in [`Self::push_heard`] then keeps it in view.
+    pub fn heard_to_newest(&mut self) {
+        let len = self.heard().len();
+        let height = self.hit.player_queue.height as usize;
+        self.heard_index = len.saturating_sub(1);
+        *self.heard_list.offset_mut() = len.saturating_sub(height.max(1));
+    }
+
+    /// Rows in the list the player screen is showing.
+    pub fn player_rows(&self) -> usize {
+        match self.radio.is_some() {
+            true => self.heard().len(),
+            false => self.queue_len(),
+        }
+    }
+
+    /// The record on one row of the list the player screen is showing.
+    pub fn player_row_track(&self, row: usize) -> Option<&Track> {
+        match self.radio.is_some() {
+            true => self.heard_track(row),
+            false => self.queue.as_ref()?.rows().get(row),
+        }
+    }
+
+    /// The selection and scroll of the list the player screen is showing.
+    ///
+    /// One accessor rather than a branch at every call site, so the movement,
+    /// click and wheel handlers each have a single definition that serves both
+    /// lists.
+    pub fn player_list(&mut self) -> PlayerList<'_> {
+        let len = self.player_rows();
+        let height = self.hit.player_queue.height;
+        match self.radio.is_some() {
+            true => PlayerList {
+                len,
+                height,
+                index: &mut self.heard_index,
+                list: &mut self.heard_list,
+            },
+            false => PlayerList {
+                len,
+                height,
+                index: &mut self.queue_index,
+                list: &mut self.queue_list,
+            },
+        }
+    }
+
+    /// Set the queue aside, whole, while a record off a station's list plays.
+    pub fn park_queue(&mut self) {
+        let Some(queue) = self.queue.take() else {
+            return;
+        };
+        self.parked = Some(ParkedQueue {
+            queue,
+            index: self.queue_index,
+            offset: self.queue_list.offset(),
+        });
+    }
+
+    /// Put a parked queue back, with the selection and scroll it had.
+    ///
+    /// Assigned directly rather than through [`Self::set_queue`], which resets
+    /// both — the point of parking is that nothing about the queue changed.
+    pub fn unpark_queue(&mut self) {
+        let Some(parked) = self.parked.take() else {
+            return;
+        };
+        self.queue = Some(parked.queue);
+        self.queue_index = parked.index;
+        *self.queue_list.offset_mut() = parked.offset;
+    }
+
     /// Install a queue, resetting the player list's selection and scroll and
     /// stamping the queue with a fresh generation — see
     /// [`Self::queue_generation`].
@@ -2542,7 +2974,9 @@ impl AppState {
     /// Off radio it is the queue's current track — spot owns the play order,
     /// so what the queue points at *is* what is playing.
     pub fn deck_track(&self) -> Option<&Track> {
-        if let Some(r) = &self.radio {
+        // Off air the deck is about a record from the station's own list, and
+        // that record is the queue's current track like any other.
+        if let Some(r) = self.radio.as_ref().filter(|r| !r.off_air) {
             return r.matched_track();
         }
         self.playback.as_ref()?;
@@ -2584,6 +3018,33 @@ impl AppState {
             offset: self.main_list.offset(),
             search_tab: self.search_tab,
         });
+    }
+
+    /// Drop the path back to Home.
+    ///
+    /// Home stays on it because it is the bottom of every path and the one
+    /// page back must always reach. Its own selection and scroll come with it,
+    /// so the frame restores the row you left rather than the top of the list.
+    pub fn reset_to_home(&mut self) {
+        if matches!(self.main, MainView::Home) {
+            self.view_stack.clear();
+            self.push_view();
+            return;
+        }
+        // A path with no Home frame on it belongs to a session that opened
+        // straight onto an album from the now-playing bar.
+        let home = self
+            .view_stack
+            .iter()
+            .find(|snap| matches!(snap.view, MainView::Home))
+            .cloned()
+            .unwrap_or_else(|| ViewSnapshot {
+                view: MainView::Home,
+                main_index: 0,
+                offset: 0,
+                search_tab: self.search_tab,
+            });
+        self.view_stack = vec![home];
     }
 
     /// What is playing now, as a history entry.
@@ -3820,5 +4281,286 @@ mod tests {
             None,
             "unstamped"
         );
+    }
+
+    /// A station on the deck, tuned in.
+    fn tuned(uuid: &str) -> AppState {
+        let mut st = AppState::new();
+        let mut station = a_station();
+        station.uuid = uuid.into();
+        st.radio = Some(RadioPlayback::new(
+            station,
+            40,
+            Default::default(),
+            Default::default(),
+        ));
+        st
+    }
+
+    /// The rows a station's list holds, by what they announced.
+    fn announced(st: &AppState) -> Vec<&str> {
+        st.heard().iter().map(|h| h.announced.as_str()).collect()
+    }
+
+    /// Every announcement makes a row, whether Spotify can place it or not:
+    /// what the station said is what was played, and that is the list.
+    #[test]
+    fn every_announcement_makes_a_row() {
+        let mut st = tuned("s1");
+        st.push_heard("Aspen - Seasick And Beer Drinking".into());
+        st.push_heard("Big R Radio - We'll Be Right Back".into());
+        assert_eq!(
+            announced(&st),
+            [
+                "Aspen - Seasick And Beer Drinking",
+                "Big R Radio - We'll Be Right Back"
+            ]
+        );
+        assert!(st.heard_track(1).is_none(), "nothing has been looked up");
+    }
+
+    /// The list belongs to the station, not to the deck: change station and
+    /// come back, and what it played is still there.
+    #[test]
+    fn a_station_you_come_back_to_keeps_its_records() {
+        let mut st = tuned("s1");
+        st.push_heard("first".into());
+
+        let mut second = a_station();
+        second.uuid = "s2".into();
+        st.radio = Some(RadioPlayback::new(
+            second,
+            40,
+            Default::default(),
+            Default::default(),
+        ));
+        st.push_heard("elsewhere".into());
+        assert_eq!(announced(&st), ["elsewhere"]);
+
+        let mut first = a_station();
+        first.uuid = "s1".into();
+        st.radio = Some(RadioPlayback::new(
+            first,
+            40,
+            Default::default(),
+            Default::default(),
+        ));
+        assert_eq!(announced(&st), ["first"]);
+    }
+
+    /// An answer that lands after the record ended still settles its own row.
+    /// A late one settles nothing else, and a second helping of the same
+    /// announcement is a row of its own.
+    #[test]
+    fn a_late_answer_settles_the_row_it_was_for() {
+        let mut st = tuned("s1");
+        st.push_heard("a".into());
+        st.set_heard_searching("s1", "a");
+        st.push_heard("b".into());
+
+        st.set_heard_match("s1", "a", RadioMatch::Matched(Box::new(track("A", 1000))));
+        assert_eq!(st.heard_track(0).map(|t| t.name.as_str()), Some("A"));
+        assert!(st.heard_track(1).is_none(), "b was never searched for");
+
+        // The row is settled, so a second answer for the same words has no
+        // searching row to land on.
+        st.set_heard_match("s1", "a", RadioMatch::Unmatched);
+        assert_eq!(st.heard_track(0).map(|t| t.name.as_str()), Some("A"));
+    }
+
+    /// The list stops growing, and the rows it drops take the selection and
+    /// the scroll down with them rather than sliding under the reader.
+    #[test]
+    fn the_list_trims_its_oldest_and_carries_the_selection() {
+        let mut st = tuned("s1");
+        st.hit.player_queue = Rect::new(0, 0, 80, 10);
+        for i in 0..HEARD_MAX {
+            st.push_heard(format!("row {i}"));
+        }
+        st.heard_index = 5;
+        *st.heard_list.offset_mut() = 3;
+
+        st.push_heard("one over".into());
+        assert_eq!(st.heard().len(), HEARD_MAX);
+        assert_eq!(st.heard()[0].announced, "row 1", "the oldest row went");
+        assert_eq!(st.heard_index, 4, "the selection followed its row");
+        assert_eq!(st.heard_list.offset(), 2, "and so did the scroll");
+    }
+
+    /// The view follows the newest row while it is already at the bottom, and
+    /// holds still the moment you scroll up to read.
+    #[test]
+    fn the_view_follows_the_newest_row_only_from_the_bottom() {
+        let mut st = tuned("s1");
+        st.hit.player_queue = Rect::new(0, 0, 80, 3);
+        for i in 0..5 {
+            st.push_heard(format!("row {i}"));
+        }
+        assert_eq!(st.heard_list.offset(), 2, "the newest row is in view");
+
+        *st.heard_list.offset_mut() = 0;
+        st.push_heard("row 5".into());
+        assert_eq!(st.heard_list.offset(), 0, "a reader is not chased down");
+    }
+
+    /// The player screen has two lists and draws one at a time. Which one it
+    /// is under a station must not depend on the queue that is kept behind it.
+    #[test]
+    fn the_players_list_is_the_station_while_one_is_on() {
+        let mut st = tuned("s1");
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            vec![track("kept", 1000)],
+            0,
+            "Kept",
+        )));
+        st.push_heard("said".into());
+        st.set_heard_searching("s1", "said");
+        st.set_heard_match(
+            "s1",
+            "said",
+            RadioMatch::Matched(Box::new(track("S", 2000))),
+        );
+
+        assert_eq!(st.player_rows(), 1);
+        assert_eq!(
+            st.player_row_track(0).map(|t| t.name.as_str()),
+            Some("S"),
+            "the station's row, not the kept queue's"
+        );
+
+        st.radio = None;
+        assert_eq!(st.player_rows(), 1);
+        assert_eq!(
+            st.player_row_track(0).map(|t| t.name.as_str()),
+            Some("kept")
+        );
+    }
+
+    /// Two things can know what a station is playing and only ever one of them
+    /// at a time: the decoder while the stream is on, and a probe while it is
+    /// stood down. The deck reads whichever there is.
+    #[test]
+    fn the_deck_reads_the_decoder_first_and_a_probe_second() {
+        let mut st = tuned("s1");
+        assert_eq!(st.radio.as_ref().unwrap().now_title(), None);
+
+        st.radio.as_mut().unwrap().probed = Some("off the wire".into());
+        assert_eq!(
+            st.radio.as_ref().unwrap().now_title().as_deref(),
+            Some("off the wire")
+        );
+
+        *st.radio.as_ref().unwrap().title.lock() = Some("off the decoder".into());
+        assert_eq!(
+            st.radio.as_ref().unwrap().now_title().as_deref(),
+            Some("off the decoder"),
+            "the stream itself wins while there is one"
+        );
+    }
+
+    /// Going back on air re-announces whatever the station is still playing,
+    /// and that is the row the list already has. A second row for it would
+    /// grow the list by one every time you left and came back.
+    #[test]
+    fn going_back_on_air_does_not_log_the_same_record_twice() {
+        let mut st = tuned("s1");
+        st.push_heard("a".into());
+        st.set_heard_searching("s1", "a");
+        st.set_heard_match("s1", "a", RadioMatch::Matched(Box::new(track("A", 1000))));
+
+        // A fresh deck for the same station, as a tune-in installs.
+        let station = st.radio.as_ref().unwrap().station.clone();
+        st.radio = Some(RadioPlayback::new(
+            station,
+            40,
+            Default::default(),
+            Default::default(),
+        ));
+        let stamped = st.heard()[0].at;
+        assert!(st.adopt_newest_heard("s1", "a"), "the row is already there");
+        assert_eq!(st.heard().len(), 1);
+        // The record started when it was first announced, not when you came
+        // back to it, so the `Ago` column goes on counting from where it was.
+        assert_eq!(st.heard()[0].at, stamped);
+        // And the answer comes back with it, so the lookup is not spent twice.
+        assert_eq!(
+            st.radio
+                .as_ref()
+                .and_then(|r| r.matched_track())
+                .map(|t| t.name.as_str()),
+            Some("A")
+        );
+
+        assert!(!st.adopt_newest_heard("s1", "b"), "a new record is new");
+    }
+
+    /// Playing a record off a station's list must not cost the play order you
+    /// already had, nor where you were in it.
+    #[test]
+    fn parking_gives_the_queue_back_whole() {
+        let mut st = AppState::new();
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            vec![track("one", 1000), track("two", 1000)],
+            1,
+            "Kept",
+        )));
+        st.queue_index = 1;
+        *st.queue_list.offset_mut() = 4;
+
+        st.park_queue();
+        assert!(st.queue.is_none(), "the queue stood down");
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            vec![track("other", 1000)],
+            0,
+            "From a station",
+        )));
+
+        st.unpark_queue();
+        assert_eq!(st.queue.as_ref().map(|q| q.name()), Some("Kept"));
+        assert_eq!(st.queue.as_ref().map(|q| q.index()), Some(1));
+        assert_eq!(st.queue_index, 1);
+        assert_eq!(st.queue_list.offset(), 4);
+    }
+
+    /// The play order a row installs and the position it starts at are read
+    /// off the same rows, so a row the station only named cannot shift what
+    /// Enter plays.
+    #[test]
+    fn a_rows_play_position_skips_what_could_not_be_placed() {
+        let mut st = tuned("s1");
+        for (words, matched) in [
+            ("a", RadioMatch::Matched(Box::new(track("A", 1000)))),
+            ("said", RadioMatch::Unmatched),
+            ("b", RadioMatch::Matched(Box::new(track("B", 1000)))),
+        ] {
+            st.push_heard(words.into());
+            st.set_heard_searching("s1", words);
+            st.set_heard_match("s1", words, matched);
+        }
+
+        let names: Vec<String> = st.heard_tracks().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["A", "B"]);
+        assert_eq!(st.heard_play_position(0), Some(0));
+        assert_eq!(st.heard_play_position(1), None, "nothing to play");
+        assert_eq!(st.heard_play_position(2), Some(1));
+    }
+
+    /// Off air the deck is about a record from the station's list, which comes
+    /// down the Spotify path like any other track.
+    #[test]
+    fn the_deck_names_the_record_while_the_stream_stands_down() {
+        let mut st = tuned("s1");
+        st.radio.as_mut().unwrap().matched =
+            RadioMatch::Matched(Box::new(track("announced", 1000)));
+        st.playback = Some(Playback::started(50, false));
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            vec![track("chosen", 1000)],
+            0,
+            "earlier on A Station",
+        )));
+
+        assert_eq!(st.deck_track().map(|t| t.name.as_str()), Some("announced"));
+        st.radio.as_mut().unwrap().off_air = true;
+        assert_eq!(st.deck_track().map(|t| t.name.as_str()), Some("chosen"));
     }
 }

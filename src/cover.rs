@@ -20,9 +20,21 @@ use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 /// Side of the decoded cover, in pixels. Comfortably above the widest art
-/// block the player draws (24 px), so the draw-time resample is always a real
-/// area average and never an upscale.
+/// block the layout draws (24 px), so the draw-time resample is a real area
+/// average there rather than an upscale.
+///
+/// The expanded view asks for far more than that and reads a cover of its own,
+/// decoded at [`ZOOM_PX`]; it falls back to this one, upscaled, until that
+/// arrives.
 pub const COVER_PX: usize = 64;
+
+/// Side of the cover the expanded view decodes for itself.
+///
+/// [`decode_at`] caps this at the source's own short side, so it is a ceiling
+/// and never a stretch: Spotify's URLs are the 300 px variant (see
+/// [`pick_url`]), which is a genuine downscale for any block up to about 300
+/// cells wide. Only one is held at a time — see `AppState::zoom_cover`.
+pub const ZOOM_PX: usize = 512;
 
 /// Cap on the response body. A 300 px Spotify cover is ~30 KB; a megabyte is
 /// far past anything legitimate and well under anything that would hurt.
@@ -143,6 +155,11 @@ pub fn is_mosaic(url: &str) -> bool {
 /// Fetch and decode the cover at `url`. The decode runs on the blocking pool:
 /// it is CPU-bound and its input is remote bytes.
 pub async fn load(http: &reqwest::Client, url: &str) -> Result<Cover> {
+    load_at(http, url, COVER_PX).await
+}
+
+/// [`load`], at a caller's resolution. See [`decode_at`].
+pub async fn load_at(http: &reqwest::Client, url: &str, max_px: usize) -> Result<Cover> {
     let mut resp = http.get(url).send().await?.error_for_status()?;
     if resp
         .content_length()
@@ -159,14 +176,18 @@ pub async fn load(http: &reqwest::Client, url: &str) -> Result<Cover> {
         bytes.extend_from_slice(&chunk);
     }
     let url = url.to_string();
-    tokio::task::spawn_blocking(move || decode(&bytes, url))
+    tokio::task::spawn_blocking(move || decode_at(&bytes, url, max_px))
         .await
         .context("cover decode task panicked")?
 }
 
-/// Decode JPEG bytes into a [`COVER_PX`]-square cover. Pure and blocking, so
-/// it can be unit-tested without a network or a runtime.
-fn decode(bytes: &[u8], url: String) -> Result<Cover> {
+/// Decode JPEG bytes into a square cover of at most `max_px` a side. Pure and
+/// blocking, so it can be unit-tested without a network or a runtime.
+///
+/// The source's own short side is the real ceiling: asking for more than the
+/// JPEG carries would stretch it here, where the pixels are, rather than at
+/// draw time where the block knows how much room it has.
+fn decode_at(bytes: &[u8], url: String, max_px: usize) -> Result<Cover> {
     let options = DecoderOptions::default()
         .set_strict_mode(false)
         .set_max_width(MAX_SOURCE_PX)
@@ -195,14 +216,26 @@ fn decode(bytes: &[u8], url: String) -> Result<Cover> {
         );
     }
 
-    let px = square_downsample(&raw, comps, w, h, COVER_PX);
+    let size = decode_size(max_px, w, h);
+    let px = square_downsample(&raw, comps, w, h, size);
     Ok(Cover {
         accent: dominant(&px),
         ramp: palette(&px),
         url,
         px,
-        size: COVER_PX,
+        size,
     })
+}
+
+/// The square a `w` x `h` source decodes to, given a caller's ceiling.
+///
+/// The source's own short side is the real limit. Asking for more would stretch
+/// the picture here, where the pixels are, and the block would then stretch what
+/// it was given again at draw time — twice the softness for none of the detail.
+const fn decode_size(max_px: usize, w: usize, h: usize) -> usize {
+    let short = if w < h { w } else { h };
+    let size = if max_px < short { max_px } else { short };
+    if size == 0 { 1 } else { size }
 }
 
 /// Centre-crop `w` x `h` interleaved samples to a square, then box-filter to
@@ -468,6 +501,22 @@ mod tests {
         }
     }
 
+    /// The source's own short side is the ceiling. The expanded view asking
+    /// [`ZOOM_PX`] of a 300 px sleeve must get 300 px of picture, not 512 px of
+    /// a stretched one — the block scales again at draw time, and stretching
+    /// twice is worse than stretching once.
+    #[test]
+    fn a_decode_never_asks_for_more_than_the_source_has() {
+        assert_eq!(decode_size(ZOOM_PX, 300, 300), 300);
+        assert_eq!(decode_size(ZOOM_PX, 1024, 1024), ZOOM_PX);
+        assert_eq!(decode_size(COVER_PX, 300, 300), COVER_PX);
+        // A sleeve Spotify served oblong is bounded by its short side, which
+        // is the one `square_downsample` crops to.
+        assert_eq!(decode_size(ZOOM_PX, 640, 200), 200);
+        // Never zero: the filter divides by it.
+        assert_eq!(decode_size(ZOOM_PX, 0, 640), 1);
+    }
+
     #[test]
     fn picks_the_three_hundred_pixel_image() {
         let images = [
@@ -694,8 +743,8 @@ mod tests {
 
     #[test]
     fn rejects_bytes_that_are_not_a_jpeg() {
-        assert!(decode(b"not a jpeg at all", "x".into()).is_err());
-        assert!(decode(&[], "x".into()).is_err());
+        assert!(decode_at(b"not a jpeg at all", "x".into(), COVER_PX).is_err());
+        assert!(decode_at(&[], "x".into(), COVER_PX).is_err());
     }
 
     #[test]

@@ -8,8 +8,8 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use super::columns::{Cell, ColKey, GUTTER, Layout, right, row_spans, scroll_col};
 use super::theme;
 use crate::app::state::{
-    AppState, Credit, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError, MainView, NowStatus,
-    SearchTab, Sort, Station, StationNow, TextCol, Track, format_duration,
+    AppState, ArtHit, ArtSource, Credit, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError,
+    MainView, NowStatus, SearchTab, Sort, Station, StationNow, TextCol, Track, format_duration,
 };
 
 /// Playback context needed to mark the playing row, copied out of the queue
@@ -900,6 +900,11 @@ fn artist_band(
                 ..inner
             };
             super::table::draw_art(frame, art, cover.as_deref(), &v.id);
+            hit.art_blocks.push(ArtHit {
+                rect: art,
+                source: ArtSource::Page(v.image_url.clone()),
+                seed: v.id.clone(),
+            });
             art
         });
     let text = match art {
@@ -1278,18 +1283,25 @@ fn artist_body(
                 continue;
             }
             let cover = a.cover_url.as_deref().and_then(|u| page_art.get(u));
-            super::table::draw_art_clipped(
-                frame,
-                Rect {
-                    x: body.x,
-                    y,
-                    width: art_w,
-                    height: CARD_ART_H,
-                },
-                body,
-                cover.as_deref(),
-                &a.id,
-            );
+            let card_art = Rect {
+                x: body.x,
+                y,
+                width: art_w,
+                height: CARD_ART_H,
+            };
+            super::table::draw_art_clipped(frame, card_art, body, cover.as_deref(), &a.id);
+            // The rect as it is on screen, not as the card wanted it: a sleeve
+            // running past the foot of the pane is only clickable where it is
+            // painted. The loop skips a card clipped at the top outright, so
+            // this bounds the bottom edge alone.
+            let rect = card_art.intersection(body);
+            if !rect.is_empty() {
+                hit.art_blocks.push(ArtHit {
+                    rect,
+                    source: ArtSource::Page(a.cover_url.clone()),
+                    seed: a.id.clone(),
+                });
+            }
         }
     }
 
@@ -1468,6 +1480,11 @@ fn header_band(
                 ..inner
             };
             super::table::draw_art(frame, art, cover, &list.header.name);
+            hit.art_blocks.push(ArtHit {
+                rect: art,
+                source: ArtSource::Page(list.header.cover_url.clone()),
+                seed: list.header.name.clone(),
+            });
             art
         });
     let text = match art {
@@ -3458,6 +3475,30 @@ mod tests {
         );
     }
 
+    /// A page's own sleeve is a click target, recorded against the URL it drew
+    /// from so the expanded view can find the picture again.
+    #[test]
+    fn the_header_sleeve_is_a_click_target() {
+        let mut st = playlist_state();
+        render(&mut st, 90, 22);
+        let blocks = &st.hit.art_blocks;
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        assert_eq!(blocks[0].seed, "Discover Weekly");
+        assert!(matches!(&blocks[0].source, ArtSource::Page(Some(_))));
+        assert_eq!(
+            (blocks[0].rect.width, blocks[0].rect.height),
+            (super::super::table::art_w(ART_H), ART_H)
+        );
+    }
+
+    /// A page that drew no sleeve leaves nothing to click.
+    #[test]
+    fn a_coverless_page_records_no_art_block() {
+        let mut st = tracks_state(vec![track("A", "B")]);
+        render(&mut st, 90, 22);
+        assert!(st.hit.art_blocks.is_empty());
+    }
+
     /// A playlist with a cover of its own is an album page in every respect
     /// that matters: the sleeve, the name beside it, the control below.
     #[test]
@@ -4483,6 +4524,8 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         });
         let playing = render(&mut st, 90, 18).join("\n");
         assert!(playing.contains("♫ Radio Paradise"), "{playing}");
@@ -4550,6 +4593,8 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         });
 
         let joined = render(&mut st, 120, 18).join("\n");
@@ -4904,6 +4949,67 @@ mod tests {
         assert!(lines[17].contains("Title"), "{:?}", lines[17]);
         assert!(lines[18].trim().is_empty(), "{:?}", lines[18]);
         assert!(lines[19].contains("Uprising"), "{:?}", lines[19]);
+    }
+
+    /// The portrait is a click target, and the cards under it each are too.
+    #[test]
+    fn the_artist_page_records_every_sleeve_it_draws() {
+        let mut st = artist_state_with(vec![
+            album_item("Black Holes", "2006", Some("https://i.scdn.co/image/bh")),
+            album_item("Absolution", "2003", None),
+        ]);
+        render(&mut st, 90, 40);
+
+        let blocks = &st.hit.art_blocks;
+        assert_eq!(blocks.len(), 3, "{blocks:#?}");
+        // The portrait first, where the band drew it.
+        assert_eq!(blocks[0].seed, "r1");
+        assert_eq!(
+            blocks[0].source,
+            ArtSource::Page(Some("https://i.scdn.co/image/artist".into()))
+        );
+        assert_eq!(
+            (blocks[0].rect.width, blocks[0].rect.height),
+            (super::super::table::art_w(ART_H), ART_H)
+        );
+        // Then a card apiece, in the order they are drawn. A card whose album
+        // named no cover still draws its placeholder, so it is still a target.
+        assert_eq!(blocks[1].seed, "id-Black Holes");
+        assert_eq!(blocks[2].source, ArtSource::Page(None));
+        for card in &blocks[1..] {
+            assert_eq!(
+                (card.rect.width, card.rect.height),
+                (CARD_ART_W, CARD_ART_H)
+            );
+        }
+    }
+
+    /// A sleeve running past the foot of the pane is clickable where it is
+    /// painted and nowhere else.
+    #[test]
+    fn a_card_sleeve_is_recorded_only_where_it_is_drawn() {
+        let albums: Vec<_> = (0..8)
+            .map(|i| album_item(&format!("Album {i}"), "2006", None))
+            .collect();
+        let mut st = artist_state_with(albums);
+        render(&mut st, 90, 30);
+
+        let body = st.hit.main_list;
+        let cards: Vec<_> = st
+            .hit
+            .art_blocks
+            .iter()
+            .filter(|a| a.seed.starts_with("id-Album"))
+            .collect();
+        assert!(!cards.is_empty());
+        for card in &cards {
+            assert!(card.rect.bottom() <= body.bottom(), "{:?}", card.rect);
+            assert!(card.rect.y >= body.y, "{:?}", card.rect);
+            assert!(!card.rect.is_empty());
+        }
+        // The pane cannot seat all eight, so the ones past its foot record
+        // nothing at all rather than a rect nobody can see.
+        assert!(cards.len() < 8, "every card fitted; widen the test");
     }
 
     /// A pane too narrow to seat both pills keeps ▶ play and drops shuffle —

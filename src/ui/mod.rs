@@ -1,3 +1,4 @@
+mod art_zoom;
 pub mod columns;
 mod deck;
 mod help;
@@ -113,6 +114,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             ..area
         };
         now_playing::draw_toast(frame, row, Some(msg.as_str()));
+    }
+
+    // Over everything the screen was showing, under the boxes that are about
+    // themselves: the expanded sleeve is the picture at full size, and nothing
+    // behind it is a target while it is up.
+    if state.art_zoom.is_some() {
+        art_zoom::draw(frame, state);
     }
 
     // Under the help box: help is the one overlay that answers "what does any
@@ -242,6 +250,65 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The whole loop the mouse actually takes: a frame records the bar's
+    /// sleeve, a click on it expands the picture, and the next frame is the
+    /// picture. A second click puts it away and gives the screen back.
+    #[test]
+    fn clicking_the_bars_sleeve_fills_the_screen_and_clicking_again_gives_it_back() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = std::sync::Arc::new(parking_lot::RwLock::new(browse_state()));
+        let before = screen(&mut state.write(), 100, 34);
+        let sleeve = state.read().hit.art_rect();
+        assert!(!sleeve.is_empty(), "the bar drew no sleeve");
+
+        let click = |x: u16, y: u16| {
+            crate::event::handle_event(
+                crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: x,
+                    row: y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+                &state,
+                &tx,
+            );
+        };
+        let (x, y) = (sleeve.x + 1, sleeve.y + 1);
+        click(x, y);
+        assert!(state.read().art_zoom.is_some());
+
+        let zoomed = screen(&mut state.write(), 100, 34);
+        // 34 rows is the shorter side, so the block takes all of them and
+        // squares to 68 cells, centred in the 100 the width offers. This queue
+        // names no cover, so the block is the placeholder and carries its one
+        // note.
+        let (x0, w) = (16, 68);
+        let mut notes = 0;
+        for row in &zoomed {
+            let cells: Vec<char> = row.chars().collect();
+            assert!(cells[..x0].iter().all(|c| *c == ' '), "{row:?}");
+            assert!(cells[x0 + w..].iter().all(|c| *c == ' '), "{row:?}");
+            for c in &cells[x0..x0 + w] {
+                match c {
+                    '▀' => {}
+                    '♫' => notes += 1,
+                    _ => panic!("a hole in the picture: {row:?}"),
+                }
+            }
+        }
+        assert_eq!(notes, 1);
+
+        click(x, y);
+        assert!(state.read().art_zoom.is_none());
+        assert_eq!(
+            screen(&mut state.write(), 100, 34),
+            before,
+            "the screen did not return"
+        );
     }
 
     /// The whole point of the redesign: the browse screen wears no frames.
@@ -887,6 +954,8 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         });
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
@@ -936,7 +1005,7 @@ mod tests {
             is_playing: true,
             started_at: Instant::now(),
             title: std::sync::Arc::new(parking_lot::Mutex::new(Some(
-                "Steve Cobby — The Unvarnished Truth".into(),
+                "Steve Cobby - The Unvarnished Truth".into(),
             ))),
             channels: Default::default(),
             volume_percent: 40,
@@ -944,19 +1013,74 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         });
         st.listen_back.push(crate::app::state::Listened::Spotify);
+        st.radio_heard.insert("b".into(), heard_rows());
+        st.heard_to_newest();
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
         }
 
-        println!("\n--- and the same station, off air ---\n");
+        println!("\n--- and a record off its list, with the stream stood down ---\n");
+        st.park_queue();
+        st.radio.as_mut().unwrap().off_air = true;
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            st.heard_tracks(),
+            0,
+            "earlier on SomaFM Groove Salad",
+        )));
+        for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
+            println!("{i:2} |{l}|");
+        }
+
+        println!("\n--- and the same station, off the air entirely ---\n");
+        st.unpark_queue();
         let r = st.radio.as_mut().unwrap();
+        r.off_air = false;
         r.is_playing = false;
         r.failure = Some("could not reach the station: operation timed out".into());
         for (i, l) in screen(&mut st, 100, 34).iter().enumerate() {
             println!("{i:2} |{l}|");
         }
+    }
+
+    /// Three records a station played: two Spotify placed, and one it could
+    /// only name.
+    pub(super) fn heard_rows() -> Vec<crate::app::state::Heard> {
+        use crate::app::state::{Heard, RadioMatch};
+        // Stamped back from now, so the `Ago` column shows a real spread
+        // rather than three readings of the same minute.
+        let heard_at = |mins: u64| Instant::now() - Duration::from_secs(mins * 60);
+        let placed = |artist: &str, name: &str, ms: u64, mins: u64| Heard {
+            announced: format!("{artist} - {name}"),
+            at: heard_at(mins),
+            matched: RadioMatch::Matched(Box::new(crate::app::state::Track {
+                uri: format!("spotify:track:{name}"),
+                name: name.into(),
+                artists: artist.into(),
+                album: "Album Name".into(),
+                release_year: "2019".into(),
+                duration_ms: ms,
+                track_number: 1,
+                album_id: Some("alb".into()),
+                credits: vec![Credit {
+                    name: artist.into(),
+                    id: Some("art".into()),
+                }],
+                cover_url: None,
+            })),
+        };
+        vec![
+            placed("Kruder & Dorfmeister", "High Noon", 419_000, 74),
+            Heard {
+                announced: "SomaFM - Groove Salad - commercial free".into(),
+                matched: RadioMatch::Unmatched,
+                at: heard_at(67),
+            },
+            placed("Steve Cobby", "The Unvarnished Truth", 287_000, 3),
+        ]
     }
 
     #[test]

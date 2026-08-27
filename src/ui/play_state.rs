@@ -55,7 +55,10 @@ pub struct Status {
 /// The audio is always ours to judge — spot is the only player, and every
 /// sample it makes goes through the tap.
 pub fn status(state: &AppState) -> Option<Status> {
-    let (word, claims) = match (&state.radio, &state.playback) {
+    // Off air a station is not what you are hearing: a record off its own list
+    // is, and it comes down the Spotify path like any other.
+    let on_air = state.radio.as_ref().filter(|r| !r.off_air);
+    let (word, claims) = match (on_air, &state.playback) {
         (Some(r), _) => ("RADIO", r.is_playing),
         (None, Some(pb)) => ("STREAMING", pb.is_playing),
         (None, None) => return None,
@@ -111,6 +114,21 @@ pub enum RadioForward {
     Seek,
 }
 
+/// Whether the forward control leads to the station's own broadcast.
+///
+/// True on the last record of a station's list: nothing follows it but the
+/// station, which has been playing all along. Computed here for the reason
+/// [`status`] is — the bottom bar and the player both draw the row, and a
+/// control that promises one thing on one screen and another on the other is
+/// a control that changes under you when you press `v`.
+pub fn played_out(state: &AppState) -> bool {
+    state.radio.as_ref().is_some_and(|r| r.off_air)
+        && state
+            .queue
+            .as_ref()
+            .is_some_and(|q| q.index() + 1 >= q.len())
+}
+
 /// What the radio transport row can offer this frame.
 ///
 /// `Seek` needs a country because the directory is asked by ISO code — a
@@ -158,6 +176,8 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         });
         st.audio_tap.push(&[0.0; 2048], 1.0);
         st
@@ -253,5 +273,40 @@ mod tests {
         assert!(!radio_steps(&st).back);
         st.listen_back.push(crate::app::state::Listened::Spotify);
         assert!(radio_steps(&st).back);
+    }
+
+    /// Forward means the next record while the list has one, and the station
+    /// itself once it has not: the queue repeats, so without this the last
+    /// record would wrap and play the list round again.
+    #[test]
+    fn forward_leads_to_the_station_once_its_list_is_played_out() {
+        use crate::app::state::Track;
+
+        let record = |name: &str| Track {
+            uri: format!("spotify:track:{name}"),
+            name: name.into(),
+            artists: "artist".into(),
+            album: "album".into(),
+            release_year: "2020".into(),
+            duration_ms: 1000,
+            track_number: 1,
+            album_id: None,
+            credits: vec![],
+            cover_url: None,
+        };
+        let mut st = radio();
+        st.set_queue(Some(crate::app::queue::Queue::new(
+            vec![record("A"), record("B")],
+            0,
+            "earlier on KEXP",
+        )));
+        // On air there is no list being played, so nothing is played out.
+        assert!(!played_out(&st));
+
+        st.radio.as_mut().unwrap().off_air = true;
+        assert!(!played_out(&st), "a record with one behind it");
+
+        st.queue.as_mut().unwrap().advance();
+        assert!(played_out(&st), "the last record of the list");
     }
 }

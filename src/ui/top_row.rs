@@ -699,6 +699,8 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         });
         audible(&st);
         st

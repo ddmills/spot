@@ -624,6 +624,16 @@ pub const fn art_w(rows: u16) -> u16 {
     rows * 2
 }
 
+/// Rows a block `cols` cells wide spends to stay square. The inverse of
+/// [`art_w`], for the caller that has a width to fill and wants the height
+/// that squares it.
+///
+/// An odd `cols` rounds down, which is what leaves the block square rather than
+/// half a cell wide of it.
+pub const fn art_rows(cols: u16) -> u16 {
+    cols / 2
+}
+
 /// Paint `area` with `cover`, or with a placeholder swatch when there is none.
 ///
 /// Cells are `▀`, the foreground carrying the upper pixel and the background

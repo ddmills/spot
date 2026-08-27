@@ -75,7 +75,8 @@ const MOUSE_HINTS: &[&str] = &[
     "click tabs, transport, ▶ play, ▶ shuffle, sliders",
     "when a page will not load, ↻ try again asks for it again; so does Enter",
     "on a browse page, click the search row under the path to search",
-    "click the visualizer to play / pause; the cover opens its album",
+    "click the visualizer to play / pause",
+    "click any cover to see the whole sleeve; click again or Esc closes it",
     "scroll lists; scroll over the bottom bar = volume",
 ];
 

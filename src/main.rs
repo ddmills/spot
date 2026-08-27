@@ -511,7 +511,9 @@ async fn run_tui(
                 .as_ref()
                 .and(st.queue.as_ref())
                 .and_then(|q| q.current());
-            let title = window_title(playing, st.radio.as_ref());
+            // Off air the station is on screen but the record is what plays,
+            // so the taskbar names the record like any other.
+            let title = window_title(playing, st.radio.as_ref().filter(|r| !r.off_air));
             if title != last_title {
                 let _ = crossterm::execute!(std::io::stdout(), SetTitle(&title));
                 last_title = title;
@@ -670,6 +672,15 @@ async fn player_event_loop(
             // no race.
             PlayerEvent::EndOfTrack { .. } => {
                 let _ = tx.send(AppCommand::TrackEnded);
+            }
+            // A load that failed. librespot leaves its own player parked in
+            // `Loading` when this fires, so nothing further arrives on this
+            // channel for that track and nothing decodes: without this arm the
+            // transport claims to play for the rest of the run, over silence.
+            PlayerEvent::Unavailable { track_id, .. } => {
+                if let Ok(uri) = track_id.to_uri() {
+                    let _ = tx.send(AppCommand::TrackUnavailable { uri });
+                }
             }
             PlayerEvent::TimeToPreloadNextTrack { .. } => {
                 let _ = tx.send(AppCommand::PreloadNext);

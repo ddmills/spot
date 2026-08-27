@@ -64,10 +64,25 @@ pub enum AppCommand {
     },
     /// Enter on a queue row: play that row of the queue as it stands.
     JumpTo(usize),
+    /// Enter on a row of a station's list: play what Spotify had for it, with
+    /// the rest of that station's records behind it.
+    ///
+    /// The station's page stays on screen and the deck stays with it — the
+    /// stream simply goes off air, and the deck's `live` control is what puts
+    /// it back. The queue you already had is parked, not replaced.
+    PlayHeard {
+        row: usize,
+    },
     /// `a`: put a track directly after the playing one.
     QueueInsertNext(Track),
     /// librespot reached the end of the playing track: advance and load.
     TrackEnded,
+    /// librespot could not load a track. Carries the track's uri, because the
+    /// event also fires for a failed *preload*, which must not move the queue
+    /// out from under the track that is playing.
+    TrackUnavailable {
+        uri: String,
+    },
     /// librespot wants the next track fetched ahead of the gap.
     PreloadNext,
 
@@ -145,6 +160,15 @@ pub enum AppCommand {
     /// header back without a fetch, so the decoded cover has to be re-pointed
     /// at it. See `AppState::view_cover_url`.
     LoadViewCover {
+        cover_url: Option<String>,
+    },
+    /// Install a screen-sized copy of the cover at `cover_url` for the expanded
+    /// art view, or clear it.
+    ///
+    /// Sent when a cover-art block is expanded. The layout's blocks are happy
+    /// with a 64 px grid; one filling the terminal is not, so this decodes the
+    /// same image again at `cover::ZOOM_PX`. See `AppState::zoom_cover`.
+    LoadZoomCover {
         cover_url: Option<String>,
     },
     /// Install the sleeve for the track that has just started playing.

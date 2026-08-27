@@ -10,9 +10,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
-    self as state, AppState, ArtistRow, BackTarget, ColKey, CrumbTarget, EditField, HomeItem,
-    InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow, RadioScope, RadioTab,
-    SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
+    self as state, AppState, ArtZoom, ArtistRow, BackTarget, ColKey, CrumbTarget, EditField,
+    HomeItem, InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow, RadioScope,
+    RadioTab, SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
 };
 use crate::link;
 
@@ -79,6 +79,13 @@ fn handle_mouse(
 fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppCommand>) {
     if st.show_help {
         st.show_help = false;
+        return;
+    }
+    // The expanded sleeve, under the help box that can draw over it. It covers
+    // the screen, so any click was aimed at it and nothing under it can be what
+    // the click meant.
+    if st.art_zoom.is_some() {
+        close_art_zoom(st);
         return;
     }
     // The add-to-playlist box, while one is up. Every branch returns: unlike
@@ -241,6 +248,17 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         return;
     }
 
+    // The sleeve, wherever one is drawn: it fills the screen with itself.
+    // Above the main list, which an album card's own sleeve sits inside and
+    // which would otherwise take the click as a row select.
+    if let Some(art) = st.hit.art_at(pos) {
+        let (source, seed) = (art.source.clone(), art.seed.clone());
+        let cover_url = st.art_zoom_url(&source);
+        st.art_zoom = Some(ArtZoom { source, seed });
+        let _ = tx.send(AppCommand::LoadZoomCover { cover_url });
+        return;
+    }
+
     // Before the main list, which a failed page's control sits *inside*: the
     // pane records the whole body as the list so it still scrolls, and the
     // list's own branch swallows a click it cannot resolve to a row rather
@@ -392,9 +410,9 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
     // Player-view queue: click selects, double-click plays. The row's own
     // `★` and `+` come first, as they do on the browse table.
     if st.hit.player_queue.contains(pos) {
-        let index = st.queue_list.offset() + (pos.y - st.hit.player_queue.y) as usize;
-        if index < st.queue_len() {
-            st.queue_index = index;
+        let index = st.player_list().list.offset() + (pos.y - st.hit.player_queue.y) as usize;
+        if index < st.player_rows() {
+            *st.player_list().index = index;
             if let Some(credit) = artist_link_at(&st.hit.queue_artist_links, pos) {
                 st.last_queue_click = None;
                 st.show_player = false;
@@ -406,15 +424,12 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
             let add = st.hit.queue_add_col.contains(pos);
             if like || share || add {
                 st.last_queue_click = None;
-                // The row under the pointer, not the playing one: the queue is
-                // a list of records you can act on, and the deck's own three
-                // two panes down are what speak for what is playing.
-                let Some(uri) = st
-                    .queue
-                    .as_ref()
-                    .and_then(|q| q.rows().get(index))
-                    .map(|t| t.uri.clone())
-                else {
+                // The row under the pointer, not the playing one: the list is
+                // records you can act on, and the deck's own three two panes
+                // down are what speak for what is playing. A row of a station's
+                // list that Spotify could not place draws no controls at all,
+                // so a click there landed on a blank cell.
+                let Some(uri) = st.player_row_track(index).map(|t| t.uri.clone()) else {
                     return;
                 };
                 if like {
@@ -487,6 +502,11 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         toggle_saved_station(st, tx);
         return;
     }
+    // Back to the broadcast, from a record off the station's own list.
+    if st.hit.radio_live_btn.contains(pos) {
+        resume_station(st, tx);
+        return;
+    }
 
     // The deck's liked control is about the playing track, which is what the
     // row it sits on is about — not the selection on the page underneath.
@@ -529,6 +549,12 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
 }
 
 fn handle_scroll(st: &mut AppState, pos: Position, delta: i64, tx: &UnboundedSender<AppCommand>) {
+    // The picture covers the screen and is whole, so there is nothing for the
+    // wheel to move. It stops here rather than reaching the list underneath:
+    // scrolling something you cannot see is worse than scrolling nothing.
+    if st.art_zoom.is_some() {
+        return;
+    }
     // The box covers the view, so the wheel belongs to it wherever it is
     // turned: scrolling a list you cannot see is worse than scrolling nothing.
     if st.picker.is_some() {
@@ -539,11 +565,10 @@ fn handle_scroll(st: &mut AppState, pos: Position, delta: i64, tx: &UnboundedSen
     if st.hit.main_list.contains(pos) {
         scroll_main(st, delta);
     } else if st.hit.player_queue.contains(pos) {
-        let max = st
-            .queue_len()
-            .saturating_sub(st.hit.player_queue.height as usize) as i64;
-        let new = (st.queue_list.offset() as i64 + delta * SCROLL_LINES).clamp(0, max);
-        *st.queue_list.offset_mut() = new as usize;
+        let list = st.player_list();
+        let max = list.len.saturating_sub(list.height as usize) as i64;
+        let new = (list.list.offset() as i64 + delta * SCROLL_LINES).clamp(0, max);
+        *list.list.offset_mut() = new as usize;
     } else if st.hit.now_playing.contains(pos) {
         // Scrolling over the now-playing bar adjusts the volume.
         let _ = tx.send(AppCommand::VolumeRel(if delta < 0 { 5 } else { -5 }));
@@ -604,8 +629,8 @@ fn handle_search_input(
                     // you could not reach a station without first walking to
                     // Radio, and could not reach Spotify from there at all.
                     Err(link::ParseError::NotALink) => {
-                        // Before the tab reset, so the snapshot keeps the tab
-                        // the page you are leaving was on.
+                        // Before the tab reset, so the Home frame the path is
+                        // reset to keeps the tab it was pushed with.
                         navigate(&mut st, AppCommand::Search(query), tx);
                         // The first tab the strip has: Tracks with Spotify
                         // behind the box, and Stations when the directory is
@@ -938,8 +963,53 @@ fn toggle_picker_row(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     });
 }
 
+/// Close the expanded sleeve and drop the screen-sized cover it was reading.
+///
+/// The cover is the largest single thing the app holds; keeping it against a
+/// second look at the same sleeve is what `Client::zoom_covers` is for.
+fn close_art_zoom(st: &mut AppState) {
+    st.art_zoom = None;
+    st.zoom_cover = None;
+    // Orphan a fetch still in flight, the way opening a second sleeve would:
+    // it has nothing left to fill, and letting it land would hold the biggest
+    // buffer the app allocates for as long as nothing else claimed the slot.
+    st.zoom_cover_generation += 1;
+}
+
+/// The keyboard while a sleeve fills the screen. Returns whether the key was
+/// spent here.
+///
+/// An allowlist for what falls through, not a blocklist for what is caught:
+/// every key not named below acts on a screen nobody can see. Transport, help
+/// and quit are about the record and the app rather than about the screen
+/// behind the picture, so they still mean what they mean.
+fn handle_zoom_key(key: KeyEvent, state: &Arc<RwLock<AppState>>) -> bool {
+    {
+        let st = state.read();
+        // The help box draws over the picture, so its own Esc comes first.
+        if st.art_zoom.is_none() || st.show_help {
+            return false;
+        }
+    }
+    match key.code {
+        KeyCode::Char(' ' | 'n' | 'p' | 'h' | 'l' | 's' | 'q' | '?' | '-' | '=' | '+') => false,
+        KeyCode::Esc => {
+            close_art_zoom(&mut state.write());
+            true
+        }
+        // Everything else is navigation of a screen nobody can see. The
+        // picture is whole, so there is nothing here for it to move either.
+        _ => true,
+    }
+}
+
 fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSender<AppCommand>) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Before the player, whose own Esc closes the player: with a sleeve up over
+    // it, that would leave the picture on a screen that had changed underneath.
+    if handle_zoom_key(key, state) {
+        return;
+    }
     // The player view captures navigation for its queue; transport and
     // global keys fall through to the normal handling below.
     if state.read().show_player && handle_player_key(key, state, tx) {
@@ -973,12 +1043,12 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
         // meaning for a live broadcast, so they say so rather than reaching
         // Spirc and quietly starting Spotify underneath the stream.
         KeyCode::Char(' ') => drop(tx.send(AppCommand::PlayPause)),
-        KeyCode::Char('s') if state.read().radio.is_some() => {
+        KeyCode::Char('s') if on_air(&state.read()) => {
             state
                 .write()
                 .toast("radio is live — there is no queue to shuffle");
         }
-        KeyCode::Char('h') | KeyCode::Char('l') if state.read().radio.is_some() => {
+        KeyCode::Char('h') | KeyCode::Char('l') if on_air(&state.read()) => {
             state
                 .write()
                 .toast("radio is live — there is nothing to seek");
@@ -1118,51 +1188,79 @@ fn handle_player_key(
 }
 
 fn queue_move(st: &mut AppState, delta: i64) {
-    let len = st.queue_len();
-    if len == 0 {
+    let list = st.player_list();
+    if list.len == 0 {
         return;
     }
-    st.queue_index = (st.queue_index as i64 + delta).clamp(0, len as i64 - 1) as usize;
+    *list.index = (*list.index as i64 + delta).clamp(0, list.len as i64 - 1) as usize;
     queue_snap(st);
 }
 
 fn queue_set(st: &mut AppState, index: usize) {
-    let len = st.queue_len();
-    if len == 0 {
+    let list = st.player_list();
+    if list.len == 0 {
         return;
     }
-    st.queue_index = index.min(len - 1);
+    *list.index = index.min(list.len - 1);
     queue_snap(st);
 }
 
-/// Half the queue list's visible height (from last frame's hit rect),
+/// Half the player list's visible height (from last frame's hit rect),
 /// falling back to 10 before the first draw.
 fn queue_half_page(st: &AppState) -> i64 {
     let height = st.hit.player_queue.height as i64;
     if height == 0 { 10 } else { (height / 2).max(1) }
 }
 
-/// Bring the queue view back to its selection after a keyboard move.
+/// Bring the player's list back to its selection after a keyboard move.
 fn queue_snap(st: &mut AppState) {
-    let height = st.hit.player_queue.height as usize;
+    let list = st.player_list();
+    let height = list.height as usize;
     if height == 0 {
         return;
     }
-    let index = st.queue_index;
-    let list = &mut st.queue_list;
-    if index < list.offset() {
-        *list.offset_mut() = index;
-    } else if index >= list.offset() + height {
-        *list.offset_mut() = index + 1 - height;
+    let index = *list.index;
+    if index < list.list.offset() {
+        *list.list.offset_mut() = index;
+    } else if index >= list.list.offset() + height {
+        *list.list.offset_mut() = index + 1 - height;
     }
 }
 
-/// Enter / double-click in the queue: play the selected row. The queue is
-/// the play order, so this is one instant command with no API behind it.
+/// Enter / double-click in the player's list: play the selected row.
+///
+/// Off the queue that is one instant command with no API behind it — spot owns
+/// the play order. Under a station it is [`play_from_heard`], which has a
+/// record to find first.
 fn play_from_queue(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    if st.radio.is_some() {
+        return play_from_heard(st, tx);
+    }
     if st.queue_index < st.queue_len() {
         let _ = tx.send(AppCommand::JumpTo(st.queue_index));
     }
+}
+
+/// Enter on a row of the station's list: play what Spotify had for it.
+///
+/// A row the station only named has nothing to play, and says so the way every
+/// other radio deck control does.
+fn play_from_heard(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+    let row = st.heard_index;
+    let matched = match st.heard().get(row) {
+        Some(heard) => heard.matched.clone(),
+        None => return,
+    };
+    // The newest row is the record the station is on: asking for it means the
+    // broadcast, not a copy of it started over from the beginning while the
+    // station plays on somewhere in the middle.
+    if row + 1 == st.heard().len() {
+        return resume_station(st, tx);
+    }
+    if matched.track().is_none() {
+        return say_no_track(st, &matched, "track");
+    }
+    let _ = tx.send(AppCommand::PlayHeard { row });
 }
 
 /// Backspace: pop the view stack. A restored track view that was still
@@ -1229,15 +1327,12 @@ fn make_way(st: &mut AppState, target: Option<ViewKey>, tx: &UnboundedSender<App
         .iter()
         .position(|snap| state::view_key(&snap.view).as_ref() == Some(&target));
 
-    // Search is one slot: the new query takes the old one's place wherever it
-    // sat. Truncating rather than popping, because the *new* query has to win
-    // — restoring the old results would leave the command unsent.
+    // A search is a fresh start rather than one more step: the pages walked
+    // through to reach it have nothing to do with the query, and keeping them
+    // leaves Esc retracing a path the results are not part of. The command
+    // always goes out — the new query has to win.
     if target == ViewKey::Search {
-        match below {
-            Some(depth) => st.view_stack.truncate(depth),
-            None if !here => st.push_view(),
-            None => {}
-        }
+        st.reset_to_home();
         return true;
     }
 
@@ -1266,6 +1361,27 @@ pub(crate) fn navigate(st: &mut AppState, cmd: AppCommand, tx: &UnboundedSender<
         st.retries = 0;
         let _ = tx.send(cmd);
     }
+}
+
+/// Open the page a link names, as a fresh path.
+///
+/// A link is the same gesture as a query — both are typed into the one box —
+/// so it starts where a search starts rather than stacking onto whichever page
+/// happened to be open. A link arriving from outside spot, off the `spotify:`
+/// scheme or off the command line, lands here for the same reason: it is not a
+/// step off the page that was open.
+///
+/// Nothing is pushed and nothing is walked back to, so this does not go through
+/// [`make_way`]: the page the link names is the whole of what it asked for.
+pub(crate) fn navigate_from_link(
+    st: &mut AppState,
+    cmd: AppCommand,
+    tx: &UnboundedSender<AppCommand>,
+) {
+    st.links.confirming = None;
+    st.reset_to_home();
+    st.retries = 0;
+    let _ = tx.send(cmd);
 }
 
 fn go_back(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
@@ -1506,7 +1622,8 @@ fn flip_sort(st: &mut AppState) {
 /// moment and is in hand by the time you reach it. The artist page's album
 /// groups are the same kind of thing: one fetch brought all four back. Radio's
 /// are four different queries, so switching *navigates* — the new tab is its
-/// own page, and Esc walks back to the one you left.
+/// own page, and Esc walks back to the chart it hangs from. See
+/// [`open_radio_tab`].
 fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand>) {
     if let MainView::Artist(v) = &mut st.main {
         // Only the groups this artist has records in, so ←/→ never lands on
@@ -1544,7 +1661,6 @@ fn cycle_view_tab(st: &mut AppState, delta: i64, tx: &UnboundedSender<AppCommand
     }
 }
 
-/// Open a radio tab, from the strip or from ←/→.
 /// The Home row that decides where a clicked Spotify link opens.
 ///
 /// Claiming the scheme takes two presses when there is another app to
@@ -1614,8 +1730,48 @@ fn toggle_links(st: &mut AppState) {
 #[cfg(not(windows))]
 fn toggle_links(_st: &mut AppState) {}
 
+/// Open a radio tab, from the strip or from ←/→.
+///
+/// The four tabs are peers under the chart rather than steps off it: whichever
+/// one is clicked, and however deep in the directory the click comes from, the
+/// path it leaves is `radio › <tab>`. Switching tabs four times leaves one step
+/// back rather than four. Popular *is* the chart, so it walks back to it and
+/// opens nothing.
 fn open_radio_tab(st: &mut AppState, tab: RadioTab, tx: &UnboundedSender<AppCommand>) {
-    navigate(st, AppCommand::LoadRadio { scope: tab.scope() }, tx);
+    let scope = tab.scope();
+    let target = ViewKey::Radio(state::radio_key(&scope));
+    // A tab already on the path is reached by walking back to it — `navigate`
+    // does that below — and the frame waiting there still holds its rows.
+    let on_path = st
+        .view_stack
+        .iter()
+        .any(|snap| state::view_key(&snap.view).as_ref() == Some(&target));
+    if !on_path {
+        rewind_to_chart(st);
+    }
+    navigate(st, AppCommand::LoadRadio { scope }, tx);
+}
+
+/// Put the chart back under the cursor, so the tab about to open sits directly
+/// on it.
+///
+/// No [`after_pop`]: nothing is being arrived at unless the chart is itself
+/// where the click leads, and the chart brings its own rows and draws no view
+/// cover. A path with no chart on it — a radio page opened without going
+/// through the directory's front door — is left where it is.
+fn rewind_to_chart(st: &mut AppState) {
+    if is_chart(&st.main) {
+        return;
+    }
+    let Some(depth) = st.view_stack.iter().position(|snap| is_chart(&snap.view)) else {
+        return;
+    };
+    st.pop_to(depth);
+    st.retries = 0;
+}
+
+fn is_chart(view: &MainView) -> bool {
+    matches!(view, MainView::Radio(v) if v.scope == RadioScope::Popular)
 }
 
 /// Enter / click: drill into the selected row, or play it.
@@ -2211,6 +2367,30 @@ fn toggle_saved_station(st: &AppState, tx: &UnboundedSender<AppCommand>) {
     let _ = tx.send(AppCommand::ToggleSavedStation(Box::new(station)));
 }
 
+/// Whether a station's broadcast is what you are hearing.
+///
+/// The keys that have nothing to do under radio have plenty to do off air: a
+/// record from the station's list is a Spotify track in a Spotify queue, so it
+/// seeks and shuffles like one.
+fn on_air(st: &AppState) -> bool {
+    st.radio.as_ref().is_some_and(|r| !r.off_air)
+}
+
+/// The station row's `◂ live`: back to the broadcast.
+///
+/// A tune-in like any other, so the parked queue is put back, the record stops
+/// and the station's list opens on what it is playing now — all of which
+/// `Client::play_station` already does.
+fn resume_station(st: &AppState, tx: &UnboundedSender<AppCommand>) {
+    let Some(station) = st.radio.as_ref().map(|r| r.station.clone()) else {
+        return;
+    };
+    let _ = tx.send(AppCommand::PlayStation {
+        station: Box::new(station),
+        attempt: 0,
+    });
+}
+
 /// Say why a deck control did nothing, when the reason is radio.
 ///
 /// Silence on a keypress is out of character here — `n`, `p`, `s`, `h` and `l`
@@ -2219,8 +2399,19 @@ fn toggle_saved_station(st: &AppState, tx: &UnboundedSender<AppCommand>) {
 /// so the only way to arrive with nothing is to have nothing playing at all,
 /// which the deck is already saying in as many words.
 fn radio_has_no_track(st: &mut AppState, what: &str) {
-    let Some(r) = st.radio.as_ref() else { return };
-    let msg = match &r.matched {
+    let Some(matched) = st.radio.as_ref().map(|r| r.matched.clone()) else {
+        return;
+    };
+    say_no_track(st, &matched, what);
+}
+
+/// Why one announcement has no record to act on.
+///
+/// Taken apart from [`radio_has_no_track`] so a row of the station's list can
+/// answer with its own state: the deck is about what is playing, and a row you
+/// pressed Enter on is not.
+fn say_no_track(st: &mut AppState, matched: &RadioMatch, what: &str) {
+    let msg = match matched {
         RadioMatch::Searching => "still looking that one up".to_string(),
         RadioMatch::Unmatched => format!("that track is not on Spotify — no {what} to open"),
         RadioMatch::None | RadioMatch::Matched(_) => {
@@ -2574,6 +2765,125 @@ mod tests {
             }
             other => panic!("sent {other:?}"),
         }
+    }
+
+    /// A frame that drew one sleeve at `rect`.
+    fn with_sleeve(st: &mut AppState, rect: Rect) {
+        st.hit.art_blocks = vec![state::ArtHit {
+            rect,
+            source: state::ArtSource::Page(Some("https://i.scdn.co/image/abc".into())),
+            seed: "Black Holes".into(),
+        }];
+    }
+
+    #[test]
+    fn clicking_a_sleeve_expands_it() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        with_sleeve(&mut st, Rect::new(1, 4, 20, 10));
+
+        handle_click(&mut st, Position { x: 5, y: 6 }, &tx);
+        let zoom = st.art_zoom.expect("the sleeve did not expand");
+        assert_eq!(zoom.seed, "Black Holes");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadZoomCover { cover_url: Some(u) }) if u.ends_with("abc")
+        ));
+    }
+
+    /// The picture covers the screen, so a click lands on it wherever it is —
+    /// and means only "put it away".
+    #[test]
+    fn a_click_anywhere_closes_the_expanded_art_and_does_nothing_else() {
+        let (tx, _rx) = channel();
+        let mut st = connected();
+        st.main = MainView::Playlists;
+        st.hit.home_btn = Rect::new(0, 0, 6, 1);
+        st.art_zoom = Some(ArtZoom {
+            source: state::ArtSource::Playing,
+            seed: "s".into(),
+        });
+        st.zoom_cover = None;
+
+        handle_click(&mut st, Position { x: 2, y: 0 }, &tx);
+        assert!(st.art_zoom.is_none());
+        assert!(
+            matches!(st.main, MainView::Playlists),
+            "the click under the picture went through"
+        );
+    }
+
+    /// Help draws over the picture, so its own click comes first.
+    #[test]
+    fn help_closes_before_the_expanded_art() {
+        let (tx, _rx) = channel();
+        let mut st = connected();
+        st.show_help = true;
+        st.art_zoom = Some(ArtZoom {
+            source: state::ArtSource::Playing,
+            seed: "s".into(),
+        });
+
+        handle_click(&mut st, Position { x: 2, y: 2 }, &tx);
+        assert!(!st.show_help);
+        assert!(st.art_zoom.is_some(), "one click closed both");
+    }
+
+    /// A sleeve expanded from the player view must not have the player pulled
+    /// out from under it: Esc puts the picture away first.
+    #[test]
+    fn esc_closes_the_expanded_art_before_the_player() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(connected()));
+        {
+            let mut st = state.write();
+            st.show_player = true;
+            st.art_zoom = Some(ArtZoom {
+                source: state::ArtSource::Playing,
+                seed: "s".into(),
+            });
+        }
+        let esc = KeyEvent::from(KeyCode::Esc);
+
+        handle_normal(esc, &state, &tx);
+        assert!(state.read().art_zoom.is_none());
+        assert!(state.read().show_player, "Esc reached the player as well");
+
+        handle_normal(esc, &state, &tx);
+        assert!(!state.read().show_player);
+    }
+
+    /// Transport is about the record, not about the screen behind the picture.
+    #[test]
+    fn transport_still_works_under_the_expanded_art() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(connected()));
+        state.write().art_zoom = Some(ArtZoom {
+            source: state::ArtSource::Playing,
+            seed: "s".into(),
+        });
+
+        handle_normal(KeyEvent::from(KeyCode::Char(' ')), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayPause)));
+        assert!(state.read().art_zoom.is_some());
+    }
+
+    /// The picture is whole, so the wheel has nothing to move — and it must
+    /// not reach the list underneath it either.
+    #[test]
+    fn the_wheel_does_nothing_under_the_expanded_art() {
+        let (tx, _rx) = channel();
+        let mut st = liked_state();
+        st.hit.main_list = Rect::new(0, 4, 60, 10);
+        st.art_zoom = Some(ArtZoom {
+            source: state::ArtSource::Playing,
+            seed: "s".into(),
+        });
+        let at = Position { x: 10, y: 6 };
+
+        handle_scroll(&mut st, at, 1, &tx);
+        assert_eq!(st.main_list.offset(), 0, "the list under it scrolled");
+        assert!(st.art_zoom.is_some(), "the wheel closed the picture");
     }
 
     /// Clicking a header sorts by that column; clicking the same one again
@@ -3569,9 +3879,9 @@ mod tests {
         assert_eq!(sent, 4);
     }
 
-    /// Search is one slot: a new query takes the old one's place wherever it
-    /// sat, rather than stacking beside it. Otherwise ten refinements leave
-    /// ten frames, each holding a whole cloned `SearchResults`.
+    /// A new query takes the old one's place rather than stacking beside it.
+    /// Otherwise ten refinements leave ten frames, each holding a whole cloned
+    /// `SearchResults`.
     #[test]
     fn a_new_search_replaces_the_old_one() {
         let (tx, mut rx) = channel();
@@ -3592,11 +3902,8 @@ mod tests {
         assert_eq!(labels(&st), ["“muse”"], "the old query was stacked");
     }
 
-    /// …and from a page *above* an earlier search, the new query takes that
-    /// search's place on the path instead of adding a second one.
-    ///
-    /// Truncating rather than popping, because the new query has to win —
-    /// restoring the old results would leave the command unsent.
+    /// …and from a page *above* an earlier search, the new query starts the
+    /// path over instead of adding a second search to it.
     #[test]
     fn a_search_from_deeper_in_replaces_the_one_on_the_path() {
         let (tx, mut rx) = channel();
@@ -3612,6 +3919,61 @@ mod tests {
 
         navigate(&mut st, AppCommand::Search("pixies".into()), &tx);
         assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "pixies"));
+        assert_eq!(st.view_stack.len(), 1, "{:?}", labels(&st));
+        assert!(matches!(st.view_stack[0].view, MainView::Home));
+    }
+
+    /// A search from several steps in is a fresh start: the pages walked
+    /// through to reach it have nothing to do with the query, and Home comes
+    /// back with the row it was left on.
+    #[test]
+    fn a_search_starts_the_path_over() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.main_index = 2;
+        st.push_view();
+        st.main = MainView::Playlists;
+        st.push_view();
+        st.main = MainView::Tracks(TrackList::new("Black Holes", "Muse · 2006", None));
+        assert_eq!(labels(&st), ["playlists", "Black Holes"]);
+
+        navigate(&mut st, AppCommand::Search("pixies".into()), &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::Search(q)) if q == "pixies"));
+        assert_eq!(st.view_stack.len(), 1, "{:?}", labels(&st));
+        assert!(matches!(st.view_stack[0].view, MainView::Home));
+        assert_eq!(
+            st.view_stack[0].main_index, 2,
+            "Home lost the row it was on"
+        );
+
+        st.main = MainView::Search(crate::app::state::SearchResults {
+            query: "pixies".into(),
+            ..Default::default()
+        });
+        assert_eq!(labels(&st), ["“pixies”"]);
+    }
+
+    /// A link out of the same box starts the same fresh path — and so does one
+    /// arriving from outside spot, which lands on the same call.
+    #[test]
+    fn a_link_starts_the_path_over_too() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.push_view();
+        st.main = MainView::Playlists;
+        st.push_view();
+        st.main = MainView::Tracks(TrackList::new("Black Holes", "Muse · 2006", None));
+
+        navigate_from_link(
+            &mut st,
+            AppCommand::OpenArtist {
+                id: "r1".into(),
+                uri: "spotify:artist:r1".into(),
+                name: "Muse".into(),
+            },
+            &tx,
+        );
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::OpenArtist { ref id, .. }) if id == "r1"));
         assert_eq!(st.view_stack.len(), 1, "{:?}", labels(&st));
         assert!(matches!(st.view_stack[0].view, MainView::Home));
     }
@@ -4162,6 +4524,8 @@ mod tests {
             failure: None,
             seek_attempt: 0,
             tune_seq: 0,
+            off_air: false,
+            probed: None,
         }
     }
 
@@ -4445,6 +4809,131 @@ mod tests {
                 scope: RadioScope::Genres
             })
         ));
+    }
+
+    /// The four tabs are peers under the chart, so walking the strip does not
+    /// deepen the path: three tabs on from Popular there is still one step
+    /// back, and it leads to the chart.
+    #[test]
+    fn walking_the_radio_strip_does_not_deepen_the_path() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.push_view();
+        st.main = radio_page(RadioScope::Popular, vec![]);
+
+        for scope in [
+            RadioScope::Countries,
+            RadioScope::Genres,
+            RadioScope::Favorites,
+        ] {
+            open_radio_tab(&mut st, scope.tab(), &tx);
+            assert!(matches!(rx.try_recv(), Ok(AppCommand::LoadRadio { scope: s }) if s == scope));
+            // The page is installed when the directory answers.
+            st.main = radio_page(scope, vec![]);
+        }
+        assert_eq!(labels(&st), ["radio", "saved stations"]);
+    }
+
+    /// …and a tab clicked from a page drilled in under another one comes back
+    /// to the chart rather than hanging off the country you were looking at.
+    #[test]
+    fn a_radio_tab_from_a_drilled_in_page_returns_to_the_chart() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.push_view();
+        st.main = radio_page(RadioScope::Popular, vec![]);
+
+        open_radio_tab(&mut st, RadioTab::Countries, &tx);
+        st.main = radio_page(RadioScope::Countries, vec![]);
+        navigate(
+            &mut st,
+            AppCommand::LoadRadio {
+                scope: RadioScope::Country("GB".into()),
+            },
+            &tx,
+        );
+        st.main = radio_page(RadioScope::Country("GB".into()), vec![]);
+        assert_eq!(labels(&st), ["radio", "countries", "GB"]);
+        while rx.try_recv().is_ok() {}
+
+        open_radio_tab(&mut st, RadioTab::Genres, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::LoadRadio {
+                scope: RadioScope::Genres
+            })
+        ));
+        st.main = radio_page(RadioScope::Genres, vec![]);
+        assert_eq!(labels(&st), ["radio", "genres"]);
+    }
+
+    /// The tab you are already drilled in under is on the path, so it is
+    /// walked back to: the list it holds comes back rather than being asked
+    /// for a second time.
+    #[test]
+    fn the_tab_a_drilled_in_page_hangs_from_is_walked_back_to() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.push_view();
+        st.main = radio_page(RadioScope::Popular, vec![]);
+
+        open_radio_tab(&mut st, RadioTab::Countries, &tx);
+        st.main = radio_page(
+            RadioScope::Countries,
+            vec![RadioRow::Facet {
+                key: "GB".into(),
+                label: "The United Kingdom".into(),
+                count: 2146,
+            }],
+        );
+        activate_selection(&mut st, &tx);
+        st.main = radio_page(RadioScope::Country("GB".into()), vec![]);
+        while rx.try_recv().is_ok() {}
+
+        open_radio_tab(&mut st, RadioTab::Countries, &tx);
+        let sent: Vec<AppCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|c| matches!(c, AppCommand::LoadRadio { .. })),
+            "the country list was asked for again: {sent:?}"
+        );
+        assert_eq!(labels(&st), ["radio", "countries"]);
+        let MainView::Radio(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.rows.len(), 1, "the frame came back without its rows");
+    }
+
+    /// Popular *is* the chart the other three hang from, so its tab walks back
+    /// to it and opens nothing.
+    #[test]
+    fn the_popular_tab_walks_back_to_the_chart() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.push_view();
+        st.main = radio_page(
+            RadioScope::Popular,
+            vec![RadioRow::Station(test_station("a", "Radio Paradise"))],
+        );
+
+        open_radio_tab(&mut st, RadioTab::Genres, &tx);
+        st.main = radio_page(RadioScope::Genres, vec![]);
+        while rx.try_recv().is_ok() {}
+
+        open_radio_tab(&mut st, RadioTab::Popular, &tx);
+        let sent: Vec<AppCommand> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|c| matches!(c, AppCommand::LoadRadio { .. })),
+            "the chart was asked for again: {sent:?}"
+        );
+        assert_eq!(labels(&st), ["radio"]);
+        let MainView::Radio(v) = &st.main else {
+            unreachable!()
+        };
+        assert_eq!(v.rows.len(), 1, "the chart came back without its rows");
     }
 
     /// The artist page's groups are cuts of one answer, so ←/→ re-cuts them
@@ -5454,5 +5943,157 @@ mod tests {
 
         handle_click(&mut st, Position { x: 20, y: 24 }, &tx);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A station on the deck with three records behind it: two Spotify placed,
+    /// and one it could only name.
+    fn radio_player_state() -> AppState {
+        use crate::app::state::{Heard, RadioMatch};
+
+        let mut st = connected();
+        st.show_player = true;
+        st.radio = Some(live_radio(test_station("s1", "Groove Salad")));
+        let placed = |name: &str| Heard {
+            announced: format!("Muse - {name}"),
+            matched: RadioMatch::Matched(Box::new(track(name, Some("a1")))),
+            at: Instant::now(),
+        };
+        st.radio_heard.insert(
+            "s1".into(),
+            vec![
+                placed("Alpha"),
+                Heard {
+                    announced: "Groove Salad - commercial free".into(),
+                    matched: RadioMatch::Unmatched,
+                    at: Instant::now(),
+                },
+                placed("Gamma"),
+            ],
+        );
+        st
+    }
+
+    /// Enter on a row of the station's list asks for that row, and asks for
+    /// nothing else: the record is played without the page leaving the
+    /// station or the queue being replaced under it.
+    #[test]
+    fn enter_on_a_station_row_asks_for_that_row() {
+        let (tx, mut rx) = channel();
+        let mut st = radio_player_state();
+        st.heard_index = 0;
+
+        play_from_queue(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::PlayHeard { row: 0 })
+        ));
+        assert!(rx.try_recv().is_err(), "one command, not two");
+        assert!(st.show_player, "the page stays on the station");
+    }
+
+    /// The newest row is the record the station is on, so asking for it means
+    /// the broadcast — not a copy of it started over from the beginning while
+    /// the station plays on somewhere in the middle.
+    #[test]
+    fn enter_on_the_newest_row_joins_the_broadcast() {
+        let (tx, mut rx) = channel();
+        let mut st = radio_player_state();
+        st.heard_index = 2;
+
+        play_from_queue(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::PlayStation { station, attempt: 0 }) if station.uuid == "s1"
+        ));
+        assert!(rx.try_recv().is_err(), "and nothing is queued for it");
+    }
+
+    /// A row the station only named has nothing to play, and says so rather
+    /// than doing nothing.
+    #[test]
+    fn enter_on_a_row_the_station_only_named_says_why() {
+        let (tx, mut rx) = channel();
+        let mut st = radio_player_state();
+        st.heard_index = 1;
+
+        play_from_queue(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "nothing to play");
+        assert!(
+            st.toast
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("not on Spotify")),
+            "{:?}",
+            st.toast
+        );
+    }
+
+    /// The cursor and the wheel walk the station's rows, not the queue kept
+    /// behind them.
+    #[test]
+    fn the_cursor_walks_the_stations_rows_not_the_kept_queue() {
+        let (tx, _rx) = channel();
+        let mut st = radio_player_state();
+        start_playing(&mut st);
+        st.hit.player_queue = Rect::new(0, 0, 80, 2);
+
+        queue_move(&mut st, 1);
+        assert_eq!(st.heard_index, 1);
+        assert_eq!(st.queue_index, 0, "the kept queue did not move");
+
+        queue_set(&mut st, usize::MAX);
+        assert_eq!(st.heard_index, 2, "G reaches the newest row");
+        assert_eq!(st.heard_list.offset(), 1, "and the view came with it");
+
+        handle_scroll(&mut st, Position::new(0, 0), -1, &tx);
+        assert_eq!(st.heard_list.offset(), 0, "the wheel walked the same rows");
+        assert_eq!(st.queue_list.offset(), 0, "and left the kept queue alone");
+
+        handle_scroll(&mut st, Position::new(0, 0), 1, &tx);
+        assert_eq!(st.heard_list.offset(), 1, "and stops at the last row");
+    }
+
+    /// The `★ ⧉ +` on a station's row act on the row under the pointer, and a
+    /// row with no record draws none of them to click.
+    #[test]
+    fn the_stations_pair_acts_on_the_row_under_the_pointer() {
+        let (tx, mut rx) = channel();
+        let mut st = radio_player_state();
+        st.hit.player_queue = Rect::new(0, 0, 80, 3);
+        st.hit.queue_like_col = Rect::new(60, 0, 3, 3);
+
+        handle_click(&mut st, Position::new(61, 2), &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::SetLiked { uri, liked: true }) if uri.ends_with("Gamma")
+        ));
+
+        handle_click(&mut st, Position::new(61, 1), &tx);
+        assert!(rx.try_recv().is_err(), "a row with no record has no star");
+    }
+
+    /// `◂ live` on the station row tunes the station back in, which is what
+    /// puts the parked queue back and the stream on air.
+    #[test]
+    fn the_live_control_tunes_the_station_back_in() {
+        let (tx, mut rx) = channel();
+        let mut st = radio_player_state();
+        st.radio.as_mut().unwrap().off_air = true;
+        st.hit.radio_live_btn = Rect::new(70, 20, 6, 1);
+
+        handle_click(&mut st, Position::new(72, 20), &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::PlayStation { station, attempt: 0 }) if station.uuid == "s1"
+        ));
+    }
+
+    /// Off air there is a record to seek and a queue to shuffle, so the keys
+    /// that explain themselves under a broadcast simply work.
+    #[test]
+    fn seek_and_shuffle_stop_apologising_once_the_stream_stands_down() {
+        let mut st = radio_player_state();
+        assert!(on_air(&st));
+        st.radio.as_mut().unwrap().off_air = true;
+        assert!(!on_air(&st));
     }
 }

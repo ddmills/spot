@@ -19,6 +19,13 @@ use crate::app::state::{HitAreas, Sort};
 pub const COL_GAP: &str = "   ";
 /// Right-aligned duration cell: "12:34".
 pub const DUR_W: usize = 5;
+/// Right-aligned "how long ago" cell. The width of the longest reading it
+/// prints, "23h ago", which everything shorter is padded out to.
+pub const AGO_W: usize = 7;
+/// Narrowest pane the `Ago` column is worth its ten cells on. Above the width
+/// the artist column needs, so a tight row loses the reading before it loses
+/// the name.
+pub const AGO_MIN: usize = 60;
 /// Four-digit release year.
 pub const YEAR_W: usize = 4;
 /// Leading marker column: "▶ " playing, "♫ " the playing context, "★ " saved.
@@ -95,6 +102,10 @@ pub enum ColKey {
     /// Whether a station is one you keep. Not sortable: the favourites are a file
     /// of spot's own and are not on the row itself.
     Saved,
+    /// How long ago a station announced a record, on the list of what it has
+    /// played. A reading that changes under the reader rather than a value, so
+    /// nothing sorts by it.
+    Ago,
     /// The `★ ⧉ +` run. Controls rather than values, so it heads nothing
     /// sortable.
     Actions,
@@ -123,6 +134,9 @@ impl ColKey {
             ColKey::Stations => "Stations",
             ColKey::Code => "Code",
             ColKey::Saved => "Saved",
+            // Headed, unlike the two below it: "6:59" says what it is and
+            // "42m ago" only says what it is once you know what it counts.
+            ColKey::Ago => "Ago",
             // The `★ ⧉ +` run and the duration head themselves: a row of marks
             // and a column of times both say what they are, and a label over
             // either is a word spent on nothing.
@@ -601,6 +615,25 @@ pub fn queue(len: usize) -> Vec<Column> {
     ]
 }
 
+/// A station's own list in the player view: what it has played, oldest first.
+///
+/// The queue's columns and one more. A history is about *when* you heard a
+/// record as much as what it was, so the last cell says how long ago the
+/// station announced it. Declared beside [`queue`] rather than added to it,
+/// because the Spotify queue is a play order and has no answer to give.
+///
+/// The extra column is the first thing a narrow pane gives up — before the
+/// artist, which is what tells two records with the same title apart.
+pub fn heard(len: usize) -> Vec<Column> {
+    let mut cols = queue(len);
+    cols.push(
+        Column::new(ColKey::Ago, Width::Fixed(AGO_W))
+            .right()
+            .drop_below(AGO_MIN),
+    );
+    cols
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +731,27 @@ mod tests {
                 .cell(ColKey::Artist)
                 .is_some()
         );
+    }
+
+    /// A station's list is the queue's table with one cell more on the end,
+    /// and it is the first cell a tight row gives up — before the artist.
+    #[test]
+    fn a_stations_list_is_the_queue_plus_a_reading_it_sheds_first() {
+        let keys = |cols: &[Column], width: usize| -> Vec<ColKey> {
+            Layout::resolve(cols, width, 9)
+                .cells()
+                .iter()
+                .map(|c| c.key)
+                .collect()
+        };
+        let mut expected = keys(&queue(9), 90);
+        expected.push(ColKey::Ago);
+        assert_eq!(keys(&heard(9), 90), expected);
+
+        assert!(keys(&heard(9), AGO_MIN).contains(&ColKey::Ago));
+        let tight = keys(&heard(9), AGO_MIN - 1);
+        assert!(!tight.contains(&ColKey::Ago));
+        assert!(tight.contains(&ColKey::Artist), "the artist outlives it");
     }
 
     #[test]

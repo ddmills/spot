@@ -50,6 +50,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Read for the same reason and in the same place: what the radio row can
     // offer is state the split borrow below gives up.
     let steps = play_state::radio_steps(state);
+    // And the same for where forward leads: a record off a station's list is
+    // followed by the station once the list is played out.
+    let forward = match play_state::played_out(state) {
+        true => deck::Forward::Live,
+        false => deck::Forward::Next,
+    };
     // Read here for the same reason: whether the `+ add` control has anywhere
     // to lead is state the split borrow below gives up.
     let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
@@ -89,7 +95,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // is kept only so stopping the stream puts the last track straight back.
     // Drawing it would have the bar report something that is not making any
     // sound.
-    if let Some(r) = radio {
+    // Off air is the exception: what the bar would report is a record off the
+    // station's list, which comes down the Spotify path below like any other.
+    // The way back on air is a control on the player screen, which is the only
+    // place the list it belongs to is drawn.
+    if let Some(r) = radio.as_ref().filter(|r| !r.off_air) {
         hit.now_playing = area;
         // Only for a matched record, and only once the answer is in: the deck
         // draws no control it cannot answer for.
@@ -205,6 +215,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ..text
         },
         play,
+        forward,
         mouse,
         hit,
     );
@@ -275,7 +286,7 @@ fn draw_radio(
     if body.height < deck::DECK_H {
         return;
     }
-    deck::radio_station_row(frame, row_at(body, 6), radio, saved, mouse, hit);
+    deck::radio_station_row(frame, row_at(body, 6), radio, saved, None, mouse, hit);
 }
 
 /// One row of `area`, `n` rows down.
@@ -460,7 +471,7 @@ mod tests {
             state.hit.shuffle_btn,
             state.hit.queue_name,
             state.hit.volume_slider,
-            state.hit.art,
+            state.hit.art_rect(),
         ] {
             assert!(!rect.is_empty());
         }
@@ -503,7 +514,7 @@ mod tests {
         terminal.draw(|f| draw(f, f.area(), &mut state)).unwrap();
         let buffer = terminal.backend().buffer().clone();
 
-        let art = state.hit.art;
+        let art = state.hit.art_rect();
         assert_eq!((art.width, art.height), (art_w(ART_H), ART_H));
         assert_eq!(art.height, deck::DECK_H, "the sleeve should span the deck");
         assert_eq!(art.y, 1, "the sleeve should start under the rule");
@@ -537,7 +548,7 @@ mod tests {
     fn a_narrow_bar_drops_the_sleeve_and_keeps_the_title() {
         let mut state = playing_state();
         let lines = render(&mut state, 50, BAR_H);
-        assert!(state.hit.art.is_empty());
+        assert!(state.hit.art_rect().is_empty());
         assert!(lines[TITLE_ROW].contains("Song Title"));
         assert!(lines[PROGRESS_ROW].contains("1:23"));
     }
