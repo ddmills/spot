@@ -52,13 +52,13 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     // the transport keys still work while the picture is up — several of them
     // report through a toast and nothing else, so without this they would act
     // silently.
-    if let Some((msg, _)) = &state.toast {
+    if let Some(msg) = state.message() {
         let row = Rect {
             y: screen.bottom().saturating_sub(1),
             height: 1,
             ..screen
         };
-        super::now_playing::draw_toast(frame, row, Some(msg.as_str()));
+        super::now_playing::draw_toast(frame, row, Some(msg));
     }
 }
 

@@ -931,6 +931,12 @@ impl Client {
                 uri,
                 seq,
             } => self.create_playlist(name, description, uri, seq).await,
+            CopyPlaylist {
+                name,
+                description,
+                uris,
+                seq,
+            } => self.copy_playlist(name, description, uris, seq).await,
             CachePlaylistTracks { playlist_ids } => self.cache_playlist_tracks(playlist_ids).await,
             OpenLink(link) => self.open_link(link).await,
             Search(query) => self.search(query).await,
@@ -2298,7 +2304,9 @@ impl Client {
             // The first failure only: a laptop left offline overnight must not
             // toast once a minute until morning.
             if r.attempts == 1 {
-                self.state.write().toast("cannot reach Spotify; still trying");
+                self.state
+                    .write()
+                    .toast("cannot reach Spotify; still trying");
             }
             return;
         };
@@ -2896,13 +2904,17 @@ impl Client {
     /// control having done nothing.
     async fn set_playlist_saved(&self, id: String, saved: bool) {
         let Some(api) = self.api.clone() else { return };
-        let name = {
+        // Whose playlist it is decides the word for taking it out of the
+        // library: Spotify spells deleting your own as unfollowing it, and the
+        // report has to say which of the two happened.
+        let (name, mine) = {
             let mut st = self.state.write();
             st.saved_playlists.insert(id.clone(), saved);
-            st.playlists
-                .iter()
-                .find(|p| p.id == id)
-                .map_or_else(|| "the playlist".to_string(), |p| p.name.clone())
+            let me = st.me_id.clone();
+            match st.playlists.iter().find(|p| p.id == id) {
+                Some(p) => (p.name.clone(), me.is_some_and(|me| me == p.owner_id)),
+                None => ("the playlist".to_string(), false),
+            }
         };
         match api.set_playlist_saved(&id, saved).await {
             Ok(()) => {
@@ -2914,11 +2926,21 @@ impl Client {
                     // list stores — and a half-filled row is worse than none.
                     st.toast(format!("saved {name}"));
                 } else {
+                    // The page goes before the list does. Standing on a
+                    // playlist that no longer exists reads as an ordinary page
+                    // until something is asked of it, and everything asked of
+                    // it now fails.
+                    if st.open_playlist_id() == Some(id.as_str()) && !st.pop_view() {
+                        st.reset_to_home();
+                    }
                     let mut playlists = std::mem::take(&mut st.playlists);
                     playlists.retain(|p| p.id != id);
                     st.set_playlists(playlists);
                     st.saved_playlists.insert(id, false);
-                    st.toast(format!("unsaved {name}"));
+                    st.toast(match mine {
+                        true => format!("deleted {name}"),
+                        false => format!("unfollowed {name}"),
+                    });
                 }
             }
             Err(e) => {
@@ -3030,6 +3052,70 @@ impl Client {
         st.toast(match refusal {
             Some(e) => format!("error: {e}"),
             None => format!("added to {name}"),
+        });
+    }
+
+    /// Make a playlist of your own holding what another one holds.
+    ///
+    /// The only write that works on a playlist you cannot edit, which is what
+    /// it is for. The rows arrive with the command — `event::copyable_tracks`
+    /// refuses the copy where the page cannot see all of them — so this walks
+    /// nothing and only writes.
+    async fn copy_playlist(&self, name: String, description: String, uris: Vec<String>, seq: u64) {
+        let Some(api) = self.api.clone() else { return };
+        let known = self.state.read().me_id.clone();
+        let me = match known {
+            Some(id) => id,
+            None => match api.account().await {
+                Ok(account) => {
+                    self.state.write().me_id = Some(account.id.clone());
+                    account.id
+                }
+                Err(e) => return self.refuse_create(e.to_string(), seq),
+            },
+        };
+        let mut playlist = match api.create_playlist(&me, &name, &description).await {
+            Ok(playlist) => playlist,
+            Err(e) => return self.refuse_create(e.to_string(), seq),
+        };
+        // The playlist exists from here on, however far the adds got, so every
+        // path below closes the box and installs it.
+        let (result, added) = api.add_tracks_to_playlist(&playlist.id, &uris).await;
+        let refusal = match result {
+            Ok(snapshot_id) => {
+                playlist.snapshot_id = snapshot_id;
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        };
+        playlist.track_count = added as u32;
+        let id = playlist.id.clone();
+
+        let mut st = self.state.write();
+        let contents = state::PlaylistContents {
+            snapshot_id: playlist.snapshot_id.clone(),
+            track_ids: uris
+                .iter()
+                .take(added)
+                .map(|uri| state::track_id(uri).to_string())
+                .collect(),
+        };
+        // Newest first, where the library's own order puts it.
+        let mut playlists = std::mem::take(&mut st.playlists);
+        playlists.insert(0, playlist);
+        st.set_playlists(playlists);
+        // Nothing has touched this playlist but the adds above, so what it
+        // holds is known and the picker needs no walk to mark it.
+        st.playlist_tracks.insert(id, contents);
+        save_playlist_tracks(&st);
+        if st.edit.as_ref().is_some_and(|e| e.seq == seq) {
+            st.edit = None;
+        }
+        // The count either way: a copy short of what was asked for is still a
+        // playlist, and the number is the only thing that says which happened.
+        st.toast(match refusal {
+            Some(e) => format!("copied {added} of {} to {name} — {e}", uris.len()),
+            None => format!("copied {added} tracks to {name}"),
         });
     }
 

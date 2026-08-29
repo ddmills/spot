@@ -60,14 +60,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // to lead is state the split borrow below gives up.
     let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
     let muted = state.muted_volume.is_some();
-    // Split borrows: playback/queue/toast/cover are read while hit areas are
+    // Owned, because the split borrow below gives up the read that produced
+    // it. See [`AppState::message`] for why it is not the toast alone.
+    let message = state.message().map(str::to_string);
+    // Split borrows: playback/queue/cover are read while hit areas are
     // written.
     let AppState {
         playback,
         radio,
         radio_favorites,
         queue,
-        toast,
         hit,
         mouse_pos,
         cover,
@@ -112,7 +114,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             frame,
             body,
             r,
-            toast.as_ref().map(|(m, _)| m.as_str()),
+            message.as_deref(),
             muted,
             like,
             spotify_ready,
@@ -184,11 +186,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if text.height < 3 {
         return;
     }
-    draw_toast(
-        frame,
-        row_at(text, 2),
-        toast.as_ref().map(|(msg, _)| msg.as_str()),
-    );
+    draw_toast(frame, row_at(text, 2), message.as_deref());
 
     // Row 3: elapsed, the track, time remaining.
     if text.height < 4 {

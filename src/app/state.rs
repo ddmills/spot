@@ -1735,6 +1735,10 @@ pub enum EditTarget {
     Existing(String),
     /// Make one, and put this record on it once it does.
     New { uri: String },
+    /// Make one holding what another playlist holds. The rows come off the
+    /// page behind the box rather than riding along here — see
+    /// `event::copyable_tracks`.
+    Copy { source_id: String },
 }
 
 /// The open "edit playlist" box: which playlist it is about, and what has
@@ -1758,6 +1762,39 @@ pub struct PlaylistEdit {
     /// Identifies this opening, so a result arriving after the box was closed
     /// and opened again cannot act on the new one.
     pub seq: u64,
+}
+
+/// A write that takes something away, held until it is asked for a second
+/// time.
+///
+/// An armed prompt rather than a box, because the controls that need one sit a
+/// cell from `▶ play` and a box over the page would hide the thing being
+/// asked about. The row's own `Enter again to replace…` (see
+/// [`LinksRow::confirming`]) proved the shape; this is the same idea where any
+/// screen can reach it.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    /// What the second ask looks like, spelled for the user.
+    pub message: String,
+    /// Sent when the ask is repeated.
+    pub command: crate::app::command::AppCommand,
+    /// What repeating it means, so a different key or a click somewhere else
+    /// disarms rather than fires.
+    pub trigger: ConfirmTrigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmTrigger {
+    Key(char),
+    /// The control that armed it. Clicking any other disarms, so a pill that
+    /// moves under the pointer cannot inherit the arming.
+    Click(ConfirmTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmTarget {
+    HeaderDelete,
+    HeaderUnfollow,
 }
 
 /// A table column of clickable text, and how much of each row that text fills.
@@ -1894,9 +1931,17 @@ pub struct HitAreas {
     /// The shuffle button in a view's header band; plays the whole context
     /// shuffled.
     pub header_shuffle_btn: Rect,
-    /// The save control in a playlist's header band. Empty on a playlist you
-    /// own, where unsaving is how Spotify spells deleting.
+    /// The save control in a playlist's header band, which reads `☆ save` or
+    /// `✕ unfollow` for the two directions of the one write. Empty on a
+    /// playlist you own, where the word is delete, and on one the library has
+    /// not answered about yet.
     pub header_save_btn: Rect,
+    /// The copy control in a playlist's header band. Never empty on a playlist
+    /// page: copying one you cannot edit is what makes it yours.
+    pub header_copy_btn: Rect,
+    /// The delete control in a playlist's header band. Empty on every playlist
+    /// you do not own, where the same write is unfollowing.
+    pub header_delete_btn: Rect,
     /// The share control in a header band, right of the shuffle button: copies
     /// the Spotify link to the page itself. Empty where the page has no link of
     /// its own to give — see [`AppState::open_page_link`].
@@ -2318,6 +2363,8 @@ pub struct AppState {
     /// Global busy flag; only search still blocks on it.
     pub loading: bool,
     pub toast: Option<(String, Instant)>,
+    /// A write waiting to be asked for a second time. See [`Confirm`].
+    pub confirm: Option<Confirm>,
     pub show_help: bool,
     /// The cover-art block filling the screen, if one is expanded. See
     /// [`ArtZoom`].
@@ -2413,6 +2460,7 @@ impl AppState {
             load_generation: 0,
             loading: false,
             toast: None,
+            confirm: None,
             show_help: false,
             art_zoom: None,
             zoom_cover: None,
@@ -2913,6 +2961,44 @@ impl AppState {
 
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// What the app has to say, in the one place every surface draws it.
+    ///
+    /// An armed write outranks a toast. A toast reports what already happened
+    /// and expires on its own; a prompt is a question, and one covered by the
+    /// answer to an earlier question is one that gets missed.
+    pub fn message(&self) -> Option<&str> {
+        match &self.confirm {
+            Some(confirm) => Some(&confirm.message),
+            None => self.toast.as_ref().map(|(msg, _)| msg.as_str()),
+        }
+    }
+
+    /// Hold a write until the same ask comes again. See [`Confirm`].
+    pub fn arm(
+        &mut self,
+        trigger: ConfirmTrigger,
+        message: impl Into<String>,
+        command: crate::app::command::AppCommand,
+    ) {
+        self.confirm = Some(Confirm {
+            message: message.into(),
+            command,
+            trigger,
+        });
+    }
+
+    /// The command an armed write is waiting to send, if this ask is the one
+    /// it is waiting for. Takes it either way: an ask that does not match is
+    /// the user doing something else, and the prompt has to stop standing over
+    /// whatever that turns out to be.
+    pub fn take_armed(
+        &mut self,
+        trigger: ConfirmTrigger,
+    ) -> Option<crate::app::command::AppCommand> {
+        let armed = self.confirm.take()?;
+        (armed.trigger == trigger).then_some(armed.command)
     }
 
     /// Whether the page on screen is still being fetched.

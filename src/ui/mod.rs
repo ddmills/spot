@@ -106,14 +106,14 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     // same corner it uses, so a toast is always read in one place — here it
     // lies over the bottom line of whatever is under it for its four seconds,
     // which costs less than a control that says nothing.
-    if !toast_shown && let Some((msg, _)) = &state.toast {
+    if !toast_shown && let Some(msg) = state.message() {
         let area = frame.area();
         let row = Rect {
             y: area.bottom().saturating_sub(1),
             height: 1,
             ..area
         };
-        now_playing::draw_toast(frame, row, Some(msg.as_str()));
+        now_playing::draw_toast(frame, row, Some(msg));
     }
 
     // Over everything the screen was showing, under the boxes that are about

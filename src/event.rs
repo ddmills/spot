@@ -10,9 +10,10 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
-    self as state, AppState, ArtZoom, ArtistRow, BackTarget, ColKey, CrumbTarget, EditField,
-    EditTarget, HomeItem, InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow,
-    RadioScope, RadioTab, SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
+    self as state, AppState, ArtZoom, ArtistRow, BackTarget, ColKey, ConfirmTarget, ConfirmTrigger,
+    CrumbTarget, EditField, EditTarget, HomeItem, InputMode, MainView, PICKER_ROWS, PlaylistEdit,
+    RadioMatch, RadioRow, RadioScope, RadioTab, SearchTab, SpotifyState, Station, Track, TrackList,
+    UpdateState, ViewKey,
 };
 use crate::link;
 
@@ -402,7 +403,17 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
     }
 
     if st.hit.header_save_btn.contains(pos) {
-        toggle_saved_playlist(st, tx);
+        toggle_saved_playlist(st, tx, ConfirmTrigger::Click(ConfirmTarget::HeaderUnfollow));
+        return;
+    }
+
+    if st.hit.header_delete_btn.contains(pos) {
+        delete_open_playlist(st, tx, ConfirmTrigger::Click(ConfirmTarget::HeaderDelete));
+        return;
+    }
+
+    if st.hit.header_copy_btn.contains(pos) {
+        open_playlist_copy(st);
         return;
     }
 
@@ -818,6 +829,67 @@ fn open_new_playlist(st: &mut AppState) {
     });
 }
 
+/// The header's `copy` control: open the edit box on a playlist of your own
+/// that does not exist yet.
+///
+/// The one control a playlist you cannot edit still offers, which is the point
+/// of it — a copy is how someone else's playlist becomes yours.
+fn open_playlist_copy(st: &mut AppState) {
+    let Some(id) = st.open_playlist_id().map(str::to_string) else {
+        return;
+    };
+    // Asked before the box opens rather than after a name is typed: a refusal
+    // is worth less the more work it throws away.
+    if let Err(why) = copyable_tracks(st) {
+        st.toast(why);
+        return;
+    }
+    let MainView::Tracks(list) = &st.main else {
+        return;
+    };
+    let name = format!("{} (copy)", list.header.name)
+        .chars()
+        .take(MAX_PLAYLIST_NAME)
+        .collect();
+    let description = list.header.description.clone();
+    st.edit_seq += 1;
+    st.edit = Some(PlaylistEdit {
+        target: EditTarget::Copy { source_id: id },
+        name,
+        description,
+        field: EditField::Name,
+        pending: false,
+        error: None,
+        seq: st.edit_seq,
+    });
+}
+
+/// The open playlist's records in playlist order, when spot can see all of
+/// them.
+///
+/// A copy is written from the URIs spot holds, and a [`TrackList`] holds only
+/// the rows `Api::playlist_tracks_page` could parse — a local file is not one
+/// of them. Copying a list spot cannot see the whole of would make a record
+/// quietly short of the one it claims to be, so it is refused instead.
+fn copyable_tracks(st: &AppState) -> Result<Vec<String>, &'static str> {
+    let MainView::Tracks(list) = &st.main else {
+        return Err("there is no playlist here to copy");
+    };
+    if list.loading {
+        return Err("still reading this playlist — copy it when the rows stop arriving");
+    }
+    if list
+        .total
+        .is_some_and(|total| total as usize != list.items.len())
+    {
+        return Err("spot cannot see every item on this playlist, so a copy would be short");
+    }
+    if list.items.is_empty() {
+        return Err("there is nothing on this playlist to copy");
+    }
+    Ok(list.items.iter().map(|track| track.uri.clone()).collect())
+}
+
 /// Send what the box holds, and hold it inert until the answer lands.
 fn submit_edit(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     let Some(edit) = st.edit.as_mut() else {
@@ -832,14 +904,16 @@ fn submit_edit(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         edit.error = Some("a playlist needs a name".to_string());
         return;
     }
-    edit.pending = true;
-    edit.error = None;
+    let target = edit.target.clone();
     let name = edit.name.trim().to_string();
     let description = edit.description.trim().to_string();
     let seq = edit.seq;
-    let _ = tx.send(match &edit.target {
+
+    // A copy is written from the page behind the box, which the borrow above
+    // gives up.
+    let command = match target {
         EditTarget::Existing(id) => AppCommand::EditPlaylistDetails {
-            id: id.clone(),
+            id,
             name,
             description,
             seq,
@@ -847,10 +921,29 @@ fn submit_edit(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
         EditTarget::New { uri } => AppCommand::CreatePlaylist {
             name,
             description,
-            uri: uri.clone(),
+            uri,
             seq,
         },
-    });
+        EditTarget::Copy { .. } => match copyable_tracks(st) {
+            Ok(uris) => AppCommand::CopyPlaylist {
+                name,
+                description,
+                uris,
+                seq,
+            },
+            Err(why) => {
+                if let Some(edit) = st.edit.as_mut() {
+                    edit.error = Some(why.to_string());
+                }
+                return;
+            }
+        },
+    };
+    if let Some(edit) = st.edit.as_mut() {
+        edit.pending = true;
+        edit.error = None;
+    }
+    let _ = tx.send(command);
 }
 
 /// `F` / the header's control: put the open playlist in the library, or take
@@ -859,7 +952,11 @@ fn submit_edit(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// Silent on a playlist you own — the control is not drawn there, and the key
 /// must agree with it. Unfollowing your own playlist is how Spotify spells
 /// deleting it, which is not what one keypress should mean.
-fn toggle_saved_playlist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
+fn toggle_saved_playlist(
+    st: &mut AppState,
+    tx: &UnboundedSender<AppCommand>,
+    trigger: ConfirmTrigger,
+) {
     if st.owns_open_playlist() {
         return;
     }
@@ -873,7 +970,64 @@ fn toggle_saved_playlist(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     };
     // The flip itself is the client's, as it is for a track's `★` — see
     // `send_like`. Doing it here as well would only be the same write twice.
-    let _ = tx.send(AppCommand::SetPlaylistSaved { id, saved: !saved });
+    if !saved {
+        let _ = tx.send(AppCommand::SetPlaylistSaved { id, saved: true });
+        return;
+    }
+    let name = state::view_title(&st.main);
+    ask_again(
+        st,
+        tx,
+        trigger,
+        format!("unfollow {name}"),
+        AppCommand::SetPlaylistSaved { id, saved: false },
+    );
+}
+
+/// `d` and the header's delete control: take a playlist you own out of the
+/// library, which is how Spotify spells deleting it.
+fn delete_open_playlist(
+    st: &mut AppState,
+    tx: &UnboundedSender<AppCommand>,
+    trigger: ConfirmTrigger,
+) {
+    if !st.owns_open_playlist() {
+        return;
+    }
+    let Some(id) = st.open_playlist_id().map(str::to_string) else {
+        return;
+    };
+    let name = state::view_title(&st.main);
+    ask_again(
+        st,
+        tx,
+        trigger,
+        format!("delete {name}"),
+        AppCommand::SetPlaylistSaved { id, saved: false },
+    );
+}
+
+/// Send a write that was already asked for, or arm it and say what asking
+/// again would do.
+///
+/// `verb` names the write in the imperative, so the prompt reads as one
+/// sentence — "press d again to delete LATE NIGHTS · Esc to cancel".
+fn ask_again(
+    st: &mut AppState,
+    tx: &UnboundedSender<AppCommand>,
+    trigger: ConfirmTrigger,
+    verb: String,
+    command: AppCommand,
+) {
+    if let Some(armed) = st.take_armed(trigger) {
+        let _ = tx.send(armed);
+        return;
+    }
+    let ask = match trigger {
+        ConfirmTrigger::Key(key) => format!("press {key} again"),
+        ConfirmTrigger::Click(_) => "click again".to_string(),
+    };
+    st.arm(trigger, format!("{ask} to {verb} · Esc to cancel"), command);
 }
 
 /// Ask for the contents of any row on screen that has not been walked yet.
@@ -1078,9 +1232,11 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
             let mut st = state.write();
             if st.show_help {
                 st.show_help = false;
+            } else if st.confirm.take().is_some() {
+                // An armed write is the nearest thing to something open, and
+                // Esc is the key its own prompt names.
             } else if st.links.confirming.take().is_some() {
-                // The armed Links row is the nearest thing to something open,
-                // and Esc is the key its own prompt names.
+                // The armed Links row, for the same reason.
             } else {
                 go_back_or_up(&mut st, tx);
             }
@@ -1146,8 +1302,14 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
         KeyCode::Enter => activate_selection(&mut state.write(), tx),
         KeyCode::Char('a') => queue_selection(&mut state.write(), tx),
         KeyCode::Char('L') => toggle_like_selection(&mut state.write(), tx),
-        KeyCode::Char('F') => toggle_saved_playlist(&mut state.write(), tx),
+        KeyCode::Char('F') => {
+            toggle_saved_playlist(&mut state.write(), tx, ConfirmTrigger::Key('F'));
+        }
         KeyCode::Char('E') => open_playlist_edit(&mut state.write()),
+        KeyCode::Char('C') => open_playlist_copy(&mut state.write()),
+        KeyCode::Char('d') => {
+            delete_open_playlist(&mut state.write(), tx, ConfirmTrigger::Key('d'))
+        }
 
         KeyCode::Char('b') => open_album_of_selection(&mut state.write(), tx),
         KeyCode::Char('B') => open_artist_of_selection(&mut state.write(), tx),
@@ -1166,6 +1328,7 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
 /// just changed.
 fn go_home(st: &mut AppState) {
     st.show_player = false;
+    st.confirm = None;
     st.view_stack.clear();
     st.main = MainView::Home;
     st.main_to_top();
@@ -1224,7 +1387,7 @@ fn handle_player_key(
         // draws no prompt over the player, so the key would put you in a mode
         // with nothing on screen to show what you were typing.
         KeyCode::Char(
-            '/' | '1' | '2' | 'b' | 'B' | 'o' | 'O' | 'a' | 'x' | 'F' | 'E' | '[' | ']',
+            '/' | '1' | '2' | 'b' | 'B' | 'o' | 'O' | 'a' | 'x' | 'F' | 'E' | 'C' | 'd' | '[' | ']',
         )
         | KeyCode::Tab
         | KeyCode::BackTab
@@ -1403,8 +1566,10 @@ fn make_way(st: &mut AppState, target: Option<ViewKey>, tx: &UnboundedSender<App
 pub(crate) fn navigate(st: &mut AppState, cmd: AppCommand, tx: &UnboundedSender<AppCommand>) {
     // Leaving the screen disarms the Links row for the same reason leaving the
     // row does: its second press claims the `spotify:` scheme, and coming back
-    // to a page has to ask again.
+    // to a page has to ask again. An armed write goes with it — every one of
+    // them is about the page being left.
     st.links.confirming = None;
+    st.confirm = None;
     if make_way(st, target_key(&cmd), tx) {
         // The count belongs to the page you were on, not to the one opening.
         st.retries = 0;
@@ -1428,6 +1593,7 @@ pub(crate) fn navigate_from_link(
     tx: &UnboundedSender<AppCommand>,
 ) {
     st.links.confirming = None;
+    st.confirm = None;
     st.reset_to_home();
     st.retries = 0;
     let _ = tx.send(cmd);
@@ -1443,8 +1609,10 @@ fn go_back(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
 /// Re-fetch what a restored view needs but did not bring with it. Shared by
 /// the one-step back and by a crumb click, which pops several at once.
 fn after_pop(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
-    // Going back is arriving at a page, so the count starts over here too.
+    // Going back is arriving at a page, so the count starts over here too, and
+    // an armed write about the page being left goes with it.
     st.retries = 0;
+    st.confirm = None;
     // The restored view brings its own header back, but the decoded sleeve in
     // `view_cover` belongs to whatever was opened *after* it. Re-request the
     // one this page wants; a cache hit installs it on the spot, and a page
@@ -1529,6 +1697,7 @@ fn main_rows_on_screen(st: &AppState) -> usize {
 fn select_row(st: &mut AppState, index: usize) {
     if st.main_index != index {
         st.links.confirming = None;
+        st.confirm = None;
     }
     st.main_index = index;
 }
@@ -3069,15 +3238,68 @@ mod tests {
 
         let (tx, mut rx) = channel();
         let mut theirs = page("someone");
-        toggle_saved_playlist(&mut theirs, &tx);
+        let ask = ConfirmTrigger::Key('F');
+        toggle_saved_playlist(&mut theirs, &tx, ask);
+        assert!(rx.try_recv().is_err(), "unfollowed on the first press");
+        assert!(theirs.confirm.is_some(), "the first press said nothing");
+        toggle_saved_playlist(&mut theirs, &tx, ask);
         assert!(matches!(
             rx.try_recv(),
             Ok(AppCommand::SetPlaylistSaved { ref id, saved: false }) if id == "p1"
         ));
 
         let mut mine = page("me");
-        toggle_saved_playlist(&mut mine, &tx);
+        toggle_saved_playlist(&mut mine, &tx, ask);
+        toggle_saved_playlist(&mut mine, &tx, ask);
         assert!(rx.try_recv().is_err(), "your own playlist was unsaved");
+    }
+
+    /// Saving is the one direction that acts at once: it takes nothing away,
+    /// and the control beside it is how to undo it.
+    #[test]
+    fn the_save_key_keeps_a_playlist_on_the_first_press() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.me_id = Some("me".into());
+        let mut list = TrackList::new("Blue Note", "", None);
+        list.cache_key = Some(state::playlist_key("p1"));
+        list.header.owner_id = "someone".into();
+        st.main = MainView::Tracks(list);
+        st.saved_playlists.insert("p1".into(), false);
+
+        toggle_saved_playlist(&mut st, &tx, ConfirmTrigger::Key('F'));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::SetPlaylistSaved { ref id, saved: true }) if id == "p1"
+        ));
+        assert!(st.confirm.is_none(), "saving armed a prompt");
+    }
+
+    /// The two asks have to be the same ask. A prompt armed by one control and
+    /// answered by another would fire a write nobody asked for twice.
+    #[test]
+    fn a_different_ask_disarms_rather_than_firing() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.me_id = Some("me".into());
+        let mut list = TrackList::new("Blue Note", "", None);
+        list.cache_key = Some(state::playlist_key("p1"));
+        list.header.owner_id = "someone".into();
+        st.main = MainView::Tracks(list);
+        st.saved_playlists.insert("p1".into(), true);
+
+        toggle_saved_playlist(&mut st, &tx, ConfirmTrigger::Key('F'));
+        assert!(st.confirm.is_some());
+        toggle_saved_playlist(
+            &mut st,
+            &tx,
+            ConfirmTrigger::Click(ConfirmTarget::HeaderUnfollow),
+        );
+        assert!(rx.try_recv().is_err(), "the other ask fired it");
+        assert!(
+            st.confirm.is_some(),
+            "the other ask armed nothing of its own"
+        );
     }
 
     /// Until the check answers there is nothing to flip to, so the key does
@@ -3092,7 +3314,7 @@ mod tests {
         list.header.owner_id = "someone".into();
         st.main = MainView::Tracks(list);
 
-        toggle_saved_playlist(&mut st, &tx);
+        toggle_saved_playlist(&mut st, &tx, ConfirmTrigger::Key('F'));
         assert!(rx.try_recv().is_err());
     }
 
@@ -3121,6 +3343,136 @@ mod tests {
         let mut theirs = page("someone");
         open_playlist_edit(&mut theirs);
         assert!(theirs.edit.is_none());
+    }
+
+    /// Copy is the one control a playlist you cannot edit still offers, and it
+    /// opens the same box the rest of them do — the name is yours before
+    /// anything is written.
+    #[test]
+    fn the_copy_box_opens_on_a_playlist_you_do_not_own() {
+        let mut st = copyable("someone", 2);
+        open_playlist_copy(&mut st);
+        let edit = st.edit.expect("no box on someone else's playlist");
+        assert_eq!(
+            edit.target,
+            EditTarget::Copy {
+                source_id: "p1".into()
+            }
+        );
+        assert_eq!(edit.name, "Blue Note (copy)");
+        assert_eq!(edit.description, "hard bop");
+    }
+
+    /// A copy is written from the rows spot holds, and a page holding fewer
+    /// than the playlist does would make a record short of the one it claims
+    /// to be. Refused before the name is typed, not after.
+    #[test]
+    fn a_copy_is_refused_where_the_page_cannot_see_every_row() {
+        let short = |edit: fn(&mut TrackList)| {
+            let mut st = copyable("someone", 2);
+            let MainView::Tracks(list) = &mut st.main else {
+                unreachable!()
+            };
+            edit(list);
+            st
+        };
+
+        let mut loading = short(|list| list.loading = true);
+        open_playlist_copy(&mut loading);
+        assert!(loading.edit.is_none(), "copied a page still arriving");
+        assert!(loading.toast.is_some(), "refused without saying why");
+
+        let mut partial = short(|list| list.total = Some(9));
+        open_playlist_copy(&mut partial);
+        assert!(partial.edit.is_none(), "copied a page missing rows");
+
+        let mut empty = short(|list| {
+            list.rows = state::SortedList::from_items(Vec::new());
+            list.total = Some(0);
+        });
+        open_playlist_copy(&mut empty);
+        assert!(empty.edit.is_none(), "copied nothing");
+    }
+
+    /// The copy carries the page's rows in playlist order, so the client
+    /// writes them without asking Spotify for a list it already has.
+    #[test]
+    fn a_submitted_copy_carries_the_rows_in_order() {
+        let (tx, mut rx) = channel();
+        let mut st = copyable("someone", 2);
+        open_playlist_copy(&mut st);
+        submit_edit(&mut st, &tx);
+        match rx.try_recv() {
+            Ok(AppCommand::CopyPlaylist { name, uris, .. }) => {
+                assert_eq!(name, "Blue Note (copy)");
+                assert_eq!(uris, vec!["spotify:track:t0", "spotify:track:t1"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            st.edit.is_some_and(|edit| edit.pending),
+            "the box did not go inert"
+        );
+    }
+
+    /// Delete is for your own playlist, and it asks twice — the control sits a
+    /// cell from ▶ play and there is no way back from the first press.
+    #[test]
+    fn deleting_a_playlist_asks_twice_and_only_on_your_own() {
+        let (tx, mut rx) = channel();
+        let ask = ConfirmTrigger::Key('d');
+
+        let mut mine = copyable("me", 1);
+        delete_open_playlist(&mut mine, &tx, ask);
+        assert!(rx.try_recv().is_err(), "deleted on the first press");
+        assert!(mine.confirm.is_some(), "the first press said nothing");
+        delete_open_playlist(&mut mine, &tx, ask);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::SetPlaylistSaved { ref id, saved: false }) if id == "p1"
+        ));
+
+        let mut theirs = copyable("someone", 1);
+        delete_open_playlist(&mut theirs, &tx, ask);
+        delete_open_playlist(&mut theirs, &tx, ask);
+        assert!(rx.try_recv().is_err(), "deleted someone else's playlist");
+    }
+
+    /// Walking away is an answer. A prompt left standing over a page nobody is
+    /// on any more would fire on a keypress meant for something else.
+    #[test]
+    fn leaving_the_page_calls_off_an_armed_write() {
+        let (tx, _rx) = channel();
+        let ask = ConfirmTrigger::Key('d');
+
+        let mut st = copyable("me", 1);
+        delete_open_playlist(&mut st, &tx, ask);
+        select_row(&mut st, 1);
+        assert!(st.confirm.is_none(), "moving off the row kept it armed");
+
+        delete_open_playlist(&mut st, &tx, ask);
+        go_home(&mut st);
+        assert!(st.confirm.is_none(), "going home kept it armed");
+    }
+
+    /// A playlist page holding `count` records, owned by `owner`.
+    fn copyable(owner: &str, count: usize) -> AppState {
+        let mut st = connected();
+        st.me_id = Some("me".into());
+        let mut list = TrackList::new("Blue Note", "by me", Some(count as u32));
+        list.cache_key = Some(state::playlist_key("p1"));
+        list.header.owner_id = owner.into();
+        list.header.description = "hard bop".into();
+        list.rows = state::SortedList::from_items(
+            (0..count)
+                .map(|i| Track {
+                    uri: format!("spotify:track:t{i}"),
+                    ..track("One", None)
+                })
+                .collect(),
+        );
+        st.main = MainView::Tracks(list);
+        st
     }
 
     /// A blank name is refused here rather than by Spotify: the round trip

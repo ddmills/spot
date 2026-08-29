@@ -671,11 +671,22 @@ const PLAY_PILL: &str = "▶ play";
 /// recorded hit rect away from what the terminal draws.
 const SHUFFLE_PILL: &str = "▶ shuffle";
 
-/// The playlist controls, beside ▶ play. `★`/`☆` rather than words, matching
-/// the mark a track row already carries for the same idea.
-const SAVED_PILL: &str = "★ saved";
+/// The playlist controls, beside ▶ play. Each one says the action it takes
+/// rather than the state it is in: a control labelled `★ saved` does the
+/// opposite of what it reads, which is one thing to work out before clicking.
+/// The `★`/`☆` pair stays on track rows, where it genuinely is a state mark.
 const SAVE_PILL: &str = "☆ save";
+const UNFOLLOW_PILL: &str = "✕ unfollow";
 const EDIT_PILL: &str = "edit";
+const COPY_PILL: &str = "copy";
+/// Spotify spells deleting your own playlist as unfollowing it. The control
+/// says the word people came for, and arms before it acts — see
+/// [`crate::app::state::Confirm`].
+const DELETE_PILL: &str = "✕ delete";
+
+/// Controls a narrow band gives up, in the order [`HeaderControls::fitted`]
+/// sheds them.
+const DROPPABLE_PILLS: usize = 3;
 
 /// The share control every header band carries, right of ▶ shuffle. It copies
 /// the link to the page itself, where a track row's `⧉` copies the link to one
@@ -692,17 +703,65 @@ fn card_pills_min_w() -> usize {
 /// because only the state knows them and the band is handed a view.
 #[derive(Default, Clone, Copy)]
 struct HeaderControls {
-    /// Draw the save control, and whether it reads as already saved. `None`
-    /// on a page that is not a playlist, on one still being asked about, and
-    /// on one you own — Spotify spells deleting your own playlist as unsaving
-    /// it, and that does not belong under one keypress beside ▶ play.
-    save: Option<bool>,
+    /// Draw the save control. Off on a playlist already in the library, on one
+    /// still being asked about, and on one you own.
+    save: bool,
+    /// Draw the unfollow control: the same write as [`Self::save`], said in
+    /// the direction it acts in. Off on a playlist you own, where the word is
+    /// delete.
+    unfollow: bool,
     /// Draw the edit control. Only a playlist you own takes it; Spotify
     /// refuses the change for any other.
     edit: bool,
+    /// Draw the copy control. Every playlist takes it — copying one you cannot
+    /// edit is what makes it yours.
+    copy: bool,
+    /// Draw the delete control. Only a playlist you own.
+    delete: bool,
     /// Draw the share control. Off on a page with no link of its own to give —
     /// see [`AppState::open_page_link`].
     share: bool,
+}
+
+impl HeaderControls {
+    /// Cells this set of controls spends, each with the space before it.
+    fn width(self) -> usize {
+        let pill = |on: bool, label: &str| match on {
+            true => 1 + super::table::width(label),
+            false => 0,
+        };
+        pill(self.share, SHARE_PILL)
+            + pill(self.copy, COPY_PILL)
+            + pill(self.edit, EDIT_PILL)
+            + pill(self.save, SAVE_PILL)
+            + pill(self.unfollow, UNFOLLOW_PILL)
+            + pill(self.delete, DELETE_PILL)
+    }
+
+    /// The controls that fit beside ▶ play in `width` cells, `spent` of which
+    /// the play and shuffle pills already hold.
+    ///
+    /// A pill drawn past the right edge is clipped by
+    /// [`crate::ui::table::segment`] to an empty rect: it is still painted but
+    /// can never be clicked, which is worse than not drawing it. So the row
+    /// sheds controls until what is left fits, in a fixed order — the share
+    /// link is on every page and repeats the crumb trail, and copy and edit
+    /// both have a page of their own to reach them from, where taking a
+    /// playlist out of the library has only this row.
+    fn fitted(mut self, width: u16, spent: u16) -> Self {
+        let room = (width as usize).saturating_sub(spent as usize);
+        for step in 0..DROPPABLE_PILLS {
+            if self.width() <= room {
+                break;
+            }
+            match step {
+                0 => self.share = false,
+                1 => self.copy = false,
+                _ => self.edit = false,
+            }
+        }
+        self
+    }
 }
 
 /// What the open page offers beyond playing itself.
@@ -716,15 +775,22 @@ fn header_controls(st: &AppState) -> HeaderControls {
     };
     if st.owns_open_playlist() {
         return HeaderControls {
-            save: None,
             edit: true,
+            copy: true,
+            delete: true,
             share,
+            ..Default::default()
         };
     }
+    // Unknown is not "not saved": until the library check answers, neither
+    // control is honest, so the page shows neither.
+    let saved = st.saved_playlists.get(id).copied();
     HeaderControls {
-        save: st.saved_playlists.get(id).copied(),
-        edit: false,
+        save: saved == Some(false),
+        unfollow: saved == Some(true),
+        copy: true,
         share,
+        ..Default::default()
     }
 }
 
@@ -748,22 +814,25 @@ fn pill_segment(
     )
 }
 
-/// The save control. Accent when the playlist is in the library and dim when
-/// it is not — the same pair of styles a track row's `★` uses to say it.
-fn save_segment(
+/// A pill in a style of its own, for the controls that take something away.
+/// [`theme::warn`] keeps them from reading as one more neutral verb in a row
+/// that sits one cell from ▶ play.
+fn warn_pill_segment(
     spans: &mut Vec<Span<'static>>,
     x: &mut u16,
     area: Rect,
     mouse: Option<Position>,
-    saved: bool,
+    label: &'static str,
 ) -> Rect {
     spans.push(Span::raw(" "));
     *x = x.saturating_add(1);
-    let (label, style) = match saved {
-        true => (SAVED_PILL, theme::accent()),
-        false => (SAVE_PILL, theme::dim()),
-    };
-    super::table::segment(spans, x, area, mouse, vec![Span::styled(label, style)])
+    super::table::segment(
+        spans,
+        x,
+        area,
+        mouse,
+        vec![Span::styled(label, theme::warn())],
+    )
 }
 
 /// Append the shuffle pill after a band's ▶ play and return its hit rect.
@@ -1592,16 +1661,28 @@ fn header_band(
         vec![Span::styled(PLAY_PILL, accent)],
     );
     hit.header_shuffle_btn = shuffle_segment(&mut spans, &mut x, play_area, mouse);
+    let controls = controls.fitted(play_area.width, x - play_area.x);
     hit.header_share_btn = match controls.share {
         true => pill_segment(&mut spans, &mut x, play_area, mouse, SHARE_PILL),
         false => Rect::default(),
     };
-    hit.header_save_btn = match controls.save {
-        Some(saved) => save_segment(&mut spans, &mut x, play_area, mouse, saved),
-        None => Rect::default(),
+    hit.header_copy_btn = match controls.copy {
+        true => pill_segment(&mut spans, &mut x, play_area, mouse, COPY_PILL),
+        false => Rect::default(),
     };
     hit.header_edit_btn = match controls.edit {
         true => pill_segment(&mut spans, &mut x, play_area, mouse, EDIT_PILL),
+        false => Rect::default(),
+    };
+    // One rect for both halves of the same write: the label says which way it
+    // goes, and the click handler reads the library rather than the pill.
+    hit.header_save_btn = match (controls.save, controls.unfollow) {
+        (true, _) => pill_segment(&mut spans, &mut x, play_area, mouse, SAVE_PILL),
+        (_, true) => warn_pill_segment(&mut spans, &mut x, play_area, mouse, UNFOLLOW_PILL),
+        _ => Rect::default(),
+    };
+    hit.header_delete_btn = match controls.delete {
+        true => warn_pill_segment(&mut spans, &mut x, play_area, mouse, DELETE_PILL),
         false => Rect::default(),
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
@@ -3570,24 +3651,76 @@ mod tests {
         assert!(lines[5].contains("▶ play"), "{lines:#?}");
     }
 
-    /// The save control is for a playlist someone else made. Your own carries
-    /// `edit` instead: Spotify has no unfollow for an owned playlist that is
-    /// not a delete, and that is not what a pill beside ▶ play should mean.
+    /// A playlist someone else made can be kept or let go; your own can be
+    /// edited or deleted. Both can be copied, which is what makes theirs into
+    /// yours.
     #[test]
     fn the_playlist_controls_follow_who_owns_it() {
         let mut st = playlist_state();
         st.me_id = Some("me".into());
         st.saved_playlists.insert("dw".into(), true);
         let theirs = render(&mut st, 90, 22);
-        assert!(theirs[8].contains("★ saved"), "{theirs:#?}");
+        assert!(theirs[8].contains("✕ unfollow"), "{theirs:#?}");
+        assert!(theirs[8].contains("copy"), "{theirs:#?}");
         assert!(!theirs[8].contains("edit"));
+        assert!(!theirs[8].contains("delete"));
 
         if let MainView::Tracks(list) = &mut st.main {
             list.header.owner_id = "me".into();
         }
         let mine = render(&mut st, 90, 22);
         assert!(mine[8].contains("edit"), "{mine:#?}");
+        assert!(mine[8].contains("copy"), "{mine:#?}");
+        assert!(mine[8].contains("✕ delete"), "{mine:#?}");
         assert!(!mine[8].contains("save"));
+        assert!(!mine[8].contains("unfollow"));
+    }
+
+    /// A playlist in the library offers the way out of it, and one that is not
+    /// offers the way in. One control, labelled with the action it takes
+    /// rather than the state it is in.
+    #[test]
+    fn the_save_control_says_which_way_it_goes() {
+        let mut st = playlist_state();
+        st.me_id = Some("me".into());
+        st.saved_playlists.insert("dw".into(), false);
+        let lines = render(&mut st, 90, 22);
+        assert!(lines[8].contains("☆ save"), "{lines:#?}");
+        assert!(!lines[8].contains("unfollow"));
+    }
+
+    /// Every control drawn can be clicked. A pill painted past the right edge
+    /// records an empty rect, which is a button that does nothing — so a band
+    /// with no room sheds controls instead, widest concern last.
+    #[test]
+    fn a_narrow_band_drops_controls_rather_than_drawing_dead_ones() {
+        for width in [40u16, 50, 60, 70, 90, 140] {
+            let mut st = playlist_state();
+            st.me_id = Some("me".into());
+            if let MainView::Tracks(list) = &mut st.main {
+                list.header.owner_id = "me".into();
+            }
+            let lines = render(&mut st, width, 22);
+            let band = lines.iter().find(|l| l.contains("▶ play")).cloned();
+            let Some(band) = band else { continue };
+            for (label, rect) in [
+                ("⧉ share", st.hit.header_share_btn),
+                ("copy", st.hit.header_copy_btn),
+                ("edit", st.hit.header_edit_btn),
+                ("✕ delete", st.hit.header_delete_btn),
+            ] {
+                assert_eq!(
+                    band.contains(label),
+                    !rect.is_empty(),
+                    "{label} at {width}: {band:?}"
+                );
+            }
+            // The controls that take something away outlive the ones that do
+            // not, so a band with room for one control keeps delete.
+            if band.contains("⧉ share") {
+                assert!(band.contains("✕ delete"), "{width}: {band:?}");
+            }
+        }
     }
 
     /// A playlist nothing has answered about yet draws no save control. A

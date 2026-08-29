@@ -138,6 +138,21 @@ pub enum AppCommand {
         uri: String,
         seq: u64,
     },
+    /// Make a playlist holding what another one holds, from the header band's
+    /// `copy` control.
+    ///
+    /// The rows ride along rather than being fetched again: the page the copy
+    /// was asked from already holds every one of them, and `event::copyable_tracks`
+    /// refuses the copy where it does not.
+    ///
+    /// `seq` is the opening of the edit box this answers, as it is above.
+    CopyPlaylist {
+        name: String,
+        description: String,
+        /// Every record to put on it, in playlist order.
+        uris: Vec<String>,
+        seq: u64,
+    },
     /// Read what these playlists hold, for the box's marks. Carries no track:
     /// the whole playlist is cached, so one walk answers every record.
     ///

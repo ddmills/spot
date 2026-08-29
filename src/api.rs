@@ -19,6 +19,9 @@ pub const PAGE_LIMIT: u32 = 50;
 /// Pages of an artist's catalogue to walk before giving up on the rest.
 const ARTIST_ALBUM_PAGES: u32 = 4;
 const MAX_PLAYLISTS: u32 = 1000;
+/// Tracks Spotify takes in one add. A longer list is written in chunks of
+/// this, each of which lands on its own.
+const ADD_LIMIT: u32 = 100;
 
 /// The signed-in account, as much of it as spot needs.
 pub struct Account {
@@ -522,6 +525,48 @@ impl Api {
             .await
             .context("failed to make the playlist")?;
         Ok(playlist_from_full(&playlist))
+    }
+
+    /// Put many tracks on the end of a playlist, in the order given.
+    ///
+    /// Returns the playlist's new snapshot id, on the same terms as
+    /// [`Self::set_track_on_playlist`], and how many landed — a walk that
+    /// fails part way has already written every chunk before it, and saying so
+    /// is worth more than pretending nothing happened.
+    pub async fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        uris: &[String],
+    ) -> (Result<String>, usize) {
+        let playlist = match PlaylistId::from_id(playlist_id) {
+            Ok(id) => id,
+            Err(e) => return (Err(e.into()), 0),
+        };
+        let mut snapshot_id = String::new();
+        let mut added = 0;
+        for chunk in uris.chunks(ADD_LIMIT as usize) {
+            let tracks: Result<Vec<PlayableId>> = chunk
+                .iter()
+                .map(|uri| Ok(PlayableId::Track(TrackId::from_uri(uri)?)))
+                .collect();
+            let tracks = match tracks {
+                Ok(tracks) => tracks,
+                Err(e) => return (Err(e), added),
+            };
+            match self
+                .client
+                .playlist_add_items(playlist.clone(), tracks, None)
+                .await
+                .context("failed to add the tracks to the playlist")
+            {
+                Ok(result) => {
+                    snapshot_id = result.snapshot_id;
+                    added += chunk.len();
+                }
+                Err(e) => return (Err(e), added),
+            }
+        }
+        (Ok(snapshot_id), added)
     }
 
     /// Put one track on a playlist, or take every copy of it off.

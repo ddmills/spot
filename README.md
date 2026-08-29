@@ -201,7 +201,19 @@ on one click, anywhere on it. Until Spotify is connected the first three are not
 a **Spotify** row is: opening it signs you in, and its right-hand end says where that got
 to — `not connected`, `connecting…`, or `no Premium` for an account that cannot stream.
 An **Update available** row joins them when a newer release exists — see
-[Updating](#updating). From a playlist, a track row leads to its album or artist. Every
+[Updating](#updating).
+
+A playlist page carries its own controls beside `▶ play`, and each says the action it
+takes rather than the state it is in. On someone else's playlist that is `☆ save` or
+`✕ unfollow`; on your own it is `edit` — the name and the blurb together — and
+`✕ delete`. Both kinds carry `copy`, which is how someone else's playlist becomes one
+you can edit: it makes a playlist of your own holding the same records, and refuses
+rather than making a short one where spot cannot see every item. `✕ unfollow` and
+`✕ delete` ask twice — the first click arms them and says so, `Esc` calls it off. A
+narrow window sheds the controls it has no room for rather than drawing ones that
+cannot be clicked, and the two that take something away are the last to go.
+
+From a playlist, a track row leads to its album or artist. Every
 page spells the path that reached it across its top row — `HOME  ›  MUSE  ›  BLACK
 HOLES` — with the page you're on at the head and every step before it clickable. A crumb
 is a jump rather than a run of single steps: clicking `HOME` from three pages deep
@@ -318,8 +330,10 @@ is a worse answer than a row that says why it won't play.
 | `x` | play without opening (a playlist row, or the current view) |
 | `a` | play the selected track next |
 | `L` | like / unlike the track — the selected row, or the playing one in the player view; on a station row, save it |
-| `F` | save / unsave the playlist you are on — not shown on your own, where unsaving is how Spotify spells deleting |
+| `F` | save / unfollow the playlist you are on — not your own, where the word is delete |
 | `E` | edit the name and blurb of a playlist you own |
+| `C` | copy the playlist you are on into one of your own |
+| `d` | delete a playlist you own — press again to confirm, `Esc` to cancel |
 | `b / B` | open the selected track's album / artist |
 | `o / O` | cycle sort column / flip sort direction (every list, or click a column header) |
 | `/` | search Spotify and the radio directory at once, or paste a Spotify link |
