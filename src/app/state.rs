@@ -1728,6 +1728,15 @@ impl EditField {
     }
 }
 
+/// What the edit box is about: a playlist that exists, or one it makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditTarget {
+    /// Rename a playlist that exists.
+    Existing(String),
+    /// Make one, and put this record on it once it does.
+    New { uri: String },
+}
+
 /// The open "edit playlist" box: which playlist it is about, and what has
 /// been typed into its two fields.
 ///
@@ -1736,8 +1745,8 @@ impl EditField {
 /// would lose the thing being edited.
 #[derive(Debug, Clone)]
 pub struct PlaylistEdit {
-    /// The playlist the change applies to, fixed when the box opens.
-    pub id: String,
+    /// What sending the box does, fixed when it opens.
+    pub target: EditTarget,
     pub name: String,
     pub description: String,
     pub field: EditField,
@@ -1989,6 +1998,9 @@ pub struct HitAreas {
     /// The add-to-playlist box's rows. One line each, so the row is
     /// `offset + (pos.y - rect.y)` against [`AppState::picker_rows`].
     pub picker_list: Rect,
+    /// The add-to-playlist box's `+ new playlist` control, which trades that
+    /// box for the edit box in its create mode.
+    pub picker_new: Rect,
     /// The playing station's country, on the deck's station row. Opens the
     /// directory's page for that country. Empty when the directory gave us no
     /// code to ask by — the name is still printed, it just leads nowhere, the
@@ -2003,6 +2015,10 @@ pub struct HitAreas {
     /// only while the stream has stood down for a record off the station's
     /// own list; empty every other frame.
     pub radio_live_btn: Rect,
+    /// The `vol` / `mut` label left of the slider. Clicking it silences the
+    /// player and puts the level back, so the four cells the word occupies are
+    /// a control of their own rather than the slider's left end.
+    pub volume_label: Rect,
     /// Volume slider track only; click position maps linearly to percent.
     pub volume_slider: Rect,
     /// The playing queue's name on the deck's context row. From the bottom
@@ -2188,6 +2204,12 @@ pub struct AppState {
     /// has to live here and be re-tested against fresh rects during draw.
     pub mouse_pos: Option<Position>,
 
+    /// The level to restore when the `mut` label is clicked again, and the flag
+    /// that the label reads `mut` at all. `None` means not muted. Kept here
+    /// rather than on [`Playback`] because a station carries its own volume and
+    /// the one slider drives both engines.
+    pub muted_volume: Option<u8>,
+
     pub input_mode: InputMode,
     pub input_buffer: String,
 
@@ -2362,6 +2384,7 @@ impl AppState {
             hit: HitAreas::default(),
             last_main_click: None,
             mouse_pos: None,
+            muted_volume: None,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             picker: None,

@@ -11,12 +11,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use super::table::{apply_selection, centered, draw_scrollbar, fit, spinner};
+use super::table::{apply_selection, centered, draw_scrollbar, fit, segment, spinner};
 use super::theme;
 use crate::app::state::{AppState, PICKER_ROWS, PlaylistPicker};
 
 const BOX_W: u16 = 44;
 const PLACEHOLDER: &str = "search playlists";
+const NEW_PILL: &str = "+ new playlist";
 
 /// The mark at the head of a row, in the four states a row can be in. All one
 /// cell wide, so the names beside them line up and nothing moves under the
@@ -40,7 +41,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     // The box is as tall as it has rows to show, so a handful of playlists get
     // a handful of lines rather than a box of empty ones.
     let rows = (matches.len().max(1) as u16).min(PICKER_ROWS as u16);
-    let height = rows + 1 + u16::from(status.is_some()) + 2;
+    let height = rows + 1 + 1 + u16::from(status.is_some()) + 2;
     let area = centered(frame.area(), BOX_W, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -68,21 +69,45 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
 
     let list = Rect {
         y: field.y + 1,
-        height: inner.height.saturating_sub(1 + u16::from(status.is_some())),
+        height: inner.height.saturating_sub(2 + u16::from(status.is_some())),
         ..inner
     };
     draw_rows(frame, list, state, &picker, &matches);
+
+    let controls = Rect {
+        y: list.y + list.height,
+        height: 1,
+        ..inner
+    };
+    draw_controls(frame, controls, state, mouse);
 
     if let Some(line) = status {
         frame.render_widget(
             Paragraph::new(line),
             Rect {
-                y: list.y + list.height,
+                y: controls.y + 1,
                 height: 1,
                 ..inner
             },
         );
     }
+}
+
+/// The way out of the box when nothing in it is what you wanted: a control
+/// that makes the playlist the query was looking for.
+fn draw_controls(frame: &mut Frame, controls: Rect, state: &mut AppState, mouse: Option<Position>) {
+    // Held one cell in, so the control starts under the rows above it.
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut x = controls.x + 1;
+    state.hit.picker_new = segment(
+        &mut spans,
+        &mut x,
+        controls,
+        mouse,
+        vec![Span::styled(NEW_PILL, theme::accent())],
+    );
+    spans.push(Span::styled("   ctrl+n", theme::dim()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), controls);
 }
 
 /// The field, in the browse screen's search-row idiom: the fill is what makes
@@ -423,6 +448,26 @@ mod tests {
         let mut st = answered();
         let text = body(&screen(&mut st));
         assert!(!text.contains("checking"), "{text}");
+    }
+
+    /// The way out of the box is drawn and can be clicked.
+    #[test]
+    fn the_box_offers_a_new_playlist() {
+        let mut st = answered();
+        let text = body(&screen(&mut st));
+        assert!(text.contains(NEW_PILL), "{text}");
+        assert!(!st.hit.picker_new.is_empty());
+    }
+
+    /// And most of all on the box that has nothing to offer, which is where
+    /// the control is the only thing left to press.
+    #[test]
+    fn a_box_that_matches_nothing_still_offers_a_new_playlist() {
+        let mut st = open("zzz");
+        let text = body(&screen(&mut st));
+        assert!(text.contains("no match"), "{text}");
+        assert!(text.contains(NEW_PILL), "{text}");
+        assert!(!st.hit.picker_new.is_empty());
     }
 
     /// Prints the box with row numbers, for eyeballing the layout.

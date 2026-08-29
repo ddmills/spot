@@ -24,6 +24,7 @@ use crate::cover::{Cover, CoverCache};
 use crate::link::Link;
 use crate::radio::api::RadioApi;
 use crate::radio::player::RadioPlayer;
+use crate::session;
 
 /// Where a streamed track fetch pulls its pages from.
 ///
@@ -117,6 +118,18 @@ const LOAD_HEARD_WITHIN: Duration = Duration::from_secs(2);
 /// as the failures arrive, and the queue would be at its end before the toast
 /// had finished drawing.
 const UNAVAILABLE_STREAK_CAP: u8 = 3;
+
+/// How long after the connection dropped a record still starts again by
+/// itself.
+///
+/// A blip while you are listening is one the record should come back from; a
+/// laptop that slept for an hour is not — music starting by itself in whatever
+/// room it was opened in is not what the last key pressed meant. The position
+/// is kept either way, so one press picks it up.
+const RESUME_WITHIN: Duration = Duration::from_secs(60);
+
+/// The longest wait between attempts at a connection that will not come.
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// How many stations a seek tries before it gives up.
 ///
@@ -279,12 +292,38 @@ fn set_cached_membership(st: &mut AppState, playlist_id: &str, track_id: &str, o
 pub const DEFAULT_VOLUME_PCT: u8 = 50;
 
 /// The Spotify streaming engine. Only a Premium account gets one.
+///
+/// Cloned only into locals that die with the call that made them. A clone
+/// parked anywhere outliving the engine would defeat the thread join
+/// [`retire`] relies on.
 #[derive(Clone)]
 pub struct Engine {
     /// Held for the shutdown: stopping the player does not close the
     /// connection underneath it.
     pub session: Session,
     pub player: Arc<Player>,
+}
+
+impl std::fmt::Debug for Engine {
+    /// Hand-written for the reason [`Spotify`]'s is: neither librespot's
+    /// session nor its player is `Debug`, and [`AppCommand`] carries an engine.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Engine")
+    }
+}
+
+/// Put a streaming engine down, and wait for its thread to be gone.
+///
+/// `Player`'s own `Drop` joins its thread, and that thread can be parked in a
+/// sink write for as long as the device takes to drain — see
+/// [`crate::audio_sink::SpotSink::write`]. That is not a wait a runtime worker
+/// may take, so the join goes to the blocking pool. Awaited rather than
+/// detached: librespot opens the output device when a `Player` is built, so
+/// the old one has to be closed before the next is asked for.
+async fn retire(engine: Engine) {
+    engine.player.stop();
+    engine.session.shutdown();
+    let _ = tokio::task::spawn_blocking(move || drop(engine)).await;
 }
 
 /// Everything a finished sign-in hands the client.
@@ -324,9 +363,9 @@ pub struct Client {
     /// up in. Spent by [`AppCommand::SpotifyConnected`]; see
     /// [`Client::open_link`].
     pending_link: Option<Link>,
-    /// librespot's on-disk cache. The client only writes the volume into it;
-    /// the credentials and the audio are librespot's own business. Held
-    /// directly rather than through the session, which need not exist.
+    /// librespot's on-disk cache: the volume the client writes, and the
+    /// credentials a reconnect spends. Held directly rather than through the
+    /// session, which need not exist.
     volume_cache: LibrespotCache,
     /// librespot's soft mixer: the volume actually being applied, readable
     /// and writable without a round trip. It needs no session, so radio has
@@ -400,8 +439,16 @@ pub struct Client {
     /// librespot leaves its player parked in `Loading` after a failed load, and
     /// a park has nothing to resume: `play` on one is silently dropped, which
     /// is a `▶ play` that does nothing at all. A load is the only command that
-    /// gets out of it, so this says which of the two the pill means.
+    /// gets out of it, so this says which of the two the pill means. A rebuilt
+    /// engine reads the same way: it has nothing loaded either.
     spotify_wedged: bool,
+    /// The PCM tap both engines write into. Held rather than handed straight
+    /// to the radio player, because rebuilding the Spotify engine needs it
+    /// again — see [`Client::start_reconnect`].
+    audio_tap: Arc<crate::audio_tap::AudioTap>,
+    /// The connection that died and the attempt to replace it. `None` when
+    /// there is nothing wrong with the one there is.
+    reconnect: Option<Reconnect>,
 }
 
 /// A `player.load` that has been asked for and has not made sound yet.
@@ -415,6 +462,71 @@ struct LoadAttempt {
     /// When the load was asked for, moved forward by a retry.
     at: Instant,
     retried: bool,
+}
+
+/// A streaming connection that has gone, and the work to build another.
+///
+/// librespot cannot reuse an invalidated session, so the engine goes down
+/// whole and a new one takes its place. Held for as long as that takes, which
+/// offline is forever.
+struct Reconnect {
+    /// When the connection was found dead, for the resume window.
+    since: Instant,
+    /// Attempts that have failed, for the backoff.
+    attempts: u32,
+    /// When the next attempt may start. `None` while one is in flight, which
+    /// is what keeps a tick from starting a second.
+    next_try: Option<Instant>,
+    /// Whether the deck was playing when the connection went.
+    was_playing: bool,
+    /// A play asked for while there was nothing to play it with. It waits for
+    /// the new engine rather than being refused, so the press is not lost.
+    pressed: bool,
+    /// Where the record was, so a blip picks it back up rather than starting
+    /// the track again. Zero for a press, which means the top of whatever it
+    /// chose.
+    at_ms: u32,
+    /// The attempt in flight, so quitting does not leave one building a player
+    /// and opening a device behind a UI that is already gone.
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Who asked for a load: the listener, or the queue walking on by itself.
+///
+/// The unavailable count turns on this. The cap exists to stop a run of
+/// failures walking the whole queue on its own, and a deliberate press is not
+/// part of any run — without the distinction the first failure after a wedge
+/// re-wedges on the count it inherited, and every track after it reads as
+/// unavailable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Asked {
+    /// A key, a click, or a media button.
+    Pressed,
+    /// The end of a track, or the step past one that would not play.
+    Queue,
+}
+
+/// The unavailable count a load starts from.
+fn streak_after(asked: Asked, streak: u8) -> u8 {
+    match asked {
+        Asked::Pressed => 0,
+        Asked::Queue => streak,
+    }
+}
+
+/// How long to wait before asking for a connection again.
+fn reconnect_backoff(attempts: u32) -> Duration {
+    match attempts {
+        0 | 1 => Duration::from_secs(5),
+        2 => Duration::from_secs(15),
+        3 => Duration::from_secs(30),
+        _ => RECONNECT_BACKOFF_CAP,
+    }
+}
+
+/// Whether a connection that has come back should start the record itself.
+fn resume_on_reconnect(r: &Reconnect, now: Instant) -> bool {
+    r.pressed || (r.was_playing && now.saturating_duration_since(r.since) < RESUME_WITHIN)
 }
 
 /// What [`Self::check_spotify_stream`] should do about a load in flight.
@@ -498,7 +610,7 @@ impl Client {
             tx,
             cache: Arc::new(Mutex::new(HashMap::new())),
             radio_api: RadioApi::new(http.clone()),
-            radio_player: RadioPlayer::new(audio_tap),
+            radio_player: RadioPlayer::new(Arc::clone(&audio_tap)),
             http,
             covers: Arc::new(Mutex::new(CoverCache::default())),
             zoom_covers: Arc::new(Mutex::new(CoverCache::with_capacity(1))),
@@ -511,6 +623,8 @@ impl Client {
             spotify_load: None,
             unavailable_streak: 0,
             spotify_wedged: false,
+            audio_tap,
+            reconnect: None,
         };
         (client, shutdown_done)
     }
@@ -540,6 +654,9 @@ impl Client {
                     None => break,
                 },
                 _ = tick.tick() => {
+                    // Before the stream check, so a connection that has gone
+                    // is answered as that rather than as a stalled load.
+                    self.check_spotify_session();
                     self.check_spotify_stream();
                     self.check_radio_stream();
                     self.probe_off_air_station();
@@ -555,12 +672,31 @@ impl Client {
         self.engine.as_ref().map(|e| &e.player)
     }
 
+    /// Whether the streaming connection is gone.
+    ///
+    /// librespot 0.8 invalidates a session on a closed connection or a missed
+    /// keep-alive — a laptop that slept, a network that blinked — and cannot
+    /// reuse one once it has. Every load through a dead session comes back as
+    /// `PlayerEvent::Unavailable`, which is what a region-locked track reports
+    /// too, so this is the only thing that tells the two apart.
+    fn session_lost(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.session.is_invalid())
+    }
+
     async fn handle(&mut self, cmd: AppCommand) -> Result<()> {
         use AppCommand::*;
         match cmd {
             SpotifyConnected(spotify) => {
                 self.api = Some(spotify.api);
+                // Dropping an engine joins its player thread, which is not a
+                // wait the command loop may take: a second sign-in from Home
+                // would otherwise stall every other command behind it.
+                if let Some(old) = self.engine.take() {
+                    tokio::spawn(retire(old));
+                }
+                self.abandon_reconnect();
                 self.engine = spotify.engine;
+                self.spotify_wedged = false;
                 // A link that arrived before there was an account to look it
                 // up in. A launch carrying one sends it at startup, seconds
                 // ahead of the sign-in it needs — see [`Client::open_link`].
@@ -568,6 +704,7 @@ impl Client {
                     self.open_link(target).await;
                 }
             }
+            SpotifyReconnected(engine) => self.spotify_reconnected(engine),
             // Whichever engine owns the device owns the transport. Radio is
             // checked first everywhere below for that reason: while a station
             // is on, the Spotify player is paused and driving it would start
@@ -613,7 +750,10 @@ impl Client {
             // `Loading` and drops a `play` sent to a park, so the pill would do
             // nothing at all; a load is what gets out of it. The same rule the
             // arm above follows for a station that would not connect.
-            PlayPause if self.spotify_wedged => self.load_current(),
+            PlayPause if self.spotify_wedged => {
+                let at = self.seek_target(|pos, _| pos).unwrap_or(0) as u32;
+                self.load_current_from(Asked::Pressed, at);
+            }
             PlayPause => {
                 let mut st = self.state.write();
                 let AppState {
@@ -641,9 +781,13 @@ impl Client {
             }
             VolumeRel(delta) if self.station_on_air() => {
                 let current = self.playback_volume();
+                self.end_mute();
                 self.set_radio_volume((i16::from(current) + i16::from(delta)).clamp(0, 100) as u8);
             }
-            SetVolume(pct) if self.station_on_air() => self.set_radio_volume(pct.min(100)),
+            SetVolume(pct) if self.station_on_air() => {
+                self.end_mute();
+                self.set_radio_volume(pct.min(100));
+            }
             // A broadcast has no position to seek to and no queue to shuffle,
             // so these have nothing to do while a station is on. The key
             // handler already turns them into a toast, but it is not the only
@@ -666,7 +810,7 @@ impl Client {
             }
             Next => {
                 if self.advance_queue() {
-                    self.load_current();
+                    self.load_current(Asked::Pressed);
                 }
             }
             Prev => {
@@ -675,12 +819,12 @@ impl Client {
                     st.queue.as_mut().and_then(|q| q.back()).is_some()
                 };
                 if stepped {
-                    self.load_current();
+                    self.load_current(Asked::Pressed);
                 }
             }
             TrackEnded => {
                 if self.advance_queue() {
-                    self.load_current();
+                    self.load_current(Asked::Queue);
                 }
             }
             TrackUnavailable { uri } => self.track_unavailable(&uri),
@@ -691,7 +835,7 @@ impl Client {
                     st.queue.as_mut().and_then(|q| q.jump(i)).is_some()
                 };
                 if jumped {
-                    self.load_current();
+                    self.load_current(Asked::Pressed);
                 }
             }
             SeekRel(delta_ms) => {
@@ -711,9 +855,14 @@ impl Client {
                 // with no round trip behind it.
                 let current = self.local_volume_pct();
                 let new_pct = (current as i16 + delta as i16).clamp(0, 100) as u8;
+                self.end_mute();
                 self.set_volume(new_pct);
             }
-            SetVolume(pct) => self.set_volume(pct.min(100)),
+            SetVolume(pct) => {
+                self.end_mute();
+                self.set_volume(pct.min(100));
+            }
+            ToggleMute => self.toggle_mute(),
             ToggleShuffle => {
                 let mut st = self.state.write();
                 let AppState {
@@ -776,6 +925,12 @@ impl Client {
                 description,
                 seq,
             } => self.edit_playlist_details(id, name, description, seq).await,
+            CreatePlaylist {
+                name,
+                description,
+                uri,
+                seq,
+            } => self.create_playlist(name, description, uri, seq).await,
             CachePlaylistTracks { playlist_ids } => self.cache_playlist_tracks(playlist_ids).await,
             OpenLink(link) => self.open_link(link).await,
             Search(query) => self.search(query).await,
@@ -965,6 +1120,7 @@ impl Client {
             // inherit it. Before anything has played there is no playback to
             // stamp, so install one; `load_current` rebuilds it right after,
             // inheriting the bit.
+            let mode_on = st.playback.as_ref().is_some_and(|pb| pb.shuffle);
             if shuffle {
                 match st.playback.as_mut() {
                     Some(pb) => pb.shuffle = true,
@@ -973,20 +1129,22 @@ impl Client {
                     }
                 }
             }
-            let shuffle = shuffle || st.playback.as_ref().is_some_and(|pb| pb.shuffle);
             let mut q = Queue::new(tracks, start, name);
             q.source_key = key;
             q.loading = loading;
-            // Shuffle is a mode, not a property of one queue: left on, a new
-            // play comes up shuffled too, with the clicked track playing
-            // first — exactly what `Queue::shuffle` guarantees.
+            // Two different intents. A shuffle control chose no track, so the
+            // whole list mixes and any row of it can come up first. An
+            // ordinary play under a shuffle mode left on chose one, and
+            // `Queue::shuffle` keeps that track first.
             if shuffle {
+                q.start_shuffled();
+            } else if mode_on {
                 q.shuffle(true);
             }
             st.set_queue(Some(q));
         }
         self.check_queue_liked();
-        self.load_current();
+        self.load_current(Asked::Pressed);
     }
 
     /// Ask whether the queue's rows are saved, so the player's list can draw
@@ -1146,7 +1304,34 @@ impl Client {
     /// match, in the same breath. There is no round trip: the deck describes
     /// the new track on the next frame, and the audio follows as fast as
     /// librespot can fetch it.
-    fn load_current(&mut self) {
+    fn load_current(&mut self, asked: Asked) {
+        self.load_current_from(asked, 0);
+    }
+
+    /// [`Self::load_current`], picking the record up where it was left.
+    fn load_current_from(&mut self, asked: Asked, position_ms: u32) {
+        self.unavailable_streak = streak_after(asked, self.unavailable_streak);
+        // The connection, before anything is sent to a player that cannot
+        // reach it: a load into a dead session buys silence and a toast.
+        if self.session_lost() || self.player().is_some_and(|p| p.is_invalid()) {
+            self.spotify_connection_lost();
+        }
+        if let Some(r) = self.reconnect.as_mut() {
+            if asked == Asked::Pressed {
+                // The queue the play path already installed stays on the deck,
+                // so the press plays exactly what it asked for once the
+                // connection is back.
+                r.pressed = true;
+                r.at_ms = position_ms;
+                // The last word wins the one toast slot, so this replaces the
+                // drop notice a press that found the connection gone just
+                // wrote — which is the more useful of the two.
+                self.state
+                    .write()
+                    .toast("reconnecting to Spotify; this plays when it is back");
+            }
+            return;
+        }
         let Some(engine) = self.engine.clone() else {
             return;
         };
@@ -1156,7 +1341,11 @@ impl Client {
                 return;
             };
             let shuffle = st.playback.as_ref().is_some_and(|pb| pb.shuffle);
-            st.playback = Some(Playback::started(self.local_volume_pct(), shuffle));
+            let mut pb = Playback::started(self.local_volume_pct(), shuffle);
+            // A resumed load starts partway in, and the bar would otherwise
+            // flash back to zero until `PlayerEvent::Playing` re-anchors it.
+            pb.anchor(u64::from(position_ms));
+            st.playback = Some(pb);
             // Every deck checks radio before Spotify, so a station left set
             // keeps drawing over the track that is starting. `yield_to_spotify`
             // stops the engine itself on the play path.
@@ -1169,6 +1358,9 @@ impl Client {
             if st.radio.as_ref().is_none_or(|r| !r.off_air) {
                 st.radio = None;
             }
+            // A mute belongs to the engine it silenced. The other one was never
+            // turned down, so a `mut` label carried across would sit over sound.
+            st.muted_volume = None;
             // The status word tells "playing" from "still fetching" by whether
             // samples are arriving, and the old track's are about to stop.
             st.audio_tap.clear();
@@ -1176,7 +1368,7 @@ impl Client {
         };
 
         match SpotifyUri::from_uri(&track.uri) {
-            Ok(uri) => engine.player.load(uri, true, 0),
+            Ok(uri) => engine.player.load(uri, true, position_ms),
             Err(e) => {
                 log::error!("unplayable uri {}: {e}", track.uri);
                 self.state.write().toast("that track cannot be played");
@@ -1268,12 +1460,48 @@ impl Client {
     /// The mixer is the truth the audio path reads; the state is what the
     /// slider draws; the cache is what the next run starts at.
     fn set_volume(&self, pct: u8) {
+        self.apply_volume(pct, true);
+    }
+
+    /// As [`Self::set_volume`], with `persist` false for a mute: the cache is
+    /// what the next run starts at, and a run that starts silent looks broken.
+    fn apply_volume(&self, pct: u8, persist: bool) {
         let raw = pct_to_raw(pct);
         self.mixer.set_volume(raw);
         if let Some(pb) = self.state.write().playback.as_mut() {
             pb.volume_percent = pct;
         }
-        self.volume_cache.save_volume(raw);
+        if persist {
+            self.volume_cache.save_volume(raw);
+        }
+    }
+
+    /// Drop the level a mute is holding, without touching the volume.
+    ///
+    /// Every other way of setting the volume ends the mute: the slider and the
+    /// wheel say what you want to hear, and a level saved before them would
+    /// snap back over it at the next click of the label.
+    fn end_mute(&self) {
+        self.state.write().muted_volume = None;
+    }
+
+    /// Silence what is playing, keeping the level to come back to, or put that
+    /// level back.
+    ///
+    /// It follows the same engine split the slider does — the station while one
+    /// is on air, the mixer otherwise. Only the restore reaches the cache: see
+    /// [`Self::apply_volume`].
+    fn toggle_mute(&self) {
+        let held = self.state.read().muted_volume;
+        let Some((target, keep)) = mute_step(self.playback_volume(), held) else {
+            return;
+        };
+        self.state.write().muted_volume = keep;
+        if self.station_on_air() {
+            self.set_radio_volume(target);
+        } else {
+            self.apply_volume(target, keep.is_none());
+        }
     }
 
     /// Answer one query out of both catalogues.
@@ -1611,6 +1839,7 @@ impl Client {
         // before the station.
         st.unpark_queue();
         st.radio = None;
+        st.muted_volume = None;
     }
 
     /// The radio deck's `◂◂ previous`: back to the last thing you were
@@ -1853,6 +2082,13 @@ impl Client {
             log::warn!("preloaded track {uri} is unavailable");
             return;
         }
+        // A load into a session librespot has invalidated fails exactly as a
+        // region-locked track does, and counting it as one is what walks the
+        // queue and then wedges it. The session tells them apart.
+        if self.session_lost() {
+            self.spotify_connection_lost();
+            return;
+        }
         self.spotify_load = None;
         self.unavailable_streak = self.unavailable_streak.saturating_add(1);
         log::warn!(
@@ -1872,7 +2108,7 @@ impl Client {
             .write()
             .toast("that track is not available; skipping");
         if self.advance_queue() {
-            self.load_current();
+            self.load_current(Asked::Queue);
         } else {
             self.stop_playback("that track is not available");
         }
@@ -1943,6 +2179,151 @@ impl Client {
         }
     }
 
+    /// Notice a connection that has gone, and keep asking for another.
+    ///
+    /// On the tick for the reason [`Self::check_radio_stream`] is: nothing else
+    /// in the app sees a session die. The deck goes on claiming to play, and
+    /// every load after it fails as a track that is not available.
+    fn check_spotify_session(&mut self) {
+        match self.reconnect.as_ref() {
+            Some(r) => {
+                if r.next_try.is_some_and(|at| Instant::now() >= at) {
+                    self.start_reconnect();
+                }
+            }
+            None if self.session_lost() => self.spotify_connection_lost(),
+            None => {}
+        }
+    }
+
+    /// Take the connection as gone: stop claiming to play, and start the work
+    /// of replacing it.
+    fn spotify_connection_lost(&mut self) {
+        if self.reconnect.is_some() {
+            return;
+        }
+        log::warn!("the Spotify session is invalid; rebuilding the engine");
+        let was_playing = self
+            .state
+            .read()
+            .playback
+            .as_ref()
+            .is_some_and(|pb| pb.is_playing);
+        let at_ms = self.seek_target(|pos, _| pos).unwrap_or(0) as u32;
+        self.reconnect = Some(Reconnect {
+            since: Instant::now(),
+            attempts: 0,
+            next_try: None,
+            was_playing,
+            pressed: false,
+            at_ms,
+            task: None,
+        });
+        self.spotify_load = None;
+        self.unavailable_streak = 0;
+        // A rebuilt player has nothing loaded, so `▶ play` has to mean a load
+        // here for the same reason it does over a failed one.
+        self.spotify_wedged = true;
+        // Under a live station the deck is about radio, which is playing
+        // perfectly well and has nothing to say about Spotify.
+        if !self.station_on_air() {
+            self.stop_playback("the Spotify connection dropped; getting it back");
+        }
+        self.start_reconnect();
+    }
+
+    /// Ask for a new connection, off the command loop.
+    ///
+    /// The client owns this rather than the sign-in path, which is half Web
+    /// API: rebuilding that half would spend the saved refresh token against
+    /// the loop already holding it.
+    fn start_reconnect(&mut self) {
+        let Some(r) = self.reconnect.as_mut() else {
+            return;
+        };
+        r.next_try = None;
+        // The one failure retrying cannot fix. Near-impossible mid-run —
+        // librespot saves reusable credentials on a connect that succeeded —
+        // but a cache that cannot be read would otherwise retry forever.
+        if self.volume_cache.credentials().is_none() {
+            log::error!("no saved Spotify credentials; cannot rebuild the engine");
+            self.state
+                .write()
+                .toast("Spotify cannot be reconnected; restart spot");
+            self.reconnect = None;
+            return;
+        }
+        let old = self.engine.take();
+        let cache = self.volume_cache.clone();
+        let mixer = Arc::clone(&self.mixer);
+        let tap = Arc::clone(&self.audio_tap);
+        let state = Arc::clone(&self.state);
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            if let Some(old) = old {
+                retire(old).await;
+            }
+            let engine = match session::connect(&cache, &mixer, &tap, session::Login::Saved).await {
+                Ok((session, player, events)) => {
+                    tokio::spawn(crate::player_event_loop(events, state, tx.clone()));
+                    Some(Engine { session, player })
+                }
+                Err(e) => {
+                    log::warn!("could not reconnect to Spotify: {e:#}");
+                    None
+                }
+            };
+            let _ = tx.send(AppCommand::SpotifyReconnected(engine));
+        });
+        if let Some(r) = self.reconnect.as_mut() {
+            r.task = Some(task);
+        }
+    }
+
+    /// Take the connection that replaces the one that died, or set the clock
+    /// for the next attempt.
+    fn spotify_reconnected(&mut self, engine: Option<Engine>) {
+        let Some(r) = self.reconnect.as_mut() else {
+            // A sign-in landed while the attempt was in flight and the engine
+            // it built is already the one on the deck.
+            if let Some(engine) = engine {
+                tokio::spawn(retire(engine));
+            }
+            return;
+        };
+        r.task = None;
+        let Some(engine) = engine else {
+            r.attempts = r.attempts.saturating_add(1);
+            r.next_try = Some(Instant::now() + reconnect_backoff(r.attempts));
+            // The first failure only: a laptop left offline overnight must not
+            // toast once a minute until morning.
+            if r.attempts == 1 {
+                self.state.write().toast("cannot reach Spotify; still trying");
+            }
+            return;
+        };
+        log::info!("the Spotify engine is back after {} attempts", r.attempts);
+        let resume = resume_on_reconnect(r, Instant::now());
+        let at_ms = r.at_ms;
+        self.reconnect = None;
+        self.engine = Some(engine);
+        self.unavailable_streak = 0;
+        self.state.write().toast("Spotify is back");
+        if resume {
+            self.load_current_from(Asked::Pressed, at_ms);
+        }
+    }
+
+    /// Give up on the attempt in flight, for a sign-in or a quit that has
+    /// already answered the question it was asking.
+    fn abandon_reconnect(&mut self) {
+        if let Some(r) = self.reconnect.take()
+            && let Some(task) = r.task
+        {
+            task.abort();
+        }
+    }
+
     /// Take back the claim that Spotify is playing.
     ///
     /// The deck reads "playing" off this flag alone and its progress runs off a
@@ -2007,6 +2388,9 @@ impl Client {
     /// the process dies — which, if librespot's player thread is wedged, can
     /// be a long time after the terminal comes back.
     fn shutdown(&mut self) {
+        // An attempt that lands after this would build a player and open a
+        // device behind a UI that is already gone.
+        self.abandon_reconnect();
         // Radio first: it is the one that outlives the process, and it blocks
         // until the output device is actually closed.
         self.radio_player.shutdown();
@@ -2399,9 +2783,10 @@ impl Client {
                 r.off_air = true;
                 r.is_playing = true;
             }
+            st.muted_volume = None;
             st.set_queue(Some(queue));
         }
-        self.load_current();
+        self.load_current(Asked::Pressed);
     }
 
     /// A station is on air: the deck is up and the broadcast, not a record off
@@ -2583,6 +2968,80 @@ impl Client {
                     None => st.toast(format!("error: {message}")),
                 }
             }
+        }
+    }
+
+    /// Make the playlist the edit box was opened to make, and put the record
+    /// it carries on it.
+    ///
+    /// Not optimistic, unlike the row marks: there is no playlist to show
+    /// until Spotify says there is one, so the box stays up and inert until
+    /// the answer lands.
+    async fn create_playlist(&self, name: String, description: String, uri: String, seq: u64) {
+        let Some(api) = self.api.clone() else { return };
+        // Who you are, which the sign-in load normally settled long ago. The
+        // endpoint ignores the id, but rspotify still asks for one.
+        let known = self.state.read().me_id.clone();
+        let me = match known {
+            Some(id) => id,
+            None => match api.account().await {
+                Ok(account) => {
+                    self.state.write().me_id = Some(account.id.clone());
+                    account.id
+                }
+                Err(e) => return self.refuse_create(e.to_string(), seq),
+            },
+        };
+        let mut playlist = match api.create_playlist(&me, &name, &description).await {
+            Ok(playlist) => playlist,
+            Err(e) => return self.refuse_create(e.to_string(), seq),
+        };
+        // The playlist exists from here on, whatever the add does, so every
+        // path below closes the box and installs it.
+        let added = api.set_track_on_playlist(&playlist.id, &uri, true).await;
+        let mut st = self.state.write();
+        let refusal = match added {
+            Ok(snapshot_id) => {
+                playlist.snapshot_id = snapshot_id;
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        };
+        let id = playlist.id.clone();
+        let contents = state::PlaylistContents {
+            snapshot_id: playlist.snapshot_id.clone(),
+            track_ids: refusal
+                .is_none()
+                .then(|| state::track_id(&uri).to_string())
+                .into_iter()
+                .collect(),
+        };
+        // Newest first, where the library's own order puts it.
+        let mut playlists = std::mem::take(&mut st.playlists);
+        playlists.insert(0, playlist);
+        st.set_playlists(playlists);
+        // Nothing has touched this playlist but the add above, so what it
+        // holds is known and the box needs no walk to mark it.
+        st.playlist_tracks.insert(id, contents);
+        save_playlist_tracks(&st);
+        if st.edit.as_ref().is_some_and(|e| e.seq == seq) {
+            st.edit = None;
+        }
+        st.toast(match refusal {
+            Some(e) => format!("error: {e}"),
+            None => format!("added to {name}"),
+        });
+    }
+
+    /// A create that never happened: the box keeps the typing and says why.
+    fn refuse_create(&self, message: String, seq: u64) {
+        let mut st = self.state.write();
+        match st.edit.as_mut().filter(|edit| edit.seq == seq) {
+            Some(edit) => {
+                edit.pending = false;
+                edit.error = Some(message);
+            }
+            None => st.toast(format!("error: {message}")),
         }
     }
 
@@ -3609,6 +4068,19 @@ fn into_facet_rows(facets: Vec<crate::radio::api::Facet>) -> Vec<state::RadioRow
         .collect()
 }
 
+/// One press of the volume label: the level to apply, and the level to hold for
+/// the press after it. `None` for a press that does nothing.
+///
+/// Muting an already-silent player would leave a 0 to come back to, which reads
+/// as a mute that did nothing, so it is not a press at all.
+fn mute_step(current: u8, held: Option<u8>) -> Option<(u8, Option<u8>)> {
+    match held {
+        Some(level) => Some((level, None)),
+        None if current == 0 => None,
+        None => Some((0, Some(current))),
+    }
+}
+
 /// A slider percent as librespot's 16-bit volume.
 pub fn pct_to_raw(percent: u8) -> u16 {
     (percent.min(100) as u32 * u16::MAX as u32 / 100) as u16
@@ -3729,6 +4201,24 @@ mod tests {
         }
     }
 
+    /// A press down and a press back up leave the level where they found it,
+    /// and only the way back up is worth writing to the cache — a run that
+    /// starts silent looks broken.
+    #[test]
+    fn a_mute_and_an_unmute_come_back_to_the_level_they_started_at() {
+        let (silence, held) = mute_step(65, None).expect("a mute");
+        assert_eq!((silence, held), (0, Some(65)));
+
+        let (restored, keep) = mute_step(silence, held).expect("an unmute");
+        assert_eq!((restored, keep), (65, None));
+    }
+
+    /// Silence has no level to come back to.
+    #[test]
+    fn muting_a_silent_player_is_not_a_press() {
+        assert_eq!(mute_step(0, None), None);
+    }
+
     #[test]
     fn volume_percent_spans_the_whole_range() {
         assert_eq!(pct_to_raw(0), 0);
@@ -3799,6 +4289,64 @@ mod tests {
     fn a_retry_gets_the_whole_window_again() {
         let (att, now) = asked(LOAD_STALL_AFTER.as_secs() - 1, true);
         assert_eq!(stall_action(&att, true, false, false, now), Stall::Wait);
+    }
+
+    /// The cap stops a run of failures walking the whole queue, and a press is
+    /// not part of any run. Without this the first failure after a wedge
+    /// re-wedges on the count it inherited, and every track after it reads as
+    /// unavailable however good it is.
+    #[test]
+    fn a_press_starts_the_unavailable_count_over_and_a_queue_step_does_not() {
+        assert_eq!(streak_after(Asked::Pressed, UNAVAILABLE_STREAK_CAP), 0);
+        assert_eq!(streak_after(Asked::Queue, 2), 2);
+    }
+
+    fn dropped(secs: u64, was_playing: bool, pressed: bool) -> (Reconnect, Instant) {
+        let now = Instant::now();
+        let r = Reconnect {
+            since: now - Duration::from_secs(secs),
+            attempts: 0,
+            next_try: None,
+            was_playing,
+            pressed,
+            at_ms: 0,
+            task: None,
+        };
+        (r, now)
+    }
+
+    /// A blip while you are listening is one the record comes back from. A
+    /// laptop that slept is not: music starting by itself in whatever room it
+    /// was opened in is not what the last key pressed meant.
+    #[test]
+    fn a_blip_picks_the_record_back_up_and_a_sleep_waits_for_a_press() {
+        let (r, now) = dropped(RESUME_WITHIN.as_secs() - 1, true, false);
+        assert!(resume_on_reconnect(&r, now));
+
+        let (r, now) = dropped(RESUME_WITHIN.as_secs() + 1, true, false);
+        assert!(!resume_on_reconnect(&r, now));
+
+        let (r, now) = dropped(1, false, false);
+        assert!(!resume_on_reconnect(&r, now));
+    }
+
+    /// A play pressed while the connection was down waits for it rather than
+    /// being refused, however long that takes.
+    #[test]
+    fn a_play_asked_for_while_the_connection_was_down_is_not_lost() {
+        let (r, now) = dropped(3600, false, true);
+        assert!(resume_on_reconnect(&r, now));
+    }
+
+    /// The wait grows, and then stops growing: a laptop left offline overnight
+    /// costs one attempt a minute, and a connection that comes back is picked
+    /// up within one.
+    #[test]
+    fn the_wait_between_attempts_backs_off_to_a_minute() {
+        assert!(reconnect_backoff(1) < reconnect_backoff(2));
+        assert!(reconnect_backoff(2) < reconnect_backoff(3));
+        assert_eq!(reconnect_backoff(4), RECONNECT_BACKOFF_CAP);
+        assert_eq!(reconnect_backoff(400), RECONNECT_BACKOFF_CAP);
     }
 
     /// The guard that keeps the three-second tick from re-asking Spotify the

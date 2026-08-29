@@ -263,6 +263,7 @@ pub fn masthead(
     area: Rect,
     track: &Track,
     volume_percent: u8,
+    muted: bool,
     liked: Option<bool>,
     add: bool,
     mouse: Option<Position>,
@@ -311,7 +312,7 @@ pub fn masthead(
         height: 1,
         ..area
     };
-    let vol_seg = draw_volume(frame, row, volume_percent, mouse, hit);
+    let vol_seg = draw_volume(frame, row, volume_percent, muted, mouse, hit);
     let meta = Rect {
         width: row.width.saturating_sub(vol_seg.width + 1),
         ..row
@@ -430,10 +431,12 @@ fn sep(spans: &mut Vec<Span<'static>>, x: &mut u16, next: &str, meta: Rect) -> b
 /// state is known — the same rule [`masthead`] follows. Keeping a *station* is
 /// still done on its row in the directory: the deck's `★` has always meant
 /// "save this track", and when there is one it now means it here too.
+#[allow(clippy::too_many_arguments)]
 pub fn radio_masthead(
     frame: &mut Frame,
     area: Rect,
     radio: &RadioPlayback,
+    muted: bool,
     liked: Option<bool>,
     add: bool,
     mouse: Option<Position>,
@@ -486,7 +489,7 @@ pub fn radio_masthead(
         height: 1,
         ..area
     };
-    let vol_seg = draw_volume(frame, row, radio.volume_percent, mouse, hit);
+    let vol_seg = draw_volume(frame, row, radio.volume_percent, muted, mouse, hit);
     let meta = Rect {
         width: row.width.saturating_sub(vol_seg.width + 1),
         ..row
@@ -1130,7 +1133,7 @@ mod tests {
     fn the_masthead_writes_two_rows_and_their_controls() {
         let t = song();
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, None, false, None, h)
+            masthead(f, a, &t, 56, false, None, false, None, h)
         });
         assert!(lines[0].starts_with("Song Title"), "{:?}", lines[0]);
         // The state pill left this row for the transport; the title has the
@@ -1148,6 +1151,44 @@ mod tests {
         assert_eq!(hit.now_album.x, artist_rect(&hit).right() + 3);
     }
 
+    /// The word mutes and the track sets a percent, so they are two rects that
+    /// meet rather than one. A row too narrow for the control drops both: half
+    /// a slider maps clicks to percents it cannot show, and a `vol` with
+    /// nothing beside it is a mute nobody went looking for.
+    #[test]
+    fn the_volume_label_is_a_target_beside_the_track() {
+        let t = song();
+        let (_, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, false, None, false, None, h)
+        });
+        assert_eq!(hit.volume_label.width, 4);
+        assert_eq!(hit.volume_label.y, hit.volume_slider.y);
+        assert_eq!(hit.volume_label.right(), hit.volume_slider.x);
+
+        let (_, narrow, _) = render(12, 2, |f, a, h| {
+            masthead(f, a, &t, 56, false, None, false, None, h)
+        });
+        assert!(narrow.volume_label.is_empty());
+        assert!(narrow.volume_slider.is_empty());
+    }
+
+    /// Muted, the label carries the word: the readout says 0% either way, and
+    /// only the word tells a mute from a slider someone pulled down.
+    #[test]
+    fn a_muted_masthead_says_mut() {
+        let t = song();
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 0, true, None, false, None, h)
+        });
+        let word: String = lines[1]
+            .chars()
+            .skip(hit.volume_label.x as usize)
+            .take(hit.volume_label.width as usize)
+            .collect();
+        assert_eq!(word, "mut ");
+        assert!(!lines[1].contains("vol "), "{:?}", lines[1]);
+    }
+
     /// The control holds the right end of the title row, says which way it would
     /// go, and keeps one width in both states so nothing under the cursor
     /// moves when it flips.
@@ -1155,10 +1196,10 @@ mod tests {
     fn the_masthead_carries_a_liked_control_for_the_playing_track() {
         let t = song();
         let (liked_lines, liked_hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(true), false, None, h)
+            masthead(f, a, &t, 56, false, Some(true), false, None, h)
         });
         let (plain_lines, plain_hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(false), false, None, h)
+            masthead(f, a, &t, 56, false, Some(false), false, None, h)
         });
 
         // The same mark either way; the word is what changes, so the two
@@ -1187,7 +1228,7 @@ mod tests {
     fn the_add_control_sits_right_of_the_liked_one() {
         let t = song();
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(true), true, None, h)
+            masthead(f, a, &t, 56, false, Some(true), true, None, h)
         });
         // One space between the two, owned by neither, so it never lights
         // under the pointer as a third control that does nothing.
@@ -1217,7 +1258,9 @@ mod tests {
     #[test]
     fn the_add_control_does_not_wait_for_the_liked_answer() {
         let t = song();
-        let (lines, hit, _) = render(80, 2, |f, a, h| masthead(f, a, &t, 56, None, true, None, h));
+        let (lines, hit, _) = render(80, 2, |f, a, h| {
+            masthead(f, a, &t, 56, false, None, true, None, h)
+        });
         assert!(lines[0].contains("+ add"), "{:?}", lines[0]);
         assert_eq!(hit.add_btn.right(), 80);
         assert!(hit.like_btn.is_empty());
@@ -1229,7 +1272,7 @@ mod tests {
     fn a_narrow_title_row_drops_the_share_control_first() {
         let t = song();
         let (lines, hit, _) = render(20, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(true), true, None, h)
+            masthead(f, a, &t, 56, false, Some(true), true, None, h)
         });
         assert!(!lines[0].contains("share"), "{:?}", lines[0]);
         assert!(hit.share_btn.is_empty());
@@ -1244,7 +1287,7 @@ mod tests {
     fn a_narrow_title_row_drops_the_add_control_first() {
         let t = song();
         let (lines, hit, _) = render(12, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(true), true, None, h)
+            masthead(f, a, &t, 56, false, Some(true), true, None, h)
         });
         assert!(!lines[0].contains("+ add"), "{:?}", lines[0]);
         assert!(hit.add_btn.is_empty());
@@ -1257,7 +1300,7 @@ mod tests {
     fn the_add_control_is_opt_in() {
         let t = song();
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, Some(true), false, None, h)
+            masthead(f, a, &t, 56, false, Some(true), false, None, h)
         });
         assert!(!lines[0].contains("+ add"));
         assert!(hit.add_btn.is_empty());
@@ -1270,7 +1313,7 @@ mod tests {
     fn the_liked_control_waits_for_an_answer() {
         let t = song();
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, None, false, None, h)
+            masthead(f, a, &t, 56, false, None, false, None, h)
         });
         let mark = super::super::table::LIKED_MARK;
         assert!(!lines[0].contains(mark));
@@ -1283,7 +1326,7 @@ mod tests {
     fn the_metadata_row_is_not_indented() {
         let t = song();
         let (_, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, None, false, None, h)
+            masthead(f, a, &t, 56, false, None, false, None, h)
         });
         assert_eq!(artist_rect(&hit).x, 0);
     }
@@ -1298,7 +1341,7 @@ mod tests {
         }];
         t.album_id = None;
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, None, false, None, h)
+            masthead(f, a, &t, 56, false, None, false, None, h)
         });
         assert!(lines[1].contains("Artist Name · Album Name"));
         assert!(hit.now_artist_links.is_empty() && hit.now_album.is_empty());
@@ -1317,7 +1360,7 @@ mod tests {
         t.artists = "高橋洋子".into();
         t.album = "残酷な天使のテーゼ、とても長いアルバム名".into();
         let (lines, hit, _) = render(60, 2, |f, a, h| {
-            masthead(f, a, &t, 56, None, false, None, h)
+            masthead(f, a, &t, 56, false, None, false, None, h)
         });
         let row = &lines[1];
         assert!(
@@ -1339,7 +1382,7 @@ mod tests {
         let mut t = song();
         t.album = "Artist Name".into();
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            masthead(f, a, &t, 56, None, false, None, h)
+            masthead(f, a, &t, 56, false, None, false, None, h)
         });
         assert!(
             lines[1].starts_with("Artist Name · Artist Name · 2020"),
@@ -1585,7 +1628,7 @@ mod tests {
         for width in 0..40u16 {
             render(width.max(1), 2, |f, a, h| {
                 let a = Rect { width, ..a };
-                masthead(f, a, &t, 56, Some(true), false, None, h);
+                masthead(f, a, &t, 56, false, Some(true), false, None, h);
                 progress(f, Rect { height: 1, ..a }, &pb, DURATION, h);
                 transport(
                     f,
@@ -1654,7 +1697,7 @@ mod tests {
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
 
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Some(false), false, None, h)
+            radio_masthead(f, a, &r, false, Some(false), false, None, h)
         });
         // Row 0 names the record, not the station.
         assert!(lines[0].starts_with("Frenesi"), "{:?}", lines[0]);
@@ -1681,7 +1724,7 @@ mod tests {
         let mut r = radio("Adroit Jazz");
         r.matched = crate::app::state::RadioMatch::Matched(Box::new(matched()));
         let (_, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, None, false, None, h)
+            radio_masthead(f, a, &r, false, None, false, None, h)
         });
         assert!(hit.like_btn.is_empty(), "{:?}", hit.like_btn);
     }
@@ -1695,7 +1738,7 @@ mod tests {
         r.matched = crate::app::state::RadioMatch::Unmatched;
 
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Some(true), false, None, h)
+            radio_masthead(f, a, &r, false, Some(true), false, None, h)
         });
         assert!(lines[0].starts_with("Some Band - A Song"), "{:?}", lines[0]);
         // Row 1 falls back to what the station says about itself.
@@ -1713,7 +1756,7 @@ mod tests {
     fn a_station_that_says_nothing_still_names_itself() {
         let r = radio("Adroit Jazz");
         let (lines, hit, _) = render(80, 2, |f, a, h| {
-            radio_masthead(f, a, &r, Some(true), false, None, h)
+            radio_masthead(f, a, &r, false, Some(true), false, None, h)
         });
         assert!(lines[0].starts_with("Adroit Jazz"), "{:?}", lines[0]);
         assert!(lines[1].starts_with("jazz"), "{:?}", lines[1]);
@@ -1898,7 +1941,7 @@ mod tests {
                     let r = if saved { &r } else { &dead };
                     render(width.max(1), 2, |f, a, h| {
                         let a = Rect { width, ..a };
-                        radio_masthead(f, a, r, Some(true), false, None, h);
+                        radio_masthead(f, a, r, false, Some(true), false, None, h);
                         radio_status(f, Rect { height: 1, ..a }, r, h);
                         radio_transport(
                             f,

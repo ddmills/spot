@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::http::Query;
 use rspotify::model::{
-    AlbumId, ArtistId, FullTrack, Id, LibraryId, PlayableId, PlayableItem, PlaylistId,
-    SearchResult, SearchType, SimplifiedAlbum, SimplifiedPlaylist, SubscriptionLevel, TrackId,
+    AlbumId, ArtistId, FullPlaylist, FullTrack, Id, LibraryId, PlayableId, PlayableItem,
+    PlaylistId, SearchResult, SearchType, SimplifiedAlbum, SimplifiedPlaylist, SubscriptionLevel,
+    TrackId, UserId,
 };
 use rspotify::{AuthCodeSpotify, Token};
 use serde::Deserialize;
@@ -498,6 +499,31 @@ impl Api {
         Ok(())
     }
 
+    /// Make a playlist, private, owned by the signed-in user.
+    ///
+    /// rspotify 0.16 takes a user id that the endpoint itself ignores — the
+    /// token decides whose playlist it is — so the caller passes whatever it
+    /// knows of the account.
+    pub async fn create_playlist(
+        &self,
+        user_id: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<Playlist> {
+        let playlist = self
+            .client
+            .user_playlist_create(
+                UserId::from_id(user_id)?,
+                name,
+                Some(false),
+                None,
+                (!description.is_empty()).then_some(description),
+            )
+            .await
+            .context("failed to make the playlist")?;
+        Ok(playlist_from_full(&playlist))
+    }
+
     /// Put one track on a playlist, or take every copy of it off.
     ///
     /// Returns the playlist's new snapshot id, so the caller can retire the
@@ -805,6 +831,26 @@ fn playlist_from_simplified(p: &SimplifiedPlaylist) -> Playlist {
         snapshot_id: p.snapshot_id.clone(),
         // Comes back with the playlist itself, so opening one can show its
         // cover without a second round trip.
+        cover_url: playlist_cover(&p.images),
+        public: p.public,
+        collaborative: p.collaborative,
+    }
+}
+
+/// The shape a freshly made playlist comes back in. Holds no tracks yet, so
+/// the count is zero whatever the response says about it.
+fn playlist_from_full(p: &FullPlaylist) -> Playlist {
+    Playlist {
+        id: p.id.id().to_string(),
+        name: p.name.clone(),
+        track_count: 0,
+        owner: p
+            .owner
+            .display_name
+            .clone()
+            .unwrap_or_else(|| p.owner.id.id().to_string()),
+        owner_id: p.owner.id.id().to_string(),
+        snapshot_id: p.snapshot_id.clone(),
         cover_url: playlist_cover(&p.images),
         public: p.public,
         collaborative: p.collaborative,

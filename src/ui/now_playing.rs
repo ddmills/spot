@@ -59,6 +59,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // Read here for the same reason: whether the `+ add` control has anywhere
     // to lead is state the split borrow below gives up.
     let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
+    let muted = state.muted_volume.is_some();
     // Split borrows: playback/queue/toast/cover are read while hit areas are
     // written.
     let AppState {
@@ -112,6 +113,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             body,
             r,
             toast.as_ref().map(|(m, _)| m.as_str()),
+            muted,
             like,
             spotify_ready,
             saved,
@@ -165,6 +167,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
         text,
         track,
         pb.volume_percent,
+        muted,
         like,
         spotify_ready,
         mouse,
@@ -258,6 +261,7 @@ fn draw_radio(
     body: Rect,
     radio: &crate::app::state::RadioPlayback,
     toast: Option<&str>,
+    muted: bool,
     liked: Option<bool>,
     add: bool,
     saved: bool,
@@ -266,7 +270,7 @@ fn draw_radio(
     mouse: Option<ratatui::layout::Position>,
     hit: &mut crate::app::state::HitAreas,
 ) {
-    deck::radio_masthead(frame, body, radio, liked, add, mouse, hit);
+    deck::radio_masthead(frame, body, radio, muted, liked, add, mouse, hit);
 
     if body.height < 3 {
         return;
@@ -708,6 +712,43 @@ mod tests {
             "a squeezed toast should go: {:?}",
             lines[TOAST_ROW]
         );
+    }
+
+    /// The word left of the track is its own target, ending where the track
+    /// begins: a click on `vol` mutes, a click one cell right sets a percent.
+    #[test]
+    fn the_volume_label_is_a_target_of_its_own() {
+        let mut state = playing_state();
+        let lines = render(&mut state, 120, BAR_H);
+        let label = state.hit.volume_label;
+        assert_eq!(label.y, state.hit.volume_slider.y);
+        assert_eq!(label.right(), state.hit.volume_slider.x);
+        let word: String = lines[META_ROW]
+            .chars()
+            .skip(label.x as usize)
+            .take(label.width as usize)
+            .collect();
+        assert_eq!(word, "vol ");
+    }
+
+    /// Muted, the label says so. The level and the knob read 0 either way, so
+    /// the word is the only thing telling a mute from a slider pulled down.
+    #[test]
+    fn a_muted_deck_says_mut_where_it_said_vol() {
+        let mut state = playing_state();
+        state.muted_volume = Some(56);
+        if let Some(pb) = state.playback.as_mut() {
+            pb.volume_percent = 0;
+        }
+        let lines = render(&mut state, 120, BAR_H);
+        let label = state.hit.volume_label;
+        let word: String = lines[META_ROW]
+            .chars()
+            .skip(label.x as usize)
+            .take(label.width as usize)
+            .collect();
+        assert_eq!(word, "mut ");
+        assert!(lines[META_ROW].contains("  0%"), "{:?}", lines[META_ROW]);
     }
 
     /// The volume track is click-mapped, so it draws the handle whose position

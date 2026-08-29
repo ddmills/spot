@@ -67,6 +67,16 @@ pub fn audio() -> Result<(Cache, Arc<dyn Mixer>, Arc<AudioTap>)> {
     Ok((cache, mixer, Arc::new(AudioTap::new())))
 }
 
+/// Where a connect may get its credentials.
+pub enum Login {
+    /// The credentials librespot cached on an earlier connect, and nothing
+    /// else. A reconnect takes this: the interactive flow blocks on a browser
+    /// and prints to the console the TUI is drawing over.
+    Saved,
+    /// Cached credentials, or a one-time browser flow when there are none.
+    Interactive,
+}
+
 /// Log in and build the audio player spot drives directly. Returns the
 /// session, the player and the player's event channel.
 ///
@@ -83,10 +93,14 @@ pub async fn connect(
     cache: &Cache,
     mixer: &Arc<dyn Mixer>,
     tap: &Arc<AudioTap>,
+    login: Login,
 ) -> Result<(Session, Arc<Player>, PlayerEventChannel)> {
-    let credentials = match cache.credentials() {
-        Some(creds) => creds,
-        None => {
+    let credentials = match (cache.credentials(), login) {
+        (Some(creds), _) => creds,
+        (None, Login::Saved) => {
+            anyhow::bail!("there is no saved Spotify login to reconnect with")
+        }
+        (None, Login::Interactive) => {
             let token = tokio::task::spawn_blocking(auth::login_session_interactive)
                 .await
                 .context("auth task panicked")??;

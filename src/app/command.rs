@@ -1,5 +1,5 @@
 use crate::app::state::{Credit, RadioScope, Station, Track};
-use crate::client::Spotify;
+use crate::client::{Engine, Spotify};
 use crate::link::Link;
 
 /// A playable source whose rows are not in hand yet — a playlist played from
@@ -24,6 +24,13 @@ pub enum AppCommand {
     /// A sign-in finished: take what it got. Sent by the frame loop, which
     /// owns the sign-in because the browser flow prints to the console.
     SpotifyConnected(Spotify),
+    /// A rebuilt streaming engine, or nothing when the attempt failed. Sent by
+    /// the task `Client::start_reconnect` spawns.
+    ///
+    /// Separate from [`Self::SpotifyConnected`] because the Web API half must
+    /// not be built twice: a second token refresh loop would spend the same
+    /// refresh token against the first.
+    SpotifyReconnected(Option<Engine>),
     PlayPause,
     Next,
     Prev,
@@ -35,6 +42,9 @@ pub enum AppCommand {
     VolumeRel(i8),
     /// Set absolute volume in percent (volume-slider click).
     SetVolume(u8),
+    /// Drop to silence, or back to the level held in
+    /// [`crate::app::state::AppState::muted_volume`] (volume-label click).
+    ToggleMute,
     ToggleShuffle,
 
     /// Install a new queue and start playing `tracks[start]`. The tracks are
@@ -116,6 +126,16 @@ pub enum AppCommand {
         id: String,
         name: String,
         description: String,
+        seq: u64,
+    },
+    /// Make a playlist and put a record on it, from the add-to-playlist box's
+    /// `+ new playlist` control.
+    ///
+    /// `seq` is the opening of the edit box this answers, as it is above.
+    CreatePlaylist {
+        name: String,
+        description: String,
+        uri: String,
         seq: u64,
     },
     /// Read what these playlists hold, for the box's marks. Carries no track:

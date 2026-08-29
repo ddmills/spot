@@ -807,7 +807,7 @@ mod tests {
     fn dump_playlist_edit() {
         let mut st = browse_state();
         st.edit = Some(crate::app::state::PlaylistEdit {
-            id: "p1".into(),
+            target: crate::app::state::EditTarget::Existing("p1".into()),
             name: "Road Trip".into(),
             description: "long drives and open windows".into(),
             field: crate::app::state::EditField::Name,

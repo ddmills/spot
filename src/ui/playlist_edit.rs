@@ -11,13 +11,14 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use super::table::{centered, fit, segment};
 use super::theme;
-use crate::app::state::{AppState, EditField, PlaylistEdit};
+use crate::app::state::{AppState, EditField, EditTarget, PlaylistEdit};
 
 const BOX_W: u16 = 52;
 /// Rows the blurb field spends. Spotify allows three hundred characters,
 /// which is more than one row of this box holds and less than anyone types.
 const DESCRIPTION_H: u16 = 3;
 const SAVE_PILL: &str = "save";
+const CREATE_PILL: &str = "create";
 const NAME_LABEL: &str = "name";
 const DESCRIPTION_LABEL: &str = "about";
 /// Widest label, so the two fields start at the same cell.
@@ -33,11 +34,15 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     // Name row, blurb rows, a blank, the control row, and the status when
     // there is one — plus the border.
     let height = 1 + DESCRIPTION_H + 1 + 1 + u16::from(status.is_some()) + 2;
+    let making = matches!(edit.target, EditTarget::New { .. });
     let area = centered(frame.area(), BOX_W, height);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
-            .title(" Edit playlist ")
+            .title(match making {
+                true => " New playlist ",
+                false => " Edit playlist ",
+            })
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(theme::accent()),
@@ -81,9 +86,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     let mut x = controls.x;
     // Inert while a change is in flight, and it says so rather than looking
     // like a control that ignored you.
-    let (label, style) = match edit.pending {
-        true => ("saving…", theme::dim()),
-        false => (SAVE_PILL, theme::accent()),
+    let (label, style) = match (edit.pending, making) {
+        (true, true) => ("creating…", theme::dim()),
+        (true, false) => ("saving…", theme::dim()),
+        (false, true) => (CREATE_PILL, theme::accent()),
+        (false, false) => (SAVE_PILL, theme::accent()),
     };
     let rect = segment(
         &mut spans,
@@ -154,4 +161,75 @@ fn status_line(edit: &PlaylistEdit) -> Option<Line<'static>> {
     edit.error
         .as_ref()
         .map(|e| Line::styled(format!(" {e}"), theme::warn()))
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    fn open(target: EditTarget) -> AppState {
+        let mut st = AppState::new();
+        st.edit = Some(PlaylistEdit {
+            target,
+            name: "Roadtrip".into(),
+            description: String::new(),
+            field: EditField::Name,
+            pending: false,
+            error: None,
+            seq: 1,
+        });
+        st
+    }
+
+    fn screen(state: &mut AppState) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .filter_map(|x| buffer.cell(Position { x, y }).map(|c| c.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A box about a playlist that exists says what it does to it.
+    #[test]
+    fn an_edit_box_saves() {
+        let mut st = open(EditTarget::Existing("p1".into()));
+        let text = screen(&mut st);
+        assert!(text.contains("Edit playlist"), "{text}");
+        assert!(text.contains(SAVE_PILL), "{text}");
+    }
+
+    /// A box about a playlist that does not exist yet says the other thing —
+    /// a control marked `save` on a playlist there is nothing to save would
+    /// name a change to something that is not there.
+    #[test]
+    fn a_new_box_creates() {
+        let mut st = open(EditTarget::New {
+            uri: "spotify:track:x".into(),
+        });
+        let text = screen(&mut st);
+        assert!(text.contains("New playlist"), "{text}");
+        assert!(text.contains(CREATE_PILL), "{text}");
+        assert!(!text.contains(SAVE_PILL), "{text}");
+    }
+
+    /// A create in flight holds the box inert and says so.
+    #[test]
+    fn a_pending_new_box_says_it_is_creating() {
+        let mut st = open(EditTarget::New {
+            uri: "spotify:track:x".into(),
+        });
+        st.edit.as_mut().unwrap().pending = true;
+        let text = screen(&mut st);
+        assert!(text.contains("creating…"), "{text}");
+        assert!(st.hit.edit_save.is_empty());
+    }
 }

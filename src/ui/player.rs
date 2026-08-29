@@ -261,6 +261,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // offer is state the split borrow below gives up.
     let steps = play_state::radio_steps(state);
     let spotify_ready = state.spotify == crate::app::state::SpotifyState::Ready;
+    let muted = state.muted_volume.is_some();
     // What the station's list has played and which row is on, read here for
     // the same reason: the split borrow below gives the deck up, and both
     // answers are about the deck.
@@ -354,6 +355,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     header_area,
                     track,
                     pb.volume_percent,
+                    muted,
                     liked.get(&track.uri).copied(),
                     spotify_ready,
                     mouse,
@@ -361,7 +363,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 ),
                 None => {
                     let like = r.matched_track().and_then(|t| liked.get(&t.uri).copied());
-                    deck::radio_masthead(frame, header_area, r, like, spotify_ready, mouse, hit);
+                    deck::radio_masthead(
+                        frame,
+                        header_area,
+                        r,
+                        muted,
+                        like,
+                        spotify_ready,
+                        mouse,
+                        hit,
+                    );
                 }
             }
             hit.now_playing = Rect {
@@ -471,6 +482,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState) {
             header_area,
             track,
             pb.volume_percent,
+            muted,
             like,
             spotify_ready,
             mouse,

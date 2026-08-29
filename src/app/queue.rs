@@ -6,6 +6,7 @@
 //! that plays at position `i`. That is what makes the player screen correct
 //! without a fetch: spot wrote the order, thus spot can show it.
 
+use rand::Rng;
 use rand::seq::SliceRandom;
 
 use crate::app::state::Track;
@@ -56,12 +57,21 @@ impl Queue {
     }
 
     /// Append a page of tracks that arrived after play started. The playing
-    /// index does not move: the new rows land after everything already here.
+    /// index does not move. Under shuffle each new row takes a random place
+    /// somewhere ahead of the ear, so a list that pages in stays mixed to the
+    /// end; `natural` still grows in fetch order, which is what `s` restores.
     pub fn extend(&mut self, page: Vec<Track>) {
-        if let Some(natural) = self.natural.as_mut() {
-            natural.extend(page.iter().cloned());
+        let Some(natural) = self.natural.as_mut() else {
+            self.tracks.extend(page);
+            return;
+        };
+        natural.extend(page.iter().cloned());
+        let mut rng = rand::rng();
+        for track in page {
+            let first_free = (self.index + 1).min(self.tracks.len());
+            let at = rng.random_range(first_free..=self.tracks.len());
+            self.tracks.insert(at, track);
         }
-        self.tracks.extend(page);
     }
 
     /// The playing track.
@@ -144,6 +154,17 @@ impl Queue {
                 .and_then(|uri| self.tracks.iter().position(|t| t.uri == uri))
                 .unwrap_or(0);
         }
+    }
+
+    /// Shuffle every track and play from row 0. A shuffle control that starts
+    /// a context chooses no track, so nothing is pinned — unlike
+    /// [`Self::shuffle`], which keeps the playing track under the ear.
+    pub fn start_shuffled(&mut self) {
+        if self.natural.is_none() {
+            self.natural = Some(self.tracks.clone());
+        }
+        self.tracks.shuffle(&mut rand::rng());
+        self.index = 0;
     }
 
     /// The rows the player screen draws — the play order itself.
@@ -271,6 +292,76 @@ mod tests {
         assert_eq!(q.index(), 1);
         assert_eq!(q.current().unwrap().name, "b");
         assert_eq!(q.len(), 4);
+    }
+
+    #[test]
+    fn start_shuffled_can_begin_on_any_track() {
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let mut first_rows = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let mut q = queue(&names, 0);
+            q.start_shuffled();
+            assert_eq!(q.index(), 0);
+            assert_eq!(q.len(), names.len());
+            let mut got: Vec<&str> = q.rows().iter().map(|t| t.name.as_str()).collect();
+            got.sort_unstable();
+            assert_eq!(got, names, "the shuffle lost or invented a track");
+            first_rows.insert(q.current().unwrap().name.clone());
+        }
+        assert!(
+            first_rows.len() > 1,
+            "every shuffle started the same track: {first_rows:?}"
+        );
+    }
+
+    #[test]
+    fn start_shuffled_still_restores_the_natural_order() {
+        let mut q = queue(&["a", "b", "c", "d", "e"], 0);
+        q.start_shuffled();
+        let playing = q.current().unwrap().name.clone();
+        q.shuffle(false);
+        let names: Vec<&str> = q.rows().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d", "e"]);
+        assert_eq!(q.current().unwrap().name, playing);
+    }
+
+    #[test]
+    fn a_page_landing_under_shuffle_is_mixed_in() {
+        let page = ["w", "x", "y", "z"];
+        let mut tails = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let mut q = queue(&["a", "b", "c", "d", "e", "f"], 0);
+            q.shuffle(true);
+            q.advance();
+            let landed: Vec<usize> = page
+                .iter()
+                .map(|n| {
+                    q.extend(vec![track(n)]);
+                    q.rows().iter().position(|t| t.name == *n).unwrap()
+                })
+                .collect();
+            assert!(
+                landed.iter().all(|at| *at > q.index()),
+                "a new row landed on or behind the ear: {landed:?}"
+            );
+            let tail = q.len() - page.len();
+            tails.insert(landed.iter().all(|at| *at >= tail));
+        }
+        assert!(
+            tails.contains(&false),
+            "every page stacked at the tail instead of mixing in"
+        );
+    }
+
+    #[test]
+    fn a_page_landing_under_shuffle_never_moves_the_playing_track() {
+        let mut q = queue(&["a", "b", "c", "d"], 0);
+        q.shuffle(true);
+        q.advance();
+        let playing = q.current().unwrap().name.clone();
+        q.extend(vec![track("x"), track("y")]);
+        assert_eq!(q.current().unwrap().name, playing);
+        assert_eq!(q.len(), 6);
     }
 
     #[test]

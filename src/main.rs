@@ -410,7 +410,12 @@ async fn connect_spotify(
     } else if !may_connect {
         (None, Some("sign in to play".to_string()))
     } else {
-        match session::connect(&audio.cache, &audio.mixer, &audio.tap).await {
+        let login = if interactive {
+            session::Login::Interactive
+        } else {
+            session::Login::Saved
+        };
+        match session::connect(&audio.cache, &audio.mixer, &audio.tap, login).await {
             Ok((session, player, events)) => {
                 tokio::spawn(player_event_loop(events, Arc::clone(&state), tx.clone()));
                 (Some(Engine { session, player }), None)

@@ -11,8 +11,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::command::{AppCommand, FetchSource};
 use crate::app::state::{
     self as state, AppState, ArtZoom, ArtistRow, BackTarget, ColKey, CrumbTarget, EditField,
-    HomeItem, InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow, RadioScope,
-    RadioTab, SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
+    EditTarget, HomeItem, InputMode, MainView, PICKER_ROWS, PlaylistEdit, RadioMatch, RadioRow,
+    RadioScope, RadioTab, SearchTab, SpotifyState, Station, Track, TrackList, UpdateState, ViewKey,
 };
 use crate::link;
 
@@ -101,6 +101,10 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         }
         if st.hit.picker_list.contains(pos) {
             click_picker_row(st, pos, tx);
+            return;
+        }
+        if st.hit.picker_new.contains(pos) {
+            open_new_playlist(st);
             return;
         }
         st.picker = None;
@@ -532,6 +536,8 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         let _ = tx.send(AppCommand::Next);
     } else if st.hit.shuffle_btn.contains(pos) {
         let _ = tx.send(AppCommand::ToggleShuffle);
+    } else if st.hit.volume_label.contains(pos) {
+        let _ = tx.send(AppCommand::ToggleMute);
     } else if st.hit.volume_slider.contains(pos) {
         let track = st.hit.volume_slider;
         let ratio = (pos.x - track.x) as f64 / track.width.saturating_sub(1).max(1) as f64;
@@ -669,6 +675,12 @@ fn handle_picker_key(
             toggle_picker_row(&mut st, tx);
             return;
         }
+        // A bare letter is query text here, so the one key that leaves the box
+        // has to be a chord.
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            open_new_playlist(&mut st);
+            return;
+        }
         _ => {}
     }
     let Some(picker) = st.picker.as_mut() else {
@@ -770,9 +782,35 @@ fn open_playlist_edit(st: &mut AppState) {
     let (name, description) = (list.header.name.clone(), list.header.description.clone());
     st.edit_seq += 1;
     st.edit = Some(PlaylistEdit {
-        id,
+        target: EditTarget::Existing(id),
         name,
         description,
+        field: EditField::Name,
+        pending: false,
+        error: None,
+        seq: st.edit_seq,
+    });
+}
+
+/// Trade the add-to-playlist box for the edit box in its create mode, carrying
+/// the record and the name that was typed looking for one.
+///
+/// The picker goes: it owns the keyboard wherever both are open, so leaving it
+/// up would leave the new box unable to be typed in.
+fn open_new_playlist(st: &mut AppState) {
+    let Some(picker) = st.picker.take() else {
+        return;
+    };
+    st.edit_seq += 1;
+    st.edit = Some(PlaylistEdit {
+        target: EditTarget::New { uri: picker.uri },
+        name: picker
+            .query
+            .trim()
+            .chars()
+            .take(MAX_PLAYLIST_NAME)
+            .collect(),
+        description: String::new(),
         field: EditField::Name,
         pending: false,
         error: None,
@@ -796,11 +834,22 @@ fn submit_edit(st: &mut AppState, tx: &UnboundedSender<AppCommand>) {
     }
     edit.pending = true;
     edit.error = None;
-    let _ = tx.send(AppCommand::EditPlaylistDetails {
-        id: edit.id.clone(),
-        name: edit.name.trim().to_string(),
-        description: edit.description.trim().to_string(),
-        seq: edit.seq,
+    let name = edit.name.trim().to_string();
+    let description = edit.description.trim().to_string();
+    let seq = edit.seq;
+    let _ = tx.send(match &edit.target {
+        EditTarget::Existing(id) => AppCommand::EditPlaylistDetails {
+            id: id.clone(),
+            name,
+            description,
+            seq,
+        },
+        EditTarget::New { uri } => AppCommand::CreatePlaylist {
+            name,
+            description,
+            uri: uri.clone(),
+            seq,
+        },
     });
 }
 
@@ -3065,7 +3114,7 @@ mod tests {
         let mut mine = page("me");
         open_playlist_edit(&mut mine);
         let edit = mine.edit.expect("no box on your own playlist");
-        assert_eq!(edit.id, "p1");
+        assert_eq!(edit.target, EditTarget::Existing("p1".into()));
         assert_eq!(edit.name, "Blue Note");
         assert_eq!(edit.description, "hard bop");
 
@@ -3081,7 +3130,7 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = connected();
         st.edit = Some(PlaylistEdit {
-            id: "p1".into(),
+            target: EditTarget::Existing("p1".into()),
             name: "  ".into(),
             description: "hard bop".into(),
             field: EditField::Name,
@@ -3104,7 +3153,7 @@ mod tests {
         let (tx, mut rx) = channel();
         let mut st = connected();
         st.edit = Some(PlaylistEdit {
-            id: "p1".into(),
+            target: EditTarget::Existing("p1".into()),
             name: " Blue Note ".into(),
             description: " hard bop ".into(),
             field: EditField::Name,
@@ -3652,6 +3701,25 @@ mod tests {
             matches!(rx.try_recv(), Ok(AppCommand::SetLiked { uri, liked })
                 if uri == "spotify:track:Uprising" && liked)
         );
+    }
+
+    /// The word and the track sit side by side and mean different things, so
+    /// the cell the pointer is on decides which of the two it gets.
+    #[test]
+    fn the_volume_label_mutes_where_the_track_sets_a_percent() {
+        let (tx, mut rx) = channel();
+        let mut st = AppState::new();
+        st.hit.volume_label = Rect::new(60, 20, 4, 1);
+        st.hit.volume_slider = Rect::new(64, 20, 16, 1);
+
+        handle_click(&mut st, Position { x: 62, y: 20 }, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::ToggleMute)));
+
+        handle_click(&mut st, Position { x: 64, y: 20 }, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::SetVolume(0))));
+
+        handle_click(&mut st, Position { x: 79, y: 20 }, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::SetVolume(100))));
     }
 
     /// Both halves of the artist page name albums on screen, so both must
@@ -5492,6 +5560,85 @@ mod tests {
         st.hit.picker_field = Rect::new(10, 9, 40, 1);
         handle_click(&mut st, Position { x: 20, y: 9 }, &tx);
         assert!(st.picker.is_some());
+    }
+
+    /// The control trades the box for one that makes the playlist the query
+    /// was looking for, carrying both the record and the name typed for it.
+    #[test]
+    fn the_new_playlist_control_opens_a_create_box() {
+        let (tx, _rx) = channel();
+        let mut st = adding_open(&tx);
+        st.picker.as_mut().unwrap().query = " Roadtrip ".into();
+        st.hit.picker_new = Rect::new(10, 21, 15, 1);
+        handle_click(&mut st, Position { x: 12, y: 21 }, &tx);
+
+        assert!(st.picker.is_none(), "the box that owns the keys stayed up");
+        let edit = st.edit.expect("no create box");
+        assert_eq!(
+            edit.target,
+            EditTarget::New {
+                uri: "spotify:track:Uprising".into()
+            }
+        );
+        assert_eq!(edit.name, "Roadtrip");
+        assert!(edit.description.is_empty());
+        assert_eq!(edit.field, EditField::Name);
+    }
+
+    /// The same from the keyboard. A chord, because a bare letter in this box
+    /// is query text.
+    #[test]
+    fn ctrl_n_opens_a_create_box() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(adding_open(&tx)));
+        handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            &state,
+            &tx,
+        );
+        let st = state.read();
+        assert!(st.picker.is_none());
+        assert!(matches!(
+            st.edit.as_ref().map(|e| &e.target),
+            Some(EditTarget::New { .. })
+        ));
+    }
+
+    /// Sending a create box asks for the playlist and holds the box inert
+    /// until the answer lands — there is nothing to show until Spotify says
+    /// the playlist is there.
+    #[test]
+    fn a_create_box_asks_for_the_playlist_and_waits() {
+        let (tx, mut rx) = channel();
+        let mut st = connected();
+        st.edit_seq = 7;
+        st.edit = Some(PlaylistEdit {
+            target: EditTarget::New {
+                uri: "spotify:track:x".into(),
+            },
+            name: " Roadtrip ".into(),
+            description: " long drives ".into(),
+            field: EditField::Name,
+            pending: false,
+            error: None,
+            seq: 7,
+        });
+
+        submit_edit(&mut st, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppCommand::CreatePlaylist { ref name, ref description, ref uri, seq })
+                if name == "Roadtrip"
+                    && description == "long drives"
+                    && uri == "spotify:track:x"
+                    && seq == 7
+        ));
+        assert!(
+            st.edit.as_ref().expect("the box closed early").pending,
+            "the box is live while the create is out"
+        );
+        submit_edit(&mut st, &tx);
+        assert!(rx.try_recv().is_err(), "the create went out twice");
     }
 
     /// While the box is up it owns the keyboard: a letter is a letter, and

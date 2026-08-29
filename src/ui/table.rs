@@ -776,29 +776,52 @@ pub fn state_spans(play: PlayState) -> Option<Vec<Span<'static>>> {
 /// bar draw the same control, so they share the width as well as the code.
 pub const VOL_TRACK_W: u16 = 16;
 
+/// Width of the volume label, in cells. `vol ` and `mut ` are the same size, so
+/// nothing either side of the control moves when it is silenced.
+const VOL_LABEL_W: u16 = 4;
+
 /// The volume slider, flush with `row`'s right edge. Records
 /// `hit.volume_slider` over the track alone — the label and the readout do
-/// not map to a percent — and returns the whole segment's rect.
+/// not map to a percent — and `hit.volume_label` over the word, which mutes.
+/// Returns the whole segment's rect.
 ///
 /// It always carries the `●` handle, whose position matches the click mapping
 /// the event layer applies to `hit.volume_slider`: both views make the track
 /// clickable, so both show what there is to grab. The progress track
 /// deliberately does not (see [`meter`]).
+///
+/// The label and the track are one `right_row` group rather than two: separate
+/// groups sit a blank cell apart, and the word is the slider's own end, not a
+/// second control standing beside it.
 pub fn draw_volume(
     frame: &mut Frame,
     row: Rect,
     volume_percent: u8,
+    muted: bool,
     mouse: Option<Position>,
     hit: &mut HitAreas,
 ) -> Rect {
     let dim = theme::dim();
-    let label = Span::styled("vol ", dim);
     let pct = Span::styled(format!(" {volume_percent:>3}%"), dim);
-    let label_w = label.width() as u16;
-    let seg_w = label_w + VOL_TRACK_W + pct.width() as u16;
-    let hover =
-        mouse.is_some_and(|m| m.y == row.y && seg_w <= row.width && m.x >= row.right() - seg_w);
-    let mut parts = vec![label];
+    let seg_w = VOL_LABEL_W + VOL_TRACK_W + pct.width() as u16;
+    let fits = seg_w <= row.width;
+    let left = row.right().saturating_sub(seg_w);
+    let on_row = move |within: fn(u16) -> bool| {
+        mouse.is_some_and(|m| m.y == row.y && fits && m.x >= left && within(m.x - left))
+    };
+    let hover = on_row(|_| true);
+    let label_hover = on_row(|off| off < VOL_LABEL_W);
+    let label_style = if label_hover {
+        Style::default()
+            .fg(theme::accent_bright())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        dim
+    };
+    let mut parts = vec![Span::styled(
+        if muted { "mut " } else { "vol " },
+        label_style,
+    )];
     parts.extend(meter(
         f64::from(volume_percent) / 100.0,
         VOL_TRACK_W,
@@ -807,16 +830,25 @@ pub fn draw_volume(
     ));
     parts.push(pct);
     let seg = right_row(frame, row, mouse, vec![parts])[0];
-    hit.volume_slider = if seg.is_empty() {
-        Rect::default()
+    let (label_rect, track_rect) = if seg.is_empty() {
+        (Rect::default(), Rect::default())
     } else {
-        Rect {
-            x: seg.x + label_w,
-            width: VOL_TRACK_W,
-            ..seg
-        }
-        .intersection(row)
+        (
+            Rect {
+                width: VOL_LABEL_W,
+                ..seg
+            }
+            .intersection(row),
+            Rect {
+                x: seg.x + VOL_LABEL_W,
+                width: VOL_TRACK_W,
+                ..seg
+            }
+            .intersection(row),
+        )
     };
+    hit.volume_label = label_rect;
+    hit.volume_slider = track_rect;
     seg
 }
 
