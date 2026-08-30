@@ -89,6 +89,15 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
         close_art_zoom(st);
         return;
     }
+    // The article, under the boxes that own the keyboard. A click inside it is
+    // someone finding their place in the text and must leave it alone; a click
+    // outside is the way out, the rule the boxes below keep too.
+    if st.bio.is_some() {
+        if !st.hit.bio_box.contains(pos) {
+            st.bio = None;
+        }
+        return;
+    }
     // The add-to-playlist box, while one is up. Every branch returns: unlike
     // the help box above, a click that dismisses this one does *not* go on to
     // work whatever was under it — the box covers the deck's own controls, and
@@ -217,6 +226,13 @@ fn handle_click(st: &mut AppState, pos: Position, tx: &UnboundedSender<AppComman
             st.main_to_top();
             let _ = tx.send(AppCommand::LoadArtistArt);
         }
+        return;
+    }
+
+    // The line about the artist in the header band. It is one sentence of
+    // something longer, and clicking it is how you ask for the rest.
+    if st.hit.artist_bio.contains(pos) {
+        open_bio(st);
         return;
     }
 
@@ -570,6 +586,13 @@ fn handle_scroll(st: &mut AppState, pos: Position, delta: i64, tx: &UnboundedSen
     // wheel to move. It stops here rather than reaching the list underneath:
     // scrolling something you cannot see is worse than scrolling nothing.
     if st.art_zoom.is_some() {
+        return;
+    }
+    // The article is the one thing on screen with more to show, so the wheel
+    // is for it while it is up — and the page behind it must not move under a
+    // paragraph you are halfway through.
+    if st.bio.is_some() {
+        scroll_bio(st, delta * SCROLL_LINES);
         return;
     }
     // The box covers the view, so the wheel belongs to it wherever it is
@@ -1206,11 +1229,110 @@ fn handle_zoom_key(key: KeyEvent, state: &Arc<RwLock<AppState>>) -> bool {
     }
 }
 
+/// The keyboard while an article is open. Returns whether the key was spent
+/// here.
+///
+/// The same allowlist the expanded sleeve keeps, and for the same reason:
+/// transport, help and quit are about the record and about the app rather than
+/// about the page behind the box, so they still mean what they mean. What is
+/// caught here that the picture does not catch is scrolling — this surface has
+/// more to show, and the page underneath must not move while you read.
+fn handle_bio_key(key: KeyEvent, state: &Arc<RwLock<AppState>>) -> bool {
+    {
+        let st = state.read();
+        // Under the help box, and under the sleeve, on their own terms.
+        if st.bio.is_none() || st.show_help || st.art_zoom.is_some() {
+            return false;
+        }
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let mut st = state.write();
+    let page = (st.hit.bio_body.height as i64).max(1);
+    match key.code {
+        KeyCode::Char(' ' | 'n' | 'p' | 'h' | 'l' | 's' | 'q' | '?' | '-' | '=' | '+') => false,
+        // `i` opened it, so `i` closes it: a key that only ever opens is a key
+        // you have to remember a second one for.
+        KeyCode::Esc | KeyCode::Char('i') => {
+            st.bio = None;
+            true
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            scroll_bio(&mut st, 1);
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            scroll_bio(&mut st, -1);
+            true
+        }
+        KeyCode::Char('d') if ctrl => {
+            scroll_bio(&mut st, page / 2);
+            true
+        }
+        KeyCode::Char('u') if ctrl => {
+            scroll_bio(&mut st, -page / 2);
+            true
+        }
+        KeyCode::PageDown => {
+            scroll_bio(&mut st, page);
+            true
+        }
+        KeyCode::PageUp => {
+            scroll_bio(&mut st, -page);
+            true
+        }
+        KeyCode::Char('g') => {
+            scroll_bio(&mut st, i64::MIN / 2);
+            true
+        }
+        KeyCode::Char('G') => {
+            scroll_bio(&mut st, i64::MAX / 2);
+            true
+        }
+        // Everything else is navigation of a page you cannot see.
+        _ => true,
+    }
+}
+
+/// Move the article by `delta` lines, keeping its last line at the foot of the
+/// box.
+///
+/// The wrap the offset counts is the one the last frame made, so a terminal
+/// resized under the box scrolls by the measure it is showing rather than by
+/// the one it was opened at.
+fn scroll_bio(st: &mut AppState, delta: i64) {
+    let height = st.hit.bio_body.height as usize;
+    let Some(popup) = st.bio.as_mut() else { return };
+    let max = popup.lines.len().saturating_sub(height) as i64;
+    popup.offset = (popup.offset as i64).saturating_add(delta).clamp(0, max) as usize;
+}
+
+/// `i`, and the line about the artist in the header band: open the article.
+///
+/// A deliberate press gets an answer either way. The band's own line is simply
+/// absent where there is nothing to say — that is how `genres` behaves and how
+/// a page should — but a key that did nothing would read as a key that is
+/// broken.
+fn open_bio(st: &mut AppState) {
+    let MainView::Artist(v) = &st.main else {
+        return;
+    };
+    let (id, name, bio) = (v.id.clone(), v.name.clone(), v.bio.clone());
+    match bio {
+        state::BioState::Ready(bio) => st.bio = Some(state::BioPopup::new(id, name, bio)),
+        state::BioState::Loading => st.toast("still reading about them"),
+        state::BioState::Missing => st.toast("nothing written about this one"),
+    }
+}
+
 fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSender<AppCommand>) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Before the player, whose own Esc closes the player: with a sleeve up over
     // it, that would leave the picture on a screen that had changed underneath.
     if handle_zoom_key(key, state) {
+        return;
+    }
+    // Under the sleeve and above everything else, for the same reason.
+    if handle_bio_key(key, state) {
         return;
     }
     // The player view captures navigation for its queue; transport and
@@ -1313,6 +1435,7 @@ fn handle_normal(key: KeyEvent, state: &Arc<RwLock<AppState>>, tx: &UnboundedSen
 
         KeyCode::Char('b') => open_album_of_selection(&mut state.write(), tx),
         KeyCode::Char('B') => open_artist_of_selection(&mut state.write(), tx),
+        KeyCode::Char('i') => open_bio(&mut state.write()),
         KeyCode::Char('x') => play_without_opening(&mut state.write(), tx),
         KeyCode::Backspace => go_back(&mut state.write(), tx),
         _ => {}
@@ -2900,6 +3023,7 @@ mod tests {
             name: "Muse".into(),
             image_url: None,
             genres: Vec::new(),
+            bio: state::BioState::default(),
             top,
             albums: vec![AlbumItem {
                 id: "a1".into(),
@@ -6594,5 +6718,154 @@ mod tests {
         assert!(on_air(&st));
         st.radio.as_mut().unwrap().off_air = true;
         assert!(!on_air(&st));
+    }
+
+    fn artist_with_bio(bio: state::BioState) -> AppState {
+        let mut st = AppState::new();
+        st.main = MainView::Artist(ArtistView {
+            id: "r1".into(),
+            uri: "spotify:artist:r1".into(),
+            name: "Muse".into(),
+            image_url: None,
+            genres: Vec::new(),
+            bio,
+            top: TrackList::new("Muse", "top tracks", None),
+            albums: Vec::new().into(),
+            tab: state::ArtistTab::Albums,
+            loading: false,
+            error: None,
+        });
+        st
+    }
+
+    fn article() -> state::BioState {
+        state::BioState::Ready(std::sync::Arc::new(state::ArtistBio {
+            text: "Muse are an English rock band from Teignmouth.".into(),
+            image_url: None,
+            source_url: "https://en.wikipedia.org/wiki/Muse_(band)".into(),
+        }))
+    }
+
+    /// A deliberate press gets an answer either way — the band's own line can
+    /// be silently absent, but a key that did nothing would read as broken.
+    #[test]
+    fn i_opens_the_article_and_says_so_when_there_is_none() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(artist_with_bio(article())));
+        handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+        assert!(state.read().bio.is_some());
+
+        for (bio, waiting) in [
+            (state::BioState::Missing, false),
+            (state::BioState::Loading, true),
+        ] {
+            let state = Arc::new(RwLock::new(artist_with_bio(bio)));
+            handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+            let st = state.read();
+            assert!(st.bio.is_none(), "opened a box over nothing");
+            assert!(st.toast.is_some(), "said nothing about why");
+            assert_eq!(
+                st.toast.as_ref().map(|t| t.0.contains("still reading")),
+                Some(waiting)
+            );
+        }
+    }
+
+    /// `i` opened it, so `i` closes it, and so does `Esc` — before Esc means
+    /// the back key it means on every page.
+    #[test]
+    fn the_article_closes_on_i_and_on_esc() {
+        let (tx, _rx) = channel();
+        for key in ['i', '\u{1b}'] {
+            let state = Arc::new(RwLock::new(artist_with_bio(article())));
+            state.write().push_view();
+            handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+            let code = match key {
+                '\u{1b}' => KeyCode::Esc,
+                c => KeyCode::Char(c),
+            };
+            handle_normal(KeyEvent::from(code), &state, &tx);
+            let st = state.read();
+            assert!(st.bio.is_none(), "`{key}` left the box open");
+            assert!(
+                matches!(st.main, MainView::Artist(_)),
+                "`{key}` closed the box and walked the path as well"
+            );
+        }
+    }
+
+    /// The transport keys still mean what they mean: the box is a reading
+    /// surface over a page that is still playing.
+    #[test]
+    fn transport_keys_fall_through_the_article() {
+        let (tx, mut rx) = channel();
+        let state = Arc::new(RwLock::new(artist_with_bio(article())));
+        handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+        handle_normal(KeyEvent::from(KeyCode::Char(' ')), &state, &tx);
+        assert!(matches!(rx.try_recv(), Ok(AppCommand::PlayPause)));
+        assert!(state.read().bio.is_some(), "a transport key closed the box");
+    }
+
+    /// Scrolling stops at both ends rather than running off either.
+    #[test]
+    fn the_article_scrolls_within_its_own_length() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(artist_with_bio(article())));
+        handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+        {
+            let mut st = state.write();
+            st.hit.bio_body.height = 4;
+            let popup = st.bio.as_mut().unwrap();
+            popup.lines = (0..10).map(|i| format!("line {i}")).collect();
+        }
+        handle_normal(KeyEvent::from(KeyCode::Char('G')), &state, &tx);
+        assert_eq!(state.read().bio.as_ref().unwrap().offset, 6);
+        handle_normal(KeyEvent::from(KeyCode::Char('j')), &state, &tx);
+        assert_eq!(
+            state.read().bio.as_ref().unwrap().offset,
+            6,
+            "ran past the end"
+        );
+        handle_normal(KeyEvent::from(KeyCode::Char('g')), &state, &tx);
+        assert_eq!(state.read().bio.as_ref().unwrap().offset, 0);
+        handle_normal(KeyEvent::from(KeyCode::Char('k')), &state, &tx);
+        assert_eq!(
+            state.read().bio.as_ref().unwrap().offset,
+            0,
+            "ran past the top"
+        );
+    }
+
+    /// The wheel is for the box while it is up: the page behind it must not
+    /// move under a paragraph you are halfway through.
+    #[test]
+    fn the_wheel_belongs_to_the_article() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(artist_with_bio(article())));
+        handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+        let mut st = state.write();
+        st.hit.bio_body.height = 4;
+        st.bio.as_mut().unwrap().lines = (0..40).map(|i| format!("line {i}")).collect();
+        handle_scroll(&mut st, Position { x: 0, y: 0 }, 1, &tx);
+        assert_eq!(st.bio.as_ref().unwrap().offset, SCROLL_LINES as usize);
+    }
+
+    /// A click inside the box leaves it alone; a click outside is the way out.
+    #[test]
+    fn a_click_outside_the_article_dismisses_it() {
+        let (tx, _rx) = channel();
+        let state = Arc::new(RwLock::new(artist_with_bio(article())));
+        handle_normal(KeyEvent::from(KeyCode::Char('i')), &state, &tx);
+        let mut st = state.write();
+        st.hit.bio_box = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 20,
+        };
+        handle_click(&mut st, Position { x: 20, y: 10 }, &tx);
+        assert!(st.bio.is_some(), "a click in the text closed the box");
+        handle_click(&mut st, Position { x: 1, y: 1 }, &tx);
+        assert!(st.bio.is_none(), "a click outside left it open");
     }
 }

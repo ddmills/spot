@@ -1,4 +1,5 @@
 mod art_zoom;
+mod bio;
 pub mod columns;
 mod deck;
 mod help;
@@ -121,6 +122,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     // behind it is a target while it is up.
     if state.art_zoom.is_some() {
         art_zoom::draw(frame, state);
+    }
+
+    // Over the page it is about, under the boxes that own the keyboard: the
+    // article is something to read while the page behind it keeps playing, and
+    // it never asks you to type.
+    if state.bio.is_some() {
+        bio::draw(frame, state);
     }
 
     // Under the help box: help is the one overlay that answers "what does any
@@ -415,6 +423,7 @@ mod tests {
                 name: "Muse".into(),
                 image_url: None,
                 genres: vec![],
+                bio: crate::app::state::BioState::default(),
                 top: TrackList::new("Muse", "", None),
                 albums: vec![].into(),
                 tab: crate::app::state::ArtistTab::Albums,
@@ -835,6 +844,7 @@ mod tests {
             name: "Roy Hargrove".into(),
             image_url: Some("https://i.scdn.co/image/artist".into()),
             genres: vec!["jazz".into(), "hard bop".into()],
+            bio: crate::app::state::BioState::default(),
             top,
             albums: (0..12)
                 .map(|i| {

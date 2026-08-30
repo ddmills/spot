@@ -152,6 +152,45 @@ pub fn is_mosaic(url: &str) -> bool {
     host_of(url).is_some_and(|h| h.eq_ignore_ascii_case(MOSAIC_HOST))
 }
 
+/// The host Wikimedia serves every image on, thumbnails included.
+const WIKIMEDIA_HOST: &str = "upload.wikimedia.org";
+
+/// Whether `url` is a Wikimedia thumbnail spot can decode.
+///
+/// A predicate of its own rather than a second host inside [`is_spotify_cdn`]:
+/// that one answers "is this Spotify's", which callers ask for its own sake,
+/// and a guard that quietly grew a host would be the change nobody reads
+/// twice.
+///
+/// `/thumb/` as well as the host, because spot asks MediaWiki for a sized
+/// thumbnail and has no business pulling a forty-megapixel original through a
+/// one-megabyte cap.
+pub fn is_wikimedia_thumb(url: &str) -> bool {
+    host_of(url).is_some_and(|h| h.eq_ignore_ascii_case(WIKIMEDIA_HOST))
+        && url.contains("/thumb/")
+        && is_jpeg_path(url)
+}
+
+/// Whether the path of `url` names a JPEG.
+///
+/// [`decode_at`] reads JPEG and nothing else. Spotify's CDN serves only JPEG,
+/// so the question never arises there; the picture at the head of a Wikipedia
+/// article is as often a PNG or an SVG, and MediaWiki's thumbnailer keeps a
+/// file's own format whatever size is asked for. Carrying a second decoder to
+/// render what is usually a wordmark is the worse trade, so an article whose
+/// lead image is not a photograph contributes no picture and the page keeps
+/// the placeholder it already had.
+fn is_jpeg_path(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+}
+
+/// Every image spot will fetch. The one question the fetchers ask.
+pub fn is_fetchable_art(url: &str) -> bool {
+    is_spotify_cdn(url) || is_wikimedia_thumb(url)
+}
+
 /// Fetch and decode the cover at `url`. The decode runs on the blocking pool:
 /// it is CPU-bound and its input is remote bytes.
 pub async fn load(http: &reqwest::Client, url: &str) -> Result<Cover> {
@@ -566,6 +605,51 @@ mod tests {
         assert!(!is_spotify_cdn("https://notscdn.co/image/x"));
         assert!(!is_spotify_cdn("https://i.scdn.co@evil.com/image/x"));
         assert!(!is_spotify_cdn("i.scdn.co/image/x"));
+    }
+
+    /// The second family of hosts, held to the same standard as the first and
+    /// to the decoder's format on top of it.
+    #[test]
+    fn accepts_only_wikimedia_jpeg_thumbnails() {
+        assert!(is_wikimedia_thumb(
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/X.jpg/640px-X.jpg"
+        ));
+        // A query tail is what the REST API appends, and says nothing about
+        // the format.
+        assert!(is_wikimedia_thumb(
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/X.JPEG/640px-X.JPEG?utm_source=x"
+        ));
+        // The original rather than a thumbnail.
+        assert!(!is_wikimedia_thumb(
+            "https://upload.wikimedia.org/wikipedia/commons/1/1a/X.jpg"
+        ));
+        // Formats the decoder cannot read, including an SVG rendered to PNG.
+        assert!(!is_wikimedia_thumb(
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/X.png/640px-X.png"
+        ));
+        assert!(!is_wikimedia_thumb(
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/X.svg/640px-X.svg.png"
+        ));
+        // Plaintext, a lookalike suffix, and userinfo hiding the real host.
+        assert!(!is_wikimedia_thumb(
+            "http://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/X.jpg/640px-X.jpg"
+        ));
+        assert!(!is_wikimedia_thumb(
+            "https://upload.wikimedia.org.evil.com/wikipedia/commons/thumb/1/1a/X.jpg/640px-X.jpg"
+        ));
+        assert!(!is_wikimedia_thumb(
+            "https://upload.wikimedia.org@evil.com/wikipedia/commons/thumb/1/1a/X.jpg/640px-X.jpg"
+        ));
+    }
+
+    #[test]
+    fn fetchable_art_is_those_two_families_and_nothing_else() {
+        assert!(is_fetchable_art("https://i.scdn.co/image/ab67616d00001e02"));
+        assert!(is_fetchable_art(
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/X.jpg/640px-X.jpg"
+        ));
+        assert!(!is_fetchable_art("https://evil.com/image/x.jpg"));
+        assert!(!is_fetchable_art("https://en.wikipedia.org/wiki/Muse.jpg"));
     }
 
     /// A mosaic is served from a host of its own, which is the only thing

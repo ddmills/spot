@@ -227,6 +227,19 @@ and it names only the ones that artist has records in. The whole catalogue arriv
 fetch, so a tab changes what you're looking at without asking Spotify again, and without
 adding a step to the path.
 
+The band over that carries a line about the artist, and `i` — or a click on the line —
+opens the rest of it in a box you can scroll. Spotify has no biography to give: the only
+prose in its catalogue belongs to playlists. So the text is the opening of the artist's
+English Wikipedia article, found by asking MusicBrainz which artist a Spotify link is,
+then which Wikipedia article that artist is. Never by name: searching for "Bush" would
+reliably put one band's history under another band's photograph, and a missing biography
+is a blank row where a wrong one is a lie. Most of the long tail has no article, and their
+pages simply have no such line. All three directories are free and none of them wants a
+key; spot names itself and a way to reach its author in every request, and keeps to
+MusicBrainz's one request a second, the same terms it keeps with the radio directory.
+Where Spotify has no photograph of an artist, the picture at the head of that article
+fills the band instead.
+
 The path stays a path rather than a log of everything you clicked. Opening a page that is
 already on it walks *back* to that page instead of adding a second copy, so bouncing
 between an album and its artist never lengthens the trail, and opening the page you are
@@ -335,6 +348,7 @@ is a worse answer than a row that says why it won't play.
 | `C` | copy the playlist you are on into one of your own |
 | `d` | delete a playlist you own — press again to confirm, `Esc` to cancel |
 | `b / B` | open the selected track's album / artist |
+| `i` | read about the artist you are on — press again or `Esc` to close |
 | `o / O` | cycle sort column / flip sort direction (every list, or click a column header) |
 | `/` | search Spotify and the radio directory at once, or paste a Spotify link |
 | `R` | refresh the current view and your playlists |

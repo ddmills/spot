@@ -1290,6 +1290,52 @@ impl std::ops::DerefMut for TrackList {
     }
 }
 
+/// What Wikipedia says about an artist, and the picture at the head of that
+/// article.
+///
+/// Deserialized nowhere: [`crate::wiki`] builds it out of four replies, none
+/// of which has this shape. The text is CC BY-SA, which is why the article's
+/// own address travels with it rather than being rebuilt for display.
+#[derive(Debug, Clone)]
+pub struct ArtistBio {
+    /// The lead section as prose, its paragraphs one blank line apart.
+    pub text: String,
+    /// The article's lead image, where that image is a photograph spot can
+    /// decode. See [`crate::cover::is_wikimedia_thumb`].
+    pub image_url: Option<String>,
+    pub source_url: String,
+}
+
+impl ArtistBio {
+    /// The article's opening paragraph, which is what the header band wraps
+    /// into the rows it has.
+    ///
+    /// One paragraph rather than the whole lead: a blank line in a band five
+    /// rows deep would spend one of them on nothing, and what comes after the
+    /// break is a keypress away.
+    pub fn lead(&self) -> &str {
+        self.text.split('\n').next().unwrap_or_default()
+    }
+}
+
+/// How far the artist page has got towards saying anything about the artist.
+///
+/// One value rather than a flag beside an option: a page cannot be both still
+/// looking and finished, and spelling it this way means nothing has to keep
+/// two fields agreeing.
+#[derive(Debug, Clone, Default)]
+pub enum BioState {
+    /// The lookup is out. The band says nothing rather than saying there is
+    /// nothing yet.
+    Loading,
+    /// The chain reached no article, which is the ordinary answer for anyone
+    /// small. The default, so a page built without a lookup behind it starts
+    /// where most of them end.
+    #[default]
+    Missing,
+    Ready(Arc<ArtistBio>),
+}
+
 /// How the catalogue is cut, as a tab strip under the "Albums" heading.
 ///
 /// Grouped by [`AlbumItem::album_group`] rather than the type, because only
@@ -1355,6 +1401,10 @@ pub struct ArtistView {
     /// Spotify's genre tags. Deprecated upstream, and often absent from a
     /// response, so the band draws the line only when one arrives.
     pub genres: Vec<String>,
+    /// What Wikipedia has to say, once the second fetch lands. Independent of
+    /// [`Self::loading`], which is the Spotify overview's: the two are asked
+    /// for separately and the page must not wait on the slower.
+    pub bio: BioState,
     pub top: TrackList,
     /// The whole catalogue, every group together, with the active tab as the
     /// display permutation over it — a filter the sort then orders within.
@@ -1366,6 +1416,19 @@ pub struct ArtistView {
 }
 
 impl ArtistView {
+    /// The picture the page wears: Spotify's own where it has one, otherwise
+    /// the one at the head of the artist's Wikipedia article.
+    ///
+    /// Resolved here rather than written into [`Self::image_url`] when the bio
+    /// lands, because the two fetches settle in either order and a slot both
+    /// of them wrote would depend on which won.
+    pub fn photo_url(&self) -> Option<&str> {
+        self.image_url.as_deref().or(match &self.bio {
+            BioState::Ready(bio) => bio.image_url.as_deref(),
+            _ => None,
+        })
+    }
+
     /// What row `index` of the page's one selectable list points at: the top
     /// tracks first, then the album cards under them.
     ///
@@ -1857,6 +1920,42 @@ pub struct ArtHit {
     pub seed: String,
 }
 
+/// The article about an artist, open over the page it is about.
+///
+/// Carries its own wrap because there is no resize event to rebuild one on —
+/// `event::handle_event` reads keys and mouse and drops the rest. `ui::bio`
+/// compares [`Self::wrapped_w`] against the column it is about to draw into
+/// and re-wraps where the terminal has changed under it.
+#[derive(Debug, Clone)]
+pub struct BioPopup {
+    /// The artist the prose belongs to. A page swapped out from under the box
+    /// closes it, rather than showing one artist's article under another's
+    /// name.
+    pub artist_id: String,
+    pub name: String,
+    pub bio: Arc<ArtistBio>,
+    /// The first wrapped line drawn. Lines rather than paragraphs, because
+    /// every scroll in the app is a manual line offset — see `ui::clamp_offset`.
+    pub offset: usize,
+    pub lines: Vec<String>,
+    pub wrapped_w: u16,
+}
+
+impl BioPopup {
+    /// Opened unwrapped: the width belongs to the frame that draws it, and
+    /// guessing one here would only be replaced.
+    pub fn new(artist_id: String, name: String, bio: Arc<ArtistBio>) -> Self {
+        Self {
+            artist_id,
+            name,
+            bio,
+            offset: 0,
+            lines: Vec::new(),
+            wrapped_w: 0,
+        }
+    }
+}
+
 /// A cover-art block expanded to the screen.
 ///
 /// The whole sleeve, as large as the terminal can seat it square: the shorter
@@ -1901,6 +2000,10 @@ pub struct HitAreas {
     /// The artist page's album-group strip. It scrolls with the body it sits
     /// in, so it is recorded only where the line is on screen.
     pub artist_tabs: Vec<(Rect, ArtistTab)>,
+    /// The line about the artist in a header band. Clicking it opens the rest.
+    /// Empty on every page that drew no such line, so a click can never reach
+    /// an article there is nothing to read.
+    pub artist_bio: Rect,
     /// The sortable labels of the column header the main pane last drew, each
     /// covering the cells its label occupies and nothing more. Clicking one
     /// sorts by that column. Recorded above [`Self::main_list`], so a header
@@ -2046,6 +2149,12 @@ pub struct HitAreas {
     /// The add-to-playlist box's `+ new playlist` control, which trades that
     /// box for the edit box in its create mode.
     pub picker_new: Rect,
+    /// The article box. A click inside it is someone finding their place in
+    /// the text; a click outside is the way out.
+    pub bio_box: Rect,
+    /// The prose inside that box, whose height is the page the scroll keys and
+    /// the wheel move by.
+    pub bio_body: Rect,
     /// The playing station's country, on the deck's station row. Opens the
     /// directory's page for that country. Empty when the directory gave us no
     /// code to ask by — the name is still printed, it just leads nowhere, the
@@ -2369,6 +2478,9 @@ pub struct AppState {
     /// The cover-art block filling the screen, if one is expanded. See
     /// [`ArtZoom`].
     pub art_zoom: Option<ArtZoom>,
+    /// The article about the artist whose page is behind it, if one is open.
+    /// See [`BioPopup`].
+    pub bio: Option<BioPopup>,
     /// The expanded view's own copy of the cover it is showing, decoded at
     /// [`crate::cover::ZOOM_PX`] rather than the grid the layout's blocks are
     /// happy with.
@@ -2463,6 +2575,7 @@ impl AppState {
             confirm: None,
             show_help: false,
             art_zoom: None,
+            bio: None,
             zoom_cover: None,
             zoom_cover_generation: 0,
             update: None,
@@ -3740,6 +3853,7 @@ mod tests {
             name: "artist".into(),
             image_url: None,
             genres: Vec::new(),
+            bio: BioState::default(),
             top: TrackList::new("artist", "top tracks", None),
             albums: albums.into(),
             tab: ArtistTab::Albums,
@@ -4671,5 +4785,71 @@ mod tests {
         assert_eq!(st.deck_track().map(|t| t.name.as_str()), Some("announced"));
         st.radio.as_mut().unwrap().off_air = true;
         assert_eq!(st.deck_track().map(|t| t.name.as_str()), Some("chosen"));
+    }
+}
+
+#[cfg(test)]
+mod bio_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn bio(text: &str) -> ArtistBio {
+        ArtistBio {
+            text: text.into(),
+            image_url: None,
+            source_url: "https://en.wikipedia.org/wiki/X".into(),
+        }
+    }
+
+    /// The band wraps the opening paragraph into the rows it has. A blank line
+    /// in five rows would spend one of them on nothing, so the break and what
+    /// follows it stay in the box.
+    #[test]
+    fn the_lead_is_the_first_paragraph_only() {
+        let b = bio("A short one\n\nThe paragraph after it, which is longer.");
+        assert_eq!(b.lead(), "A short one");
+
+        let b = bio(
+            "Muse are an English rock band from Teignmouth, Devon, formed in 1994. They released Showbiz in 1999.",
+        );
+        assert_eq!(
+            b.lead(),
+            "Muse are an English rock band from Teignmouth, Devon, formed in 1994. They released Showbiz in 1999."
+        );
+
+        assert_eq!(bio("").lead(), "");
+    }
+
+    /// Spotify's photograph where there is one, the article's where there is
+    /// not, and nothing where neither has one.
+    #[test]
+    fn the_page_wears_whichever_photo_it_has() {
+        let mut v = artist_view(Vec::new());
+        assert_eq!(v.photo_url(), None);
+
+        let mut from_wiki = bio("text");
+        from_wiki.image_url = Some("https://upload.wikimedia.org/x.jpg".into());
+        v.bio = BioState::Ready(Arc::new(from_wiki));
+        assert_eq!(v.photo_url(), Some("https://upload.wikimedia.org/x.jpg"));
+
+        v.image_url = Some("https://i.scdn.co/image/artist".into());
+        assert_eq!(v.photo_url(), Some("https://i.scdn.co/image/artist"));
+    }
+
+    fn artist_view(albums: Vec<AlbumItem>) -> ArtistView {
+        ArtistView {
+            id: "r1".into(),
+            uri: "spotify:artist:r1".into(),
+            name: "artist".into(),
+            image_url: None,
+            genres: Vec::new(),
+            bio: BioState::default(),
+            top: TrackList::new("artist", "top tracks", None),
+            albums: albums.into(),
+            tab: ArtistTab::Albums,
+            loading: false,
+            error: None,
+        }
     }
 }

@@ -23,6 +23,7 @@ mod session;
 mod ui;
 mod update;
 mod viz;
+mod wiki;
 
 use std::fs::File;
 use std::sync::Arc;

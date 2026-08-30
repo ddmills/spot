@@ -383,6 +383,9 @@ pub struct Client {
     /// Shared with cover-fetch tasks, so the connection to Spotify's image
     /// CDN stays warm across track changes.
     http: reqwest::Client,
+    /// Wikipedia by way of MusicBrainz, sharing the client's connection pool
+    /// and holding its own record of what it has already looked up.
+    wiki: crate::wiki::Wiki,
     covers: Arc<Mutex<CoverCache>>,
     /// The expanded view's covers, which hold the same URLs as [`Self::covers`]
     /// at a much larger size and so cannot share it. One entry: re-expanding
@@ -611,6 +614,7 @@ impl Client {
             cache: Arc::new(Mutex::new(HashMap::new())),
             radio_api: RadioApi::new(http.clone()),
             radio_player: RadioPlayer::new(Arc::clone(&audio_tap)),
+            wiki: crate::wiki::Wiki::new(http.clone()),
             http,
             covers: Arc::new(Mutex::new(CoverCache::default())),
             zoom_covers: Arc::new(Mutex::new(CoverCache::with_capacity(1))),
@@ -3521,6 +3525,7 @@ impl Client {
             name: name.clone(),
             image_url: None,
             genres: Vec::new(),
+            bio: state::BioState::Loading,
             top: TrackList::new(name, "top tracks", None),
             albums: state::SortedList::new(),
             tab: ArtistTab::Albums,
@@ -3538,6 +3543,19 @@ impl Client {
         };
         let state = self.state.clone();
         let http = self.http.clone();
+        // A task of its own rather than a fourth arm of `artist_overview`'s
+        // join: behind it are four third-party requests in sequence with a
+        // second of courtesy throttle in the middle, and a page that waited on
+        // that would take longer to show its top tracks than it takes now to
+        // show everything. It lands into the page it was asked for, or into
+        // nothing.
+        spawn_artist_bio(
+            self.wiki.clone(),
+            state.clone(),
+            http.clone(),
+            id.clone(),
+            generation,
+        );
         tokio::spawn(async move {
             let result = api.artist_overview(&id).await;
             let (uris, art) = {
@@ -3896,9 +3914,9 @@ impl Client {
             slot.install(&mut st, generation, cover);
         };
 
-        // The URL is remote data; anything off the CDN is dropped rather than
-        // fetched. See `cover::is_spotify_cdn`.
-        let Some(url) = url.filter(|u| crate::cover::is_spotify_cdn(u)) else {
+        // The URL is remote data; anything off the two allowed hosts is
+        // dropped rather than fetched. See `cover::is_fetchable_art`.
+        let Some(url) = url.filter(|u| crate::cover::is_fetchable_art(u)) else {
             return install(&self.state, None);
         };
         let covers = match slot {
@@ -4000,6 +4018,51 @@ impl CoverSlot {
 /// leaving the connection pool to the rest of the client.
 const PAGE_ART_CONCURRENCY: usize = 6;
 
+/// Fill the artist page's biography, and its photo where Spotify had none.
+///
+/// The same generation guard the overview keeps, and the page's own id beside
+/// it: this chain is slow enough that the page it was asked for can be two
+/// pages ago by the time it answers.
+fn spawn_artist_bio(
+    wiki: crate::wiki::Wiki,
+    state: Arc<RwLock<AppState>>,
+    http: reqwest::Client,
+    artist_id: String,
+    generation: u64,
+) {
+    tokio::spawn(async move {
+        let bio = wiki.artist_bio(&artist_id).await;
+        let art = {
+            let mut st = state.write();
+            if st.load_generation != generation {
+                return;
+            }
+            let MainView::Artist(v) = &mut st.main else {
+                return;
+            };
+            if v.id != artist_id {
+                return;
+            }
+            // Worth a fetch only where Spotify named no photo. Where the
+            // overview has not landed yet the answer is not known, and one
+            // small picture that turns out to be unused is a better trade than
+            // a page with no portrait until you leave it and come back.
+            let art = match v.image_url.is_none() {
+                true => bio.as_ref().and_then(|b| b.image_url.clone()),
+                false => None,
+            };
+            v.bio = match bio {
+                Some(bio) => state::BioState::Ready(bio),
+                None => state::BioState::Missing,
+            };
+            art
+        };
+        if let Some(url) = art {
+            spawn_page_art(http, state, vec![url], generation);
+        }
+    });
+}
+
 /// Fetch and decode the artist page's images — the photo, then every album
 /// sleeve — into [`AppState::page_art`].
 ///
@@ -4018,9 +4081,9 @@ fn spawn_page_art(
     let wanted: Vec<String> = {
         let st = state.read();
         urls.into_iter()
-            // The URL is remote data, and only Spotify's own CDN may be
-            // fetched. See `cover::is_spotify_cdn`.
-            .filter(|u| crate::cover::is_spotify_cdn(u) && !st.page_art.contains(u))
+            // The URL is remote data, and only the two allowed hosts may be
+            // fetched. See `cover::is_fetchable_art`.
+            .filter(|u| crate::cover::is_fetchable_art(u) && !st.page_art.contains(u))
             .filter(|u| seen.insert(u.clone()))
             .collect()
     };

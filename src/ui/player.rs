@@ -1393,6 +1393,7 @@ mod tests {
             name: name.into(),
             image_url: None,
             genres: vec![],
+            bio: crate::app::state::BioState::default(),
             top: TrackList::new(name, "", None),
             albums: vec![].into(),
             tab: crate::app::state::ArtistTab::Albums,

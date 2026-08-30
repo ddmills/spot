@@ -8,8 +8,9 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use super::columns::{Cell, ColKey, GUTTER, Layout, right, row_spans, scroll_col};
 use super::theme;
 use crate::app::state::{
-    AppState, ArtHit, ArtSource, Credit, Crumb, CrumbTarget, HitAreas, HomeItem, LoadError,
-    MainView, NowStatus, SearchTab, Sort, Station, StationNow, TextCol, Track, format_duration,
+    AppState, ArtHit, ArtSource, BioState, Credit, Crumb, CrumbTarget, HitAreas, HomeItem,
+    LoadError, MainView, NowStatus, SearchTab, Sort, Station, StationNow, TextCol, Track,
+    format_duration,
 };
 
 /// Playback context needed to mark the playing row, copied out of the queue
@@ -958,8 +959,9 @@ fn artist_band(
     let dim = theme::dim();
 
     let photo_w = super::table::art_w(ART_H);
-    let cover = v.image_url.as_deref().and_then(|u| page_art.get(u));
-    let art = (v.image_url.is_some()
+    let photo = v.photo_url();
+    let cover = photo.and_then(|u| page_art.get(u));
+    let art = (photo.is_some()
         && inner.height >= ART_BAND_H + MIN_TABLE_H
         && inner.width >= photo_w + ART_GAP + MIN_META_W)
         .then(|| {
@@ -971,7 +973,7 @@ fn artist_band(
             super::table::draw_art(frame, art, cover.as_deref(), &v.id);
             hit.art_blocks.push(ArtHit {
                 rect: art,
-                source: ArtSource::Page(v.image_url.clone()),
+                source: ArtSource::Page(photo.map(str::to_owned)),
                 seed: v.id.clone(),
             });
             art
@@ -1024,16 +1026,36 @@ fn artist_band(
         height: 1,
         ..text
     };
+    let mut play_row = 1;
     if stacked {
-        // Stacked under the name, in order, skipping what Spotify did not
-        // give us — the counts belong against the name, not floating a row
-        // below an empty genre line.
+        // Stacked under the name, in order, skipping what nobody gave us —
+        // the counts belong against the name, not floating two rows below an
+        // empty genre line and an artist nothing is written about. The shape
+        // `header_band` lays its own lines out in.
         let mut n = 1;
         if !genres.is_empty() {
             frame.render_widget(Paragraph::new(Line::styled(genres, gray)), row(n));
             n += 1;
         }
+        // The opening of the article, filling the photo's spare rows. The rest
+        // of it is a keypress away — a band is not a page of prose, but the
+        // rows beside a portrait are there either way.
+        if let BioState::Ready(bio) = &v.bio {
+            let rows = draw_prose(frame, text, n, prose_budget(n), bio.lead());
+            if rows > 0 {
+                hit.artist_bio = Rect {
+                    height: rows,
+                    ..row(n)
+                };
+                n += rows;
+            }
+        }
         frame.render_widget(Paragraph::new(Line::from(counts)), row(n));
+        n += 1;
+        // Low in the block, so the metadata above and the controls below read
+        // as two groups rather than one list — and inside the photo's own rows
+        // however many lines the metadata spent.
+        play_row = (n + 1).min(ART_H - 1);
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(counts)),
@@ -1045,7 +1067,7 @@ fn artist_band(
         );
     }
 
-    let play_area = row(if stacked { 4 } else { 1 });
+    let play_area = row(play_row);
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut x = play_area.x;
     hit.header_play_btn = super::table::segment(
@@ -1061,12 +1083,65 @@ fn artist_band(
     hit.header_share_btn = pill_segment(&mut spans, &mut x, play_area, mouse, SHARE_PILL);
     frame.render_widget(Paragraph::new(Line::from(spans)), play_area);
 
-    let used = if stacked { ART_BAND_H } else { TEXT_BAND_H };
+    // A blank under the control row, and never less than the photo, which the
+    // list below must clear however few lines the metadata beside it spent.
+    let floor = match stacked {
+        true => ART_BAND_H,
+        false => TEXT_BAND_H,
+    };
+    let used = (play_area.y - text.y + 2).max(floor);
     Rect {
         y: inner.y + used,
-        height: inner.height - used,
+        height: inner.height.saturating_sub(used),
         ..inner
     }
+}
+
+/// Draw `prose` into the rows a band has left, and say how many it filled.
+///
+/// The rows between the name above it and the count, the blank and the
+/// controls below — which sit at the foot of the sleeve. A band beside a
+/// picture has those rows whether or not anything is in them, and one line of
+/// prose over four empty ones spends them on nothing.
+///
+/// `budget` is the caller's, because only the caller knows whether there is a
+/// picture whose rows are being filled. A band without one grows by every row
+/// it takes, and takes one.
+///
+/// The last row drawn says the text goes on, where it does.
+fn draw_prose(frame: &mut Frame, text: Rect, first_row: u16, budget: usize, prose: &str) -> u16 {
+    if budget == 0 || text.width == 0 {
+        return 0;
+    }
+    let w = text.width as usize;
+    let lines = super::table::wrap(prose, w);
+    let shown = lines.len().min(budget);
+    for (i, line) in lines.iter().take(shown).enumerate() {
+        let clipped = i + 1 == shown && lines.len() > shown;
+        let line = match clipped {
+            true => super::table::fit(&format!("{line} …"), w),
+            false => line.clone(),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(line, theme::dim())),
+            Rect {
+                y: text.y + first_row + i as u16,
+                height: 1,
+                ..text
+            },
+        );
+    }
+    shown as u16
+}
+
+/// The rows a band beside a picture can spend on prose, starting at `first_row`.
+///
+/// What is left of the sleeve's own rows once the count, the blank and the
+/// control row under them are set aside — the controls sit at the foot of the
+/// picture, and prose that pushed them past it would leave the band taller
+/// than the thing it is wrapped around.
+fn prose_budget(first_row: u16) -> usize {
+    (ART_H - 3).saturating_sub(first_row) as usize
 }
 /// "30 records", or nothing until the catalogue lands.
 ///
@@ -1628,9 +1703,14 @@ fn header_band(
     // The blurb goes with the sleeve rather than with the name: both are what
     // a page sheds first, and the compact band has no row to spend on prose.
     if blurb && stacked {
-        let description = super::table::fit(&list.header.description, text.width as usize);
-        frame.render_widget(Paragraph::new(Line::styled(description, dim)), row(n));
-        n += 1;
+        // Beside a sleeve the blurb fills the rows the picture has spare. With
+        // no sleeve there are no spare rows — the band is only as tall as what
+        // is written in it — so a long blurb takes one and says it goes on.
+        let budget = match art.is_some() {
+            true => prose_budget(n),
+            false => 1,
+        };
+        n += draw_prose(frame, text, n, budget, &list.header.description);
     }
     if stacked {
         frame.render_widget(Paragraph::new(Line::from(totals)), row(n));
@@ -3269,6 +3349,7 @@ mod tests {
             name: "Donna The Buffalo".into(),
             image_url: None,
             genres: vec![],
+            bio: crate::app::state::BioState::default(),
             top: crate::app::state::TrackList::new("Donna The Buffalo", "", None),
             albums: vec![].into(),
             tab: crate::app::state::ArtistTab::Albums,
@@ -5014,6 +5095,7 @@ mod tests {
             name: "Muse".into(),
             image_url: Some("https://i.scdn.co/image/artist".into()),
             genres: vec!["alt rock".into(), "space rock".into()],
+            bio: crate::app::state::BioState::default(),
             top,
             albums: albums.into(),
             tab: crate::app::state::ArtistTab::Albums,
@@ -5354,5 +5436,168 @@ mod tests {
             let mut st = artist_state();
             render(&mut st, 80, height);
         }
+    }
+
+    fn with_bio(text: &str, image_url: Option<&str>) -> AppState {
+        let mut st = artist_state();
+        let MainView::Artist(v) = &mut st.main else {
+            unreachable!("artist_state builds an artist page")
+        };
+        v.bio =
+            crate::app::state::BioState::Ready(std::sync::Arc::new(crate::app::state::ArtistBio {
+                text: text.into(),
+                image_url: image_url.map(Into::into),
+                source_url: "https://en.wikipedia.org/wiki/Muse_(band)".into(),
+            }));
+        st
+    }
+
+    /// A short article takes the one row it needs, between the genres and the
+    /// count, and is clickable over exactly what it drew.
+    #[test]
+    fn a_short_article_takes_one_row() {
+        let mut st = with_bio("Muse are an English rock band.", None);
+        let lines = render(&mut st, 90, 30);
+        assert!(lines[5].contains("alt rock · space rock"));
+        assert!(lines[6].contains("Muse are an English rock band."));
+        assert!(lines[7].contains("1 record"));
+        assert_eq!((st.hit.artist_bio.y, st.hit.artist_bio.height), (6, 1));
+    }
+
+    /// A long one fills the rows the photo has spare and stops where the
+    /// controls begin — which is the foot of the photo, not past it.
+    #[test]
+    fn a_long_article_fills_the_photos_spare_rows() {
+        let long = "Muse are an English rock band from Teignmouth, Devon, formed in 1994. \
+            The band consists of Matt Bellamy, Chris Wolstenholme and Dominic Howard. They \
+            have sold over thirty million records worldwide and are known for their energetic \
+            live shows and their blend of alternative rock with classical influences.";
+        let mut st = with_bio(long, None);
+        let lines = render(&mut st, 90, 30);
+
+        // Genres on 5, then five rows of prose, the count, a blank, and the
+        // controls on the photo's last row.
+        assert!(lines[5].contains("alt rock · space rock"));
+        assert!(lines[6].contains("Muse are an English rock band"));
+        assert!(lines[10].contains("classical influences"));
+        assert!(lines[11].contains("1 record"));
+        // Blank in the metadata column; the photo still fills the left of it.
+        let meta = |row: &String| row.chars().skip(23).collect::<String>();
+        assert!(meta(&lines[12]).trim().is_empty());
+        assert!(lines[13].contains("▶ play"));
+        assert_eq!((st.hit.artist_bio.y, st.hit.artist_bio.height), (6, 5));
+
+        // The photo is ten rows from 4, so the controls sit on its last one and
+        // the body below still starts where it always did.
+        assert!(
+            lines[13].starts_with('▀'),
+            "the controls ran past the photo"
+        );
+        assert!(lines[15].contains("Top Tracks"));
+    }
+
+    /// More article than rows: the last one says so rather than stopping
+    /// mid-word as though that were the end of it.
+    #[test]
+    fn an_article_longer_than_the_band_says_it_goes_on() {
+        let mut st = with_bio(&"Muse are an English rock band. ".repeat(40), None);
+        let lines = render(&mut st, 90, 30);
+        assert!(lines[10].contains('…'), "the clipped row does not say so");
+        assert!(lines[11].contains("1 record"));
+        assert!(lines[13].contains("▶ play"));
+    }
+
+    /// The line simply is not there for the artists nothing is written about,
+    /// and a click cannot reach an article that does not exist.
+    #[test]
+    fn a_band_with_nothing_to_say_says_nothing() {
+        let mut st = artist_state();
+        let lines = render(&mut st, 90, 30);
+        assert!(lines[6].contains("1 record"));
+        assert!(st.hit.artist_bio.is_empty());
+    }
+
+    /// The extra row is spent out of the photo's ten, not added to the band, so
+    /// the list below sits where it sat.
+    #[test]
+    fn the_snippet_costs_the_page_no_height() {
+        let mut without = artist_state();
+        let mut with = with_bio("Muse are an English rock band.", None);
+        let plain = render(&mut without, 90, 30);
+        let prose = render(&mut with, 90, 30);
+        assert!(plain[15].contains("Top Tracks"));
+        assert!(prose[15].contains("Top Tracks"));
+        // The pills sit a row lower to make room, inside the photo's own ten.
+        assert!(plain[8].contains("▶ play"));
+        assert!(prose[9].contains("▶ play"));
+    }
+
+    /// The two halves of this cover for each other: an artist Spotify has no
+    /// picture of gets the one at the head of their article, and it zooms the
+    /// way any other page portrait does.
+    #[test]
+    fn the_article_supplies_a_photo_where_spotify_has_none() {
+        let wiki = "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/M.jpg/640px-M.jpg";
+        let mut st = with_bio("Muse are an English rock band.", Some(wiki));
+        let MainView::Artist(v) = &mut st.main else {
+            unreachable!()
+        };
+        v.image_url = None;
+        assert_eq!(v.photo_url(), Some(wiki));
+
+        render(&mut st, 90, 30);
+        assert!(
+            st.hit
+                .art_blocks
+                .iter()
+                .any(|h| h.rect.height == super::ART_H),
+            "the band drew no portrait"
+        );
+    }
+
+    const LONG_BLURB: &str = "Deep cuts and new arrivals chosen for you every Monday morning, \
+        drawn from the artists you already play and the ones sitting a step away from them, \
+        refreshed while you sleep and gone again the following week.";
+
+    /// Beside a sleeve the blurb fills the rows the picture has spare, the way
+    /// an artist's article does.
+    #[test]
+    fn a_long_blurb_fills_the_sleeves_spare_rows() {
+        let mut st = playlist_state();
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.description = LONG_BLURB.into();
+        }
+        let lines = render(&mut st, 90, 26);
+        assert!(lines[5].contains("by Spotify"));
+        assert!(lines[6].contains("Deep cuts and new arrivals"));
+        assert!(lines[9].contains("following week"), "{lines:#?}");
+        assert!(lines[10].contains("tracks"));
+        // The controls follow the prose rather than being pinned under it, and
+        // the sleeve's ten rows from 4 are the furthest they go.
+        assert!(lines[12].contains("▶ play"), "{lines:#?}");
+        assert!(
+            lines[12].starts_with('▀'),
+            "the controls ran past the sleeve"
+        );
+        assert!(lines[15].contains("Title"), "the table moved: {lines:#?}");
+    }
+
+    /// Without a sleeve there are no spare rows to fill — the band is only as
+    /// tall as what is written in it, so a long blurb takes one row and says it
+    /// goes on rather than pushing the table down five.
+    #[test]
+    fn a_long_blurb_without_a_sleeve_still_takes_one_row() {
+        let mut st = tracks_state(vec![track("A", "B")]);
+        if let MainView::Tracks(list) = &mut st.main {
+            list.header.subtitle = "by me".into();
+            list.header.description = LONG_BLURB.into();
+        }
+        let lines = render(&mut st, 90, 22);
+        assert!(lines[5].contains("by me"), "{lines:#?}");
+        assert!(lines[6].contains("Deep cuts"), "{lines:#?}");
+        assert!(lines[6].contains('…'), "the clipped row does not say so");
+        assert!(lines[7].contains("tracks"), "{lines:#?}");
+        assert!(lines[9].contains("▶ play"), "{lines:#?}");
+        assert!(lines[11].contains("Title"), "the table moved: {lines:#?}");
     }
 }

@@ -57,6 +57,58 @@ pub fn width(s: &str) -> usize {
     s.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
+/// Break `text` into lines of at most `w` display columns.
+///
+/// Terminal cells, not characters: the same measure [`fit`] truncates by, so
+/// a wrapped paragraph and a fitted one agree about what fits. Breaks at
+/// spaces where there is one, and mid-word only where a single word is wider
+/// than the line — a URL in a paragraph is that case, and letting it run off
+/// the edge would lose its tail rather than its middle.
+///
+/// Blank lines survive. They are the paragraph breaks the prose was written
+/// with, and a wrapper that ate them would turn an article into a wall.
+pub fn wrap(text: &str, w: usize) -> Vec<String> {
+    if w == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for source in text.split('\n') {
+        let mut line = String::new();
+        let mut used = 0;
+        for word in source.split_whitespace() {
+            let ww = width(word);
+            if used > 0 && used + 1 + ww <= w {
+                line.push(' ');
+                line.push_str(word);
+                used += 1 + ww;
+                continue;
+            }
+            if used > 0 {
+                out.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            if ww <= w {
+                line.push_str(word);
+                used = ww;
+                continue;
+            }
+            // Wider than the line even on its own. Cut it by cells, so a wide
+            // character lands whole on one side of the break or the other.
+            for c in word.chars() {
+                let cw = c.width().unwrap_or(0);
+                if used + cw > w {
+                    out.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push(c);
+                used += cw;
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
 /// Byte index of the first character at or after display column `col`.
 ///
 /// Columns rather than bytes or chars, because that is what [`fit`] and
@@ -1062,5 +1114,55 @@ mod tests {
                 .collect();
             assert_eq!(lit, vec![i], "{action:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::{width, wrap};
+
+    const PROSE: &str = "Muse are an English rock band from Teignmouth, Devon, formed in 1994.\n\nThey have sold over thirty million records worldwide.";
+
+    #[test]
+    fn a_wrapped_line_never_outruns_its_column() {
+        for w in 1..40 {
+            assert!(
+                wrap(PROSE, w).iter().all(|l| width(l) <= w),
+                "a line ran past {w} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn words_break_at_spaces() {
+        assert_eq!(wrap("the quick brown fox", 10), ["the quick", "brown fox"]);
+    }
+
+    /// The paragraph breaks the prose was written with are the shape of it.
+    #[test]
+    fn blank_lines_survive_as_paragraph_breaks() {
+        let lines = wrap(PROSE, 40);
+        assert!(lines.iter().any(|l| l.is_empty()));
+    }
+
+    /// A word wider than the line loses its middle to a break rather than its
+    /// tail to the edge.
+    #[test]
+    fn an_overlong_word_is_cut_rather_than_dropped() {
+        let lines = wrap("https://en.wikipedia.org/wiki/Muse_(band)", 12);
+        assert!(lines.iter().all(|l| width(l) <= 12));
+        assert_eq!(lines.concat(), "https://en.wikipedia.org/wiki/Muse_(band)");
+    }
+
+    /// Cells, not characters: three CJK glyphs fill six columns.
+    #[test]
+    fn wide_characters_wrap_by_the_cells_they_take() {
+        let lines = wrap("日本語のテキスト", 6);
+        assert_eq!(lines, ["日本語", "のテキ", "スト"]);
+    }
+
+    #[test]
+    fn no_column_holds_nothing() {
+        assert!(wrap(PROSE, 0).is_empty());
     }
 }
