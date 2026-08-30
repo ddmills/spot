@@ -14,6 +14,7 @@
 //!
 //! [`HitAreas`]: crate::app::state::HitAreas
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -34,7 +35,7 @@ use super::theme;
 use crate::app::queue::Queue;
 use crate::app::state::{AppState, HitAreas, Track, format_duration};
 use crate::cover::Cover;
-use crate::viz::{Viz, VizMode};
+use crate::viz::{Chord, Viz, VizMode};
 
 /// Samples older than this mean audio is paused or playing elsewhere.
 const FRESH_WITHIN: Duration = Duration::from_millis(500);
@@ -629,21 +630,31 @@ impl Bands {
 /// the rect has, and the caller declines to draw.
 fn band_layout(width: u16) -> Bands {
     let n = width.div_ceil(BAND_STRIDE).clamp(MIN_BANDS, MAX_BANDS);
-    // The stride that fits `n` bands in the rect, and the cells left over
-    // after it — the `+ 1` on both pays for the gap the last bar does not
-    // need. The leftovers go one apiece to the leading bands rather than into
-    // a gap at the field's right edge. Only a capped field has any to share
-    // out: below the cap the band count itself grew to take them, leaving at
-    // most the one cell a two-cell stride cannot fill.
-    let capped = n == MAX_BANDS;
-    let stride = match capped {
-        true => ((width + 1) / n).max(BAND_STRIDE),
-        false => BAND_STRIDE,
-    };
-    let wide = match capped {
-        true => (width + 1).saturating_sub(n * stride),
-        false => 0,
-    };
+    // Only a capped field has cells to share out: below the cap the band count
+    // itself grew to take them, leaving at most the one cell a two-cell stride
+    // cannot fill.
+    match n == MAX_BANDS {
+        true => bands_of(width, n),
+        false => Bands {
+            n: n as usize,
+            bar: BAND_STRIDE - 1,
+            wide: 0,
+            used: n * BAND_STRIDE - 1,
+        },
+    }
+}
+
+/// How a rect `width` cells wide divides into exactly `n` bands, spending
+/// every cell it can.
+///
+/// The stride is as wide as the width affords, and the cells over go one apiece
+/// to the leading bands rather than into a gap at the field's right edge. The
+/// `+ 1` on both pays for the gap the last bar does not need. A rect too narrow
+/// for `n` bands asks for more cells than it has, and the caller declines to
+/// draw.
+fn bands_of(width: u16, n: u16) -> Bands {
+    let stride = ((width + 1) / n).max(BAND_STRIDE);
+    let wide = (width + 1).saturating_sub(n * stride);
     Bands {
         n: n as usize,
         bar: stride - 1,
@@ -703,6 +714,7 @@ fn draw_visualizer(frame: &mut Frame, area: Rect, tap: &crate::audio_tap::AudioT
         VizMode::Bars => draw_bars(frame, area, tap, viz, fresh, now),
         VizMode::Wave => draw_wave(frame, area, tap, viz, fresh, now),
         VizMode::Scope => draw_scope(frame, area, tap, viz, fresh, now),
+        VizMode::Chords => draw_chords(frame, area, tap, viz, fresh, now),
     }
 }
 
@@ -883,6 +895,261 @@ fn draw_scope(
             cell.set_char(ch).set_style(style);
         }
     }
+}
+
+/// Pitch classes the chord field is divided into.
+const CHROMA_BANDS: u16 = 12;
+/// Shortest field the note labels, the blank under the name, and a leading
+/// blank are each worth spending a row on.
+const CHORD_LABEL_H: u16 = 4;
+const CHORD_HISTORY_H: u16 = 6;
+const CHORD_GAP_H: u16 = 7;
+const CHORD_LEAD_H: u16 = 8;
+/// Cells a label needs before it can carry an accidental. Under this the
+/// naturals are labelled and the black notes are left blank, which is how a
+/// keyboard reads.
+const CHORD_ACCIDENTAL_W: u16 = 2;
+/// What the history strip puts between two chords, and how wide that is.
+const CHORD_SEPARATOR: &str = " · ";
+const CHORD_SEPARATOR_W: usize = 3;
+/// What the name row says through a passage with no harmony in it.
+const CHORD_NONE: &str = "—";
+
+/// How the chord field's rows divide, top to bottom.
+///
+/// Bands are shed in this order as the field loses height: the leading blank
+/// first, then the blank under the name, then the history, then the labels.
+/// The name outlasts all of them, because it is what the mode is about, and
+/// the chroma takes whatever is left over.
+struct ChordRows {
+    lead: u16,
+    name: u16,
+    gap: u16,
+    chroma: u16,
+    labels: u16,
+    history: u16,
+}
+
+impl ChordRows {
+    /// `columns` says whether the rect is wide enough for twelve of them. It
+    /// is not only the chroma that depends on that — a label row under no
+    /// columns labels nothing.
+    fn new(height: u16, columns: bool) -> Self {
+        let history = u16::from(height >= CHORD_HISTORY_H);
+        let labels = u16::from(columns && height >= CHORD_LABEL_H);
+        let gap = u16::from(columns && height >= CHORD_GAP_H);
+        let lead = u16::from(columns && height >= CHORD_LEAD_H);
+        let name = height.min(1);
+        let spent = lead + name + gap + labels + history;
+        Self {
+            lead,
+            name,
+            gap,
+            chroma: match columns {
+                true => height.saturating_sub(spent),
+                false => 0,
+            },
+            labels,
+            history,
+        }
+    }
+}
+
+/// The harmony, named.
+///
+/// Three things at once, because a chord on its own is a readout rather than a
+/// picture: the name of what is sounding, the twelve pitch classes it was
+/// heard in, and the chords before it. The chroma is what moves between
+/// changes, and the strip is what makes a progression read as a progression.
+fn draw_chords(
+    frame: &mut Frame,
+    area: Rect,
+    tap: &crate::audio_tap::AudioTap,
+    viz: &mut Viz,
+    fresh: bool,
+    now: Instant,
+) {
+    let bands = chroma_layout(area.width);
+    let chords = viz.chords(tap, fresh, now);
+    let chord = chords.current();
+    // With nothing named there is no chord to be outside of, so every column
+    // stays lit rather than the whole field reading as dead.
+    let tones = chord.map_or(u16::MAX, |c| c.mask());
+    let name = chord.map_or_else(|| CHORD_NONE.to_string(), Chord::name);
+    let name_style = match (fresh, chord.is_some()) {
+        (true, true) => Style::default()
+            .fg(theme::viz_color(chords.confidence(), theme::Led::Lit))
+            .add_modifier(Modifier::BOLD),
+        _ => theme::dim(),
+    };
+    let history = chord_history(chords.history(), area.width as usize, fresh);
+    let levels = *chords.chroma();
+
+    let rows = ChordRows::new(area.height, bands.used <= area.width);
+    let mut y = area.y;
+    let mut band = |h: u16| {
+        let r = Rect {
+            y,
+            height: h,
+            ..area
+        };
+        y += h;
+        r
+    };
+    band(rows.lead);
+    let name_area = band(rows.name);
+    band(rows.gap);
+    let chroma_area = band(rows.chroma);
+    let label_area = band(rows.labels);
+    let history_area = band(rows.history);
+
+    if rows.name > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::styled(spaced(&name, area.width), name_style))
+                .alignment(ratatui::layout::Alignment::Center),
+            name_area,
+        );
+    }
+    if rows.history > 0 {
+        frame.render_widget(
+            Paragraph::new(history).alignment(ratatui::layout::Alignment::Right),
+            history_area,
+        );
+    }
+    if rows.chroma > 0 {
+        draw_chroma(frame, chroma_area, &bands, &levels, tones, fresh);
+    }
+    if rows.labels > 0 {
+        draw_chroma_labels(frame, label_area, &bands, tones, fresh);
+    }
+}
+
+/// The twelve pitch classes as bars, the chord's own notes lit and the rest
+/// dimmed back.
+///
+/// Painted through [`viz_cell`], so the LEDs and the colour ramp are the ones
+/// the spectrum uses and the two fields cannot drift apart. There is no
+/// afterglow to chase here — a pitch class is sounding or it is not — so the
+/// glow is held level with the bar.
+fn draw_chroma(
+    frame: &mut Frame,
+    area: Rect,
+    bands: &Bands,
+    levels: &[f32; 12],
+    tones: u16,
+    fresh: bool,
+) {
+    let rows = area.height;
+    let h = rows as f32;
+    let buf = frame.buffer_mut();
+    for (b, &level) in levels.iter().enumerate().take(bands.n) {
+        let col = Column {
+            bar: level * h,
+            glow: level * h,
+        };
+        let lit = fresh && tones & (1 << b) != 0;
+        let x = area.x + bands.x(b);
+        let bar_w = bands.width(b);
+        for row in 0..rows {
+            let (ch, style) = viz_cell(&col, rows - row, rows);
+            let style = match lit {
+                true => style,
+                false => theme::dim(),
+            };
+            for x in x..x + bar_w {
+                if let Some(cell) = buf.cell_mut((x, area.y + row)) {
+                    cell.set_char(ch).set_style(style);
+                }
+            }
+        }
+    }
+}
+
+/// The note under each column, centred on it.
+fn draw_chroma_labels(frame: &mut Frame, area: Rect, bands: &Bands, tones: u16, fresh: bool) {
+    let buf = frame.buffer_mut();
+    for b in 0..bands.n {
+        let width = bands.width(b);
+        let label = crate::viz::NOTE_NAMES[b];
+        // A black note is left unlabelled in a narrow field rather than
+        // truncated to the letter beside it, which would read as that note.
+        if label.len() > 1 && width < CHORD_ACCIDENTAL_W {
+            continue;
+        }
+        let style = match fresh && tones & (1 << b) != 0 {
+            true => theme::accent(),
+            false => theme::dim(),
+        };
+        let x = area.x + bands.x(b) + width.saturating_sub(label.len() as u16) / 2;
+        buf.set_stringn(x, area.y, label, width as usize, style);
+    }
+}
+
+/// The chords gone through, newest at the right, dropping the oldest until the
+/// strip fits.
+fn chord_history(history: &VecDeque<Chord>, width: usize, fresh: bool) -> Line<'static> {
+    let names: Vec<String> = history.iter().map(|c| c.name()).collect();
+    let Some(newest) = names.len().checked_sub(1) else {
+        return Line::default();
+    };
+    let mut first = 0;
+    while first < newest {
+        let used = names[first..]
+            .iter()
+            .map(|n| n.chars().count())
+            .sum::<usize>()
+            + CHORD_SEPARATOR_W * (newest - first);
+        if used <= width {
+            break;
+        }
+        first += 1;
+    }
+    let spans = names
+        .into_iter()
+        .enumerate()
+        .skip(first)
+        .flat_map(|(i, name)| {
+            let style = match fresh && i == newest {
+                true => theme::accent(),
+                false => theme::dim(),
+            };
+            let separator = (i > first).then(|| Span::styled(CHORD_SEPARATOR, theme::dim()));
+            separator
+                .into_iter()
+                .chain(std::iter::once(Span::styled(name, style)))
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+/// The chord's name, with its letters spread when the field can afford it.
+///
+/// A name is three or four characters against a field dozens of cells wide, and
+/// at that size it reads as a caption rather than as the thing the field is
+/// showing. Spacing it out is what gives it the weight a larger type size
+/// would.
+fn spaced(name: &str, width: u16) -> String {
+    let spread: String = name
+        .chars()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let width = width as usize;
+    if spread.chars().count() <= width {
+        return spread;
+    }
+    // `fit` pads to the width it is given, which would throw the centring off,
+    // so it is only reached where the name has to be cut anyway.
+    match name.chars().count() <= width {
+        true => name.to_string(),
+        false => fit(name, width),
+    }
+}
+
+/// How the chord field divides a rect: one column per pitch class, whatever
+/// the width.
+fn chroma_layout(width: u16) -> Bands {
+    bands_of(width, CHROMA_BANDS)
 }
 
 /// One row of the player's list, whichever of its two lists is on screen: the
@@ -1735,7 +2002,7 @@ mod tests {
     fn every_mode_fills_the_same_field() {
         let mut mode = VizMode::default();
         let (first, _) = field_in(mode, 40);
-        for _ in 0..3 {
+        for _ in 0..VizMode::ALL.len() {
             let (rect, cells) = field_in(mode, 40);
             assert_eq!(rect, first, "{mode:?} moved the field");
             assert!(
@@ -1798,11 +2065,83 @@ mod tests {
         assert!(cells.iter().filter(|c| braille(c)).count() > 20, "no trace");
     }
 
+    /// A chord in the tap, and what the field says about it.
+    fn chord_field(midi: &[usize]) -> (Rect, Vec<ratatui::buffer::Cell>) {
+        let mut st = playing_state();
+        st.viz.mode = VizMode::Chords;
+        let chord: Vec<f64> = crate::viz::chord_signal(midi)
+            .iter()
+            .flat_map(|&s| [s as f64, s as f64])
+            .collect();
+        st.audio_tap.push(&chord, 1.0);
+        // The draw loop reads a real clock and a test renders its frames in
+        // microseconds, so drawing sixty of them advances the chroma by
+        // nothing. Walk the analyzer over simulated time first, and the field
+        // below is painted from a settled chroma rather than a rising one.
+        let t0 = Instant::now();
+        for frame in 1..=60u64 {
+            st.viz
+                .chords(&st.audio_tap, true, t0 + Duration::from_millis(50 * frame));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
+        terminal.draw(|f| draw(f, f.area(), &mut st)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let field = st.hit.viz;
+        let cells = (field.y..field.bottom())
+            .flat_map(|y| (field.x..field.right()).map(move |x| Position { x, y }))
+            .map(|p| buffer.cell(p).unwrap().clone())
+            .collect();
+        (field, cells)
+    }
+
+    /// The field names what it hears and lights the notes it heard it in — the
+    /// three the chord is built of standing out from the nine it is not.
+    #[test]
+    fn the_chord_field_names_a_triad_and_lights_its_notes() {
+        let (field_rect, cells) = chord_field(&[60, 64, 67]);
+        let (w, h) = (field_rect.width as usize, field_rect.height as usize);
+        let row = |y: usize| {
+            (0..w)
+                .map(|x| cells[y * w + x].symbol())
+                .collect::<String>()
+        };
+        let field = (0..h).map(row).collect::<Vec<_>>().join("\n");
+
+        // Name, then the columns, then their labels, then the strip: the last
+        // three rows are the bottom three bands of the budget.
+        assert_eq!(row(1).trim(), "C", "{field}");
+        for note in crate::viz::NOTE_NAMES {
+            assert!(row(h - 2).contains(note), "{note} is unlabelled\n{field}");
+        }
+        assert_eq!(row(h - 1).trim(), "C", "{field}");
+
+        // The chord's own pitch classes stand up and take the colour; the rest
+        // stay dim, which is what makes the chord readable off the columns
+        // alone.
+        let bands = chroma_layout(field_rect.width);
+        let floor = h - 3;
+        let lit = |b: usize| cells[floor * w + bands.x(b) as usize].fg != theme::DIM;
+        for b in [0usize, 4, 7] {
+            assert!(
+                lit(b),
+                "{} is in the chord and unlit\n{field}",
+                crate::viz::NOTE_NAMES[b]
+            );
+        }
+        for b in [1usize, 2, 3, 5, 6, 8, 9, 10, 11] {
+            assert!(
+                !lit(b),
+                "{} is not in the chord and lit\n{field}",
+                crate::viz::NOTE_NAMES[b]
+            );
+        }
+    }
+
     /// A stale tap keeps every mode's shape and drops its colour, so a paused
     /// player reads as paused rather than as a blank rectangle.
     #[test]
     fn a_stale_tap_greys_every_mode() {
-        for mode in [VizMode::Bars, VizMode::Wave, VizMode::Scope] {
+        for mode in VizMode::ALL {
             let mut st = playing_state();
             st.viz.mode = mode;
             let mut terminal = Terminal::new(TestBackend::new(80, TALL_H + BRAND_H)).unwrap();
@@ -1834,7 +2173,7 @@ mod tests {
     /// outside the rect it recorded as `hit.viz`.
     #[test]
     fn no_mode_paints_outside_its_own_field() {
-        for mode in [VizMode::Bars, VizMode::Wave, VizMode::Scope] {
+        for mode in VizMode::ALL {
             for (w, h) in [
                 (94u16, 36u16),
                 (80, 26),

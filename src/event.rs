@@ -5645,7 +5645,7 @@ mod tests {
 
         let start = state.read().viz.mode;
         let mut seen = vec![start];
-        for _ in 0..3 {
+        for _ in 0..crate::viz::VizMode::ALL.len() {
             assert!(handle_player_key(
                 KeyEvent::from(KeyCode::Char('V')),
                 &state,
@@ -5664,11 +5664,11 @@ mod tests {
             seen.push(mode);
         }
         assert_eq!(seen.last(), Some(&start), "the cycle does not come round");
-        let mut distinct = seen[..3].to_vec();
+        let mut distinct = seen[..crate::viz::VizMode::ALL.len()].to_vec();
         distinct.dedup();
         assert_eq!(
             distinct.len(),
-            3,
+            crate::viz::VizMode::ALL.len(),
             "a mode repeated inside one cycle: {seen:?}"
         );
     }

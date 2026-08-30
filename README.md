@@ -72,16 +72,23 @@ with Spotify and can't be changed. Radio goes on playing either way.
   the UI accent while it plays. Records with no colour to speak of fall back to the
   built-in gold. Browsing an album fetches its own sleeve without disturbing the accent —
   the record you are looking at and the one you are hearing are not always the same.
-- The visualizer has three modes, cycled with `V` in the player view. **bars** is the
+- The visualizer has four modes, cycled with `V` in the player view. **bars** is the
   spectrum analyzer. **waveform** is what an audio editor draws — one bar per slice of
   time, as tall as the record was loud over it, standing either side of a centerline
   and walking left as new slices arrive, so the field is the last few seconds rather
   than this instant and a chorus is visible as a shape. **scope** drops the analysis
   entirely and draws the waveform itself, triggered on a rising zero-crossing so it
   holds still, in braille for eight times the vertical resolution the block characters
-  have. All three take their colours from the playing sleeve, and all three work for a
-  radio station as well as a track. The choice lasts the session; it starts on **bars**
-  each launch.
+  have. **chords** is the odd one out: instead of measuring the signal it names the
+  music in it. A long transform resolves single semitones, each one is scored against
+  its own harmonic series — which is what keeps a minor chord minor, since a note's
+  fifth harmonic is its major third — and the twelve pitch classes that folds into are
+  matched against triads and sevenths. The field shows the chord it hears, the pitch
+  classes it heard it in with the chord's own notes lit, and the chords before it, so a
+  progression reads as a progression. A passage with no harmony in it, a drum break or
+  a noise floor, is named as nothing rather than guessed at. All four take their colours
+  from the playing sleeve, and all four work for a radio station as well as a track. The
+  choice lasts the session; it starts on **bars** each launch.
 - Auth uses two OAuth browser flows with pre-registered client IDs — **no developer app
   registration needed**. The Web API uses ncspot's client ID (registered in extended quota
   mode; Spotify's own keymaster ID gets 429-rate-limited on `api.spotify.com`), while the
@@ -335,7 +342,7 @@ is a worse answer than a row that says why it won't play.
 | `Ctrl-d/u` | half page down / up |
 | `H` | go home |
 | `v` | toggle player view (Esc closes) |
-| `V` | cycle the visualizer — bars, waveform, scope |
+| `V` | cycle the visualizer — bars, waveform, scope, chords |
 | `← / →` | switch tab (search results, artist pages, radio pages) |
 | `Backspace` | back to the previous view |
 | `Esc` | back to the previous view · closes an overlay |

@@ -13,8 +13,13 @@ use librespot_playback::decoder::AudioPacket;
 use librespot_playback::mixer::VolumeGetter;
 use parking_lot::Mutex;
 
-/// Mono samples retained for analysis (~185 ms at 44.1 kHz).
-const RING_CAP: usize = 8192;
+/// Mono samples retained for analysis (~371 ms at 44.1 kHz).
+///
+/// The chord analyzer sets this floor. Two semitones at A2 stand 6.5 Hz apart,
+/// and a Hann-windowed transform separates them only over a window about this
+/// long. The other analyzers ask [`AudioTap::latest`] for a shorter window of
+/// their own and are unaffected by the retained length.
+const RING_CAP: usize = 16384;
 
 /// Shared sample buffer plus a freshness clock. The audio thread pushes,
 /// the draw loop reads; neither ever holds this lock while touching

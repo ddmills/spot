@@ -4,7 +4,8 @@
 //! something the renderer can paint. The analyzers are split by what they
 //! measure rather than by how they look: [`spectrum`] resolves a spectrum,
 //! [`wave`] keeps a scrolling history of the signal's loudness, [`scope`]
-//! follows the waveform itself, and [`Pulse`] is a single loudness number.
+//! follows the waveform itself, [`chords`] reads the harmony out of it, and
+//! [`Pulse`] is a single loudness number.
 //!
 //! [`VizMode`] names the choices; the renderer in [`crate::ui::player`] decides
 //! which analyzer a given mode needs, because only it knows the field's shape.
@@ -15,10 +16,14 @@
 //! buffering, or audio going to another device — falls to rest rather than
 //! snapping, so nothing blanks on a single missed frame.
 
+mod chords;
 mod scope;
 mod spectrum;
 mod wave;
 
+#[cfg(test)]
+pub use chords::chord_signal;
+pub use chords::{Chord, Chords, NOTE_NAMES};
 pub use scope::Scope;
 pub use spectrum::VizState;
 pub use wave::Wave;
@@ -32,24 +37,28 @@ pub const SAMPLE_RATE: f32 = 44_100.0;
 
 /// What the player view's field is showing.
 ///
-/// The order is the cycle order, and it runs by how much of the record each
-/// one shows: the spectrum at this instant, the last half-minute of loudness,
-/// then the waveform itself at a few dozen milliseconds' magnification.
+/// The order is the cycle order. The first three run by how much of the record
+/// each one shows: the spectrum at this instant, the last half-minute of
+/// loudness, then the waveform itself at a few dozen milliseconds'
+/// magnification. Chords comes last because it is off that scale altogether —
+/// the other three measure the signal, and this one names the music in it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum VizMode {
     #[default]
     Bars,
     Wave,
     Scope,
+    Chords,
 }
 
 impl VizMode {
+    /// The cycle itself, so `V` and the tests that walk it read the order from
+    /// one place.
+    pub const ALL: [Self; 4] = [Self::Bars, Self::Wave, Self::Scope, Self::Chords];
+
     pub fn next(self) -> Self {
-        match self {
-            Self::Bars => Self::Wave,
-            Self::Wave => Self::Scope,
-            Self::Scope => Self::Bars,
-        }
+        let at = Self::ALL.iter().position(|&mode| mode == self);
+        Self::ALL[(at.unwrap_or(0) + 1) % Self::ALL.len()]
     }
 
     pub fn label(self) -> &'static str {
@@ -57,6 +66,7 @@ impl VizMode {
             Self::Bars => "bars",
             Self::Wave => "waveform",
             Self::Scope => "scope",
+            Self::Chords => "chords",
         }
     }
 }
@@ -64,9 +74,10 @@ impl VizMode {
 /// The chosen mode and every analyzer's rolling state.
 ///
 /// One field on [`AppState`] rather than one per mode: the renderer asks for
-/// the analysis the current mode needs and the rest simply do not run. The two
-/// that carry a buffer are boxed and built on first use, so cycling past a mode
-/// you never look at costs nothing.
+/// the analysis the current mode needs and the rest simply do not run. The
+/// three that carry a buffer are boxed and built on first use, so cycling past
+/// a mode you never look at costs nothing — which matters most for the chord
+/// analyzer, whose transform is the largest of them.
 ///
 /// [`AppState`]: crate::app::state::AppState
 #[derive(Default)]
@@ -75,6 +86,7 @@ pub struct Viz {
     spectrum: VizState,
     wave: Option<Box<Wave>>,
     scope: Option<Box<Scope>>,
+    chords: Option<Box<Chords>>,
 }
 
 impl Viz {
@@ -113,6 +125,15 @@ impl Viz {
         let scope = self.scope.get_or_insert_with(Default::default);
         scope.update(tap, columns, fresh, now);
         scope
+    }
+
+    /// Advance the chroma and hand back the chord standing on it. Takes no
+    /// geometry: the field is always the twelve pitch classes, whatever the
+    /// rect is.
+    pub fn chords(&mut self, tap: &AudioTap, fresh: bool, now: Instant) -> &Chords {
+        let chords = self.chords.get_or_insert_with(Default::default);
+        chords.update(tap, fresh, now);
+        chords
     }
 }
 
